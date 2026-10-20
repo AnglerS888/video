@@ -53,7 +53,15 @@ RUN set -eux; \
 
 # ---- 运行阶段（极简镜像）----
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata \
+# Alpine 软件源镜像：国内 dl-cdn.alpinelinux.org 很慢（apk add 能跑几分钟）。
+# 构建时传 --build-arg APK_MIRROR=https://mirrors.aliyun.com/alpine 即可换源。
+ARG APK_MIRROR=
+RUN set -eux; \
+    if [ -n "${APK_MIRROR}" ]; then \
+      sed -i "s#https\?://dl-cdn.alpinelinux.org#${APK_MIRROR}#g" /etc/apk/repositories; \
+      echo "apk 源已切换：${APK_MIRROR}"; \
+    fi; \
+    apk add --no-cache ca-certificates tzdata \
     && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
     && echo "Asia/Shanghai" > /etc/timezone
 WORKDIR /app

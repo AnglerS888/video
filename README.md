@@ -77,8 +77,22 @@ sudo ./deploy.sh --yes           # 不交互；已有容器则沿用它的端口
 5. **再次执行 = 更新**：自动读取现有容器的端口与数据目录，重建镜像后替换容器；
    新镜像启动失败会自动回滚到 `videodl:previous`。
 
-常用参数：`--port` / `--data` / `--source-dir` / `--registry-mirror` / `--no-install` / `--yes`，
-完整说明见 `./deploy.sh --help`。
+常用参数：`--port` / `--data` / `--source-dir` / `--registry-mirror` / `--apk-mirror` / `--goproxy` /
+`--no-install` / `--yes`，完整说明见 `./deploy.sh --help`。
+
+**国内网络首次构建很慢？** 首次要拉 `golang:1.26-alpine`（约 250MB）和 `alpine:3.20`，
+`apk add` 也要连 Alpine CDN。实测限速环境下 67MB 的层能跑 7 分钟。加两个镜像参数会快很多：
+
+```bash
+sudo ./deploy.sh --registry-mirror https://docker.m.daocloud.io \
+                 --apk-mirror https://mirrors.aliyun.com/alpine
+```
+
+- `--registry-mirror` 会写入 `/etc/docker/daemon.json` 并重启 docker（其他容器会短暂中断）；
+- `--apk-mirror` 只是构建参数，改的是镜像内的 apk 源，不影响宿主机。
+
+首次构建正常 2~5 分钟（好网络）/ 10~30 分钟（限速网络）；**中断后重跑会复用已下载的层**，
+之后的更新构建通常 1~2 分钟。
 
 镜像不再内置 ffmpeg（二进制约 12MB，不再是 40MB）。运行时的解析顺序是：
 

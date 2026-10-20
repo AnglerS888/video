@@ -37,6 +37,7 @@ ASSUME_YES=0
 DRY_RUN=0
 NO_INSTALL=0
 REGISTRY_MIRROR=""
+APK_MIRROR="${APK_MIRROR:-}"
 FORCE=0
 
 # ---------- 输出 ----------
@@ -65,7 +66,9 @@ usage() {
   --port N              宿主机端口（容器内固定 5200）
   --data PATH           数据存储路径（数据库、视频、config.json 都在这里）
   --source-dir PATH     源码目录（默认脚本目录；没有源码则放 ~/videodl-src）
-  --registry-mirror URL Docker 镜像加速地址（国内拉不到镜像时用）
+  --registry-mirror URL Docker 镜像加速地址（如 https://docker.m.daocloud.io）
+  --apk-mirror URL      Alpine 软件源（如 https://mirrors.aliyun.com/alpine），加速 apk add
+  --goproxy URL         Go 模块代理（默认 https://goproxy.cn,direct）
   --yes, -y             不交互，使用默认值 / 沿用已有容器
   --no-install          不自动安装 Docker（已装好时用）
   --dry-run             演练模式：只打印命令
@@ -85,6 +88,8 @@ while [ $# -gt 0 ]; do
     --data)            DATA_DIR="${2:-}"; shift 2 ;;
     --source-dir)      SOURCE_DIR="${2:-}"; shift 2 ;;
     --registry-mirror) REGISTRY_MIRROR="${2:-}"; shift 2 ;;
+    --apk-mirror)      APK_MIRROR="${2:-}"; shift 2 ;;
+    --goproxy)         GOPROXY_ARG="${2:-}"; shift 2 ;;
     --yes|-y)          ASSUME_YES=1; shift ;;
     --dry-run)         DRY_RUN=1; shift ;;
     --no-install)      NO_INSTALL=1; shift ;;
@@ -396,9 +401,15 @@ build_image() {
   fi
 
   info "版本：$ver（构建阶段会拉取 golang / alpine 基础镜像，首次较慢）"
+  local extra=()
+  [ -n "$APK_MIRROR" ] && extra+=(--build-arg "APK_MIRROR=$APK_MIRROR")
+  if [ ${#extra[@]} -gt 0 ]; then
+    info "Alpine 软件源：$APK_MIRROR"
+  fi
   run docker build \
     --build-arg "APP_VERSION=$ver" \
     --build-arg "GOPROXY=$GOPROXY_ARG" \
+    "${extra[@]}" \
     -t "$IMAGE_NAME" "$SOURCE_DIR"
   ok "镜像构建完成：$IMAGE_NAME"
 }
