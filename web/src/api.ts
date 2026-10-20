@@ -209,10 +209,6 @@ export const api = {
   updateStatus() {
     return req<UpdateStatus>('/api/update/status')
   },
-  /** 应用新版本并重启（仅直接运行模式） */
-  restartUpdate() {
-    return req<{ msg: string; relaunch: boolean }>('/api/update/restart', { method: 'POST' })
-  },
 
   /* ---- 封面补充 ---- */
   // 检查全库封面缓存，同剧多源时用其它源的封面补齐拉不到的

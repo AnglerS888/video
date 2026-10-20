@@ -53,11 +53,11 @@ docker-multi:
 	docker buildx build --platform linux/amd64,linux/arm64 -t videodl:latest .
 
 run:
-	go run . -addr :5200 -data ./videodata
+	go run .
 
-# 低配模式本地试跑（等同 NAS 上的默认参数）
+# 低配模式本地试跑：加载仓库里的 config.lowmem.json（等同 NAS 默认参数）
 run-lowmem:
-	go run . -addr :5200 -data ./videodata -lowmem
+	VDL_CONFIG=./config.lowmem.json go run .
 
 # 只清构建产物。数据目录 videodata/ 是唯一的库与下载文件，绝不在这里删
 # （要清数据请自己手动操作，确认已备份）

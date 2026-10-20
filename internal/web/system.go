@@ -64,7 +64,8 @@ func (s *Server) sysInfo(w http.ResponseWriter, r *http.Request) {
 			"version": s.Version, "go": runtime.Version(),
 			"os": runtime.GOOS, "arch": runtime.GOARCH,
 			"pid": os.Getpid(), "uptime_sec": uptime,
-			"started_at": s.StartedAt.Format("2006-01-02 15:04:05"),
+			"started_at":  s.StartedAt.Format("2006-01-02 15:04:05"),
+			"config_file": s.ConfigPath,
 		},
 		"ffmpeg": ff,
 		"data": map[string]any{

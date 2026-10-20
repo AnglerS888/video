@@ -3,8 +3,8 @@
 // 版本号只有一个来源：仓库根目录的 VERSION 文件。构建脚本（Makefile / Dockerfile）
 // 读取它并通过 -ldflags 注入下面的变量，所以二进制里带的是构建时那份 VERSION。
 //
-//	go build -ldflags "-X videoDownLoad/internal/version.Version=1.3.0 \
-//	                   -X videoDownLoad/internal/version.Commit=ced2295 \
+//	go build -ldflags "-X videoDownLoad/internal/version.Version=1.3.1 \
+//	                   -X videoDownLoad/internal/version.Commit=d943a63 \
 //	                   -X videoDownLoad/internal/version.BuildTime=2026-10-20T03:00:00Z"
 //
 // 不带 ldflags 直接 go build 也能跑：Version 保持默认值，Commit 为空，
@@ -19,7 +19,7 @@ import (
 
 var (
 	// Version 语义化版本号（与仓库根目录 VERSION 一致），构建时由 ldflags 覆盖
-	Version = "1.3.0"
+	Version = "1.3.1"
 	// Commit 构建时的 git 提交短哈希（可能为空：直接 go build 时没有）
 	Commit = ""
 	// BuildTime 构建时间，RFC3339（UTC），可能为空
@@ -27,13 +27,20 @@ var (
 )
 
 const (
-	// Repo GitHub 仓库（owner/name），在线更新用它拼接口与下载地址
-	Repo = "AnglerS888/video"
+	// Repo 更新源仓库（Gitee，owner/name）；GitHub 镜像仓库已删除，只保留 Gitee
+	Repo = "anglers/video"
 	// Branch 更新跟踪的分支
-	Branch = "main"
+	Branch = "master"
+	// SiteBase Gitee 站点根地址
+	SiteBase = "https://gitee.com"
 )
 
-// Short 用于界面上展示的版本串，如 v1.3.0 (ced2295)
+// RepoURL 仓库网页地址
+func RepoURL(repo string) string {
+	return SiteBase + "/" + repo
+}
+
+// Short 用于界面上展示的版本串，如 v1.3.1 (d943a63)
 func Short() string {
 	v := Version
 	if v == "" {

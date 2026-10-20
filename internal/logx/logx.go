@@ -3,7 +3,7 @@
 //   - 默认写 **stdout**，单行、无 ANSI 颜色、带毫秒时间戳：
 //     docker logs / Portainer / 群晖容器日志 都能直接看，不会被当成错误流红色刷屏
 //   - 多行消息（例如 ffmpeg 的 stderr 片段）会被压成一行，避免一条日志炸成几十行
-//   - 支持分级（debug/info/warn/error），默认 info；可用 -log-level 或 VDL_LOG_LEVEL 调整
+//   - 支持分级（debug/info/warn/error），默认 info；改 config.json 的 log_level
 //   - 进程日志是唯一输出通道，不做文件轮转（容器里交给 docker 的 json-file + max-size）
 package logx
 

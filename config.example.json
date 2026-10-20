@@ -1,0 +1,63 @@
+{
+  // 复制成 config.json 后按需修改（读取时允许 // 与 /* */ 注释）。
+  // 全部字段都有默认值，删掉任何一项都等于用默认值。
+
+  "server": {
+    "addr": ":5200"
+  },
+
+  // 数据目录：SQLite、封面、下载的视频、ffmpeg 缓存都在这里
+  "data_dir": "./videodata",
+
+  // debug / info / warn / error
+  "log_level": "info",
+
+  // 低配模式（NAS / 4G 内存推荐）：先套一套低配默认值，
+  // 本文件里显式写过的字段仍会覆盖它（例如 lowmem=true 同时写 pages=8）
+  "lowmem": false,
+
+  // Go GC 软内存上限（MiB），0=不限；lowmem 时默认 768
+  "mem_limit_mb": 0,
+  // GOMAXPROCS，0=自动；lowmem 时默认 min(核数,3)
+  "max_procs": 0,
+
+  "collect": {
+    "pages": 6,          // 每个接口的分页采集并发数
+    "sources": 8,        // 同时采集的接口数上限
+    "incr_every": "1h",  // 定时增量间隔：1h / 30m / 1h30m
+    "incr_pages": 5      // 定时增量每次同步前 N 页，0=不限
+  },
+
+  "download": {
+    "workers": 1,          // 同时下载的集数（实际固定串行）
+    "seg_concurrency": 16, // 单任务分片并发
+    "seg_budget": 0,       // 全局分片并发上限，0=workers × seg_concurrency
+    "min_free_mb": 2048    // 磁盘剩余空间低于该值(MiB)时拒绝新下载并暂停队列，0=关闭
+  },
+
+  "cover": {
+    "workers": 2,          // 封面预取协程数
+    "concurrency": 4,      // 封面同时连接/解码并发
+    "img_proxy": ""        // 图片代理前缀，如 https://wsrv.nl/?url=
+  },
+
+  "ffmpeg": {
+    "threads": 0,          // ffmpeg 线程数，0=默认；NAS 建议 1~2
+    "reencode": true,      // 音画不同步时是否全量重编码（弱 CPU 上很慢）
+    "verify": true         // 合并后是否做音画同步自检
+  },
+
+  "db": {
+    "cache_mb": 64,        // SQLite 每连接页缓存（MiB）
+    "mmap_mb": 1024,       // 内存映射大小（MiB，0=关闭；网络盘建议 0）
+    "conns": 4,            // 最大连接数（WAL 一写多读）
+    "page_size": 0,        // 页大小字节数（如 8192），0=不改
+    "vacuum_pct": 15       // 空闲页占比超过该值时自动整理，0=关闭
+  },
+
+  "update": {
+    "repo": "",            // 留空=anglers/video（Gitee）
+    "branch": "",          // 留空=master
+    "token": ""            // 可选：Gitee 私人令牌（匿名下载被拦时用）
+  }
+}

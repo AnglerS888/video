@@ -232,7 +232,11 @@ export interface FfmpegStatus {
 }
 
 export interface SysInfo {
-  app: { version: string; go: string; os: string; arch: string; pid: number; uptime_sec: number; started_at: string }
+  app: {
+    version: string; go: string; os: string; arch: string; pid: number; uptime_sec: number; started_at: string
+    /** 当前使用的配置文件路径 */
+    config_file: string
+  }
   ffmpeg: FfmpegStatus
   data: {
     dir: string; db_bytes: number; img_bytes: number; img_count: number
@@ -272,6 +276,8 @@ export interface UpdateInfo {
   build_time: string
   /** docker / direct */
   mode: string
+  /** 更新源仓库网页地址（Gitee） */
+  site_url: string
   repo: string
   branch: string
   latest_version: string
@@ -295,11 +301,7 @@ export interface UpdateStatus {
   bytes: number
   total: number
   source_dir?: string
-  new_binary?: string
-  /** 已编译完成，可「重启并应用」 */
-  ready: boolean
-  /** 源码已下载但本机缺 Go 工具链 */
-  need_go: boolean
+  /** 在宿主机重建镜像的步骤（仅 Docker 模式） */
   instructions?: string[]
   error?: string
   updated_at: string

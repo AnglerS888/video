@@ -1,0 +1,14 @@
+{
+  // 低配示例：NAS / 4G 内存直接用它（make run-lowmem 会加载这个文件）
+  // 也可以把它复制成 config.json 当主配置。
+  "server": { "addr": ":5200" },
+  "data_dir": "./videodata",
+  "log_level": "info",
+
+  "lowmem": true,
+  "mem_limit_mb": 768,
+
+  // 想覆盖 lowmem 预设的单项，就在这里显式写，例如：
+  // "collect": { "pages": 8 }
+  "collect": { "incr_every": "1h", "incr_pages": 5 }
+}

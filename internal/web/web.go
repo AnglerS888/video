@@ -31,10 +31,10 @@ type Server struct {
 	StartedAt time.Time
 	// VacuumPct 自动整理数据库的空闲页占比阈值（-vacuum-pct），信息页据此提示「建议整理」
 	VacuumPct int
+	// ConfigPath 当前使用的配置文件路径（信息页展示）
+	ConfigPath string
 	// Up 在线更新器（检查/下载/编译/重启）
 	Up *updater.Updater
-	// Shutdown 优雅停机回调：重启应用新版本时由更新接口调用
-	Shutdown func()
 
 	listMu    sync.Mutex
 	listCache map[string]listCacheItem

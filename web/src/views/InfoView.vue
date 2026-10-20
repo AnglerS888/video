@@ -231,11 +231,10 @@ const upInfo = ref<UpdateInfo | null>(null)
 const upStatus = ref<UpdateStatus | null>(null)
 const upChecking = ref(false)
 const upApplying = ref(false)
-const restarting = ref(false)
 let upTimer: number | undefined
 
 const isDocker = computed(() => upInfo.value?.mode === 'docker')
-const upBusy = computed(() => ['downloading', 'extracting', 'building', 'applying'].includes(upStatus.value?.phase || ''))
+const upBusy = computed(() => ['downloading', 'extracting'].includes(upStatus.value?.phase || ''))
 
 const upPhaseText = computed(() => {
   const s = upStatus.value
@@ -243,9 +242,6 @@ const upPhaseText = computed(() => {
   switch (s.phase) {
     case 'downloading': return '正在下载最新源码…'
     case 'extracting': return '正在解压…'
-    case 'building': return '正在编译新版本…'
-    case 'applying': return '正在替换并重启…'
-    case 'ready': return '新版本已编译完成'
     case 'staged': return '源码已就绪'
     case 'failed': return '更新失败'
     default: return s.message || ''
@@ -257,28 +253,45 @@ async function loadVersion() {
   if (!r.ok || !r.data) return
   upInfo.value = r.data.info
   upStatus.value = r.data.status
-  if (['downloading', 'extracting', 'building'].includes(r.data.status?.phase || '')) {
+  if (['downloading', 'extracting'].includes(r.data.status?.phase || '')) {
     upApplying.value = true
     pollUp()
   }
+  maybeAutoCheck()
 }
 
-async function checkUp() {
+async function checkUp(silent = false) {
   if (upChecking.value) return
   upChecking.value = true
   const r = await api.checkUpdate()
   upChecking.value = false
-  if (!r.ok || !r.data) return toast(r.msg || '检查更新失败', 'err', 4000)
+  if (!r.ok || !r.data) {
+    if (!silent) toast(r.msg || '检查更新失败', 'err', 4000)
+    return
+  }
   upInfo.value = r.data
-  if (r.data.error) return toast(r.data.error, 'err', 5000)
-  toast(r.data.available ? '发现可用更新' : '当前已是最新版本', r.data.available ? 'ok' : 'info', 2400)
+  if (r.data.error) {
+    if (!silent) toast(r.data.error, 'err', 5000)
+    return
+  }
+  if (!silent) toast(r.data.available ? '发现可用更新' : '当前已是最新版本', r.data.available ? 'ok' : 'info', 2400)
+}
+
+// 进信息页时自动检查一次：超过 30 分钟没查过才查，避免每次刷新都打接口
+async function maybeAutoCheck() {
+  const t = upInfo.value?.checked_at
+  if (!t) return checkUp(true)
+  const ts = Date.parse(t.replace(' ', 'T'))
+  if (Number.isNaN(ts) || Date.now() - ts > 30 * 60 * 1000) return checkUp(true)
 }
 
 async function applyUp() {
   if (upApplying.value || upBusy.value) return
-  const tip = isDocker.value
-    ? 'Docker 模式会把最新源码下载到数据目录 update/src。\n编译需要在宿主机执行 docker compose build，然后 up -d。继续？'
-    : '将下载最新源码，并用本机 Go 工具链编译新版本（约 1~2 分钟）。继续？'
+  if (!upInfo.value?.available) return toast('当前没有可用的新版本', 'info', 2200)
+  if (!isDocker.value) {
+    return toast('直接运行模式不支持自动更新，请到 Gitee 下载最新版', 'info', 3000)
+  }
+  const tip = '会把最新源码下载到数据目录 update/src。\n容器里没有 Go，编译需要在宿主机执行 docker compose build，然后 up -d。继续？'
   if (!confirm(tip)) return
   upApplying.value = true
   const r = await api.applyUpdate()
@@ -296,37 +309,14 @@ function pollUp() {
     const r = await api.updateStatus()
     if (!r.ok || !r.data) return
     upStatus.value = r.data
-    if (['ready', 'staged', 'failed'].includes(r.data.phase)) {
+    if (['staged', 'failed'].includes(r.data.phase)) {
       if (upTimer) { window.clearInterval(upTimer); upTimer = undefined }
       upApplying.value = false
       if (r.data.phase === 'failed') toast(r.data.error || '更新失败', 'err', 6000)
-      else if (r.data.phase === 'ready') toast('新版本已编译完成，点「重启并应用」生效', 'ok', 4000)
-      else toast(r.data.message || '源码已就绪', 'ok', 4000)
+      else toast(r.data.message || '源码已就绪，请到宿主机重建镜像', 'ok', 5000)
       loadVersion()
     }
   }, 1200)
-}
-
-async function restartUp() {
-  if (restarting.value) return
-  if (!confirm('将替换程序文件并重启服务，页面会短暂断开（约 3~15 秒）。继续？')) return
-  restarting.value = true
-  const r = await api.restartUpdate()
-  if (!r.ok) {
-    restarting.value = false
-    return toast(r.msg || '重启失败', 'err', 5000)
-  }
-  toast(r.data?.msg || '正在重启…', 'ok', 3000)
-  // 轮询 /healthz，服务回来后自动刷新（重启成功后进程会重载页面数据）
-  for (let i = 0; i < 40; i++) {
-    await new Promise((res) => setTimeout(res, 1500))
-    try {
-      const h = await fetch('/healthz', { cache: 'no-store' })
-      if (h.ok) { location.reload(); return }
-    } catch { /* 还没起来，继续等 */ }
-  }
-  toast('服务 60 秒内未恢复，请手动刷新或查看进程日志', 'err', 8000)
-  restarting.value = false
 }
 
 onMounted(() => {
@@ -510,6 +500,10 @@ onBeforeUnmount(() => {
             <div class="flex justify-between gap-3"><dt class="muted">系统 / 架构</dt><dd>{{ info.app.os }} / {{ info.app.arch }}</dd></div>
             <div class="flex justify-between gap-3"><dt class="muted">进程 PID</dt><dd class="tabular-nums">{{ info.app.pid }}</dd></div>
             <div class="flex justify-between gap-3"><dt class="muted">启动时间</dt><dd>{{ info.app.started_at }}</dd></div>
+            <div class="flex justify-between gap-3 sm:col-span-2">
+              <dt class="shrink-0 muted">配置文件</dt>
+              <dd class="min-w-0 truncate text-right" :title="info.app.config_file">{{ info.app.config_file || '—' }}</dd>
+            </div>
             <div class="flex justify-between gap-3"><dt class="muted">已运行</dt><dd>{{ fmtUptime(info.app.uptime_sec) }}</dd></div>
           </dl>
 
@@ -579,7 +573,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="flex justify-between gap-3">
               <dt class="muted">更新源</dt>
-              <dd class="truncate" :title="(upInfo?.repo || '') + '@' + (upInfo?.branch || '')">{{ upInfo?.repo || '—' }}@{{ upInfo?.branch || '—' }}</dd>
+              <dd class="truncate" :title="upInfo?.site_url || ''">gitee.com/{{ upInfo?.repo || '—' }}@{{ upInfo?.branch || '—' }}</dd>
             </div>
             <div class="flex justify-between gap-3">
               <dt class="muted">最新提交</dt>
@@ -615,7 +609,7 @@ onBeforeUnmount(() => {
           </div>
 
           <!-- 结果：已编译 / 源码已就位 / 失败 -->
-          <div v-else-if="upStatus && ['ready', 'staged', 'failed'].includes(upStatus.phase)" class="rounded-lg bg-slate-50 px-2.5 py-2 dark:bg-white/5">
+          <div v-else-if="upStatus && ['staged', 'failed'].includes(upStatus.phase)" class="rounded-lg bg-slate-50 px-2.5 py-2 dark:bg-white/5">
             <p class="text-xs" :class="upStatus.phase === 'failed' ? 'text-rose-500' : 'font-medium'">{{ upStatus.message }}</p>
             <ul v-if="upStatus.instructions?.length" class="mt-1 space-y-0.5 break-all text-[11px] muted">
               <li v-for="(t, i) in upStatus.instructions" :key="i">{{ t }}</li>
@@ -624,21 +618,36 @@ onBeforeUnmount(() => {
           </div>
 
           <div class="flex flex-wrap items-center gap-2">
-            <button class="btn btn-primary btn-sm" :disabled="upApplying || upBusy || restarting" @click="applyUp">
-              {{ upApplying || upBusy ? '更新中…' : isDocker ? '下载最新源码' : '下载并更新' }}
-            </button>
-            <button v-if="!isDocker" class="btn btn-ghost btn-sm" :disabled="!upStatus?.ready || restarting" @click="restartUp">
-              {{ restarting ? '重启中…' : '重启并应用' }}
-            </button>
+            <template v-if="isDocker">
+              <button
+                class="btn btn-primary btn-sm"
+                :disabled="!upInfo?.available || upApplying || upBusy"
+                :title="upInfo?.available ? '' : '当前已是最新版本（或还没检查），不支持下载'"
+                @click="applyUp"
+              >
+                {{ upApplying || upBusy ? '更新中…' : '下载最新源码' }}
+              </button>
+            </template>
+            <a
+              class="btn btn-primary btn-sm"
+              v-else
+              :href="upInfo?.site_url || 'https://gitee.com/anglers/video'"
+              target="_blank" rel="noopener"
+            >打开 Gitee 手动更新</a>
             <a
               class="btn btn-ghost btn-sm"
-              :href="`https://github.com/${upInfo?.repo || 'AnglerS888/video'}`"
+              :href="upInfo?.site_url || 'https://gitee.com/anglers/video'"
               target="_blank" rel="noopener"
-            >GitHub 仓库</a>
+            >Gitee 仓库</a>
           </div>
           <p v-if="isDocker" class="text-[11px] muted">
-            Docker 模式容器内没有 Go 工具链，不会自动编译：源码下载到数据目录后，在宿主机执行
+            自动更新只在 Docker 容器内提供：容器里没有 Go 工具链，所以只把最新源码下载到数据目录，
+            随后在宿主机项目目录 <code>git pull</code>（或同步上面的源码）并执行
             <code>docker compose build && docker compose up -d</code> 生效（volume 数据不受影响）。
+          </p>
+          <p v-else class="text-[11px] muted">
+            当前为<strong>直接运行</strong>模式，不支持自动更新：请到 Gitee 下载最新版（或最新源码自行编译），
+            替换程序文件后重启即可；数据目录与配置不受影响。
           </p>
         </section>
 

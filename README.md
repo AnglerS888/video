@@ -37,17 +37,48 @@
 ### 二进制运行
 
 ```bash
-make build                                    # 产出 bin/videodl.exe（当前平台）
-./bin/videodl -addr :5200 -data ./videodata
+make build                    # 产出 bin/videodl.exe（当前平台）
+./bin/videodl                 # 首次运行会在当前目录生成 config.json
 ```
 
-打开 <http://localhost:5200>。
+打开 <http://localhost:5200>。端口、数据目录、并发、低配模式等**全部在 `config.json`**：
+
+```bash
+cp config.example.json config.json   # 全字段带注释的模板
+cp config.lowmem.json  config.json   # NAS / 4G 内存：低配预设
+```
+
+配置文件允许写 `//` 注释；容器里用 `VDL_CONFIG` 指向 volume 上的 `config.json`（compose 已配好）。
 
 ### Docker
 
 ```bash
 docker compose up -d
 ```
+
+### Linux 一键部署 / 更新（推荐）
+
+```bash
+chmod +x deploy.sh
+sudo ./deploy.sh                 # 交互式：询问宿主端口、数据存储路径
+sudo ./deploy.sh --yes           # 不交互；已有容器则沿用它的端口与数据目录
+./deploy.sh --dry-run            # 只打印将要执行的命令，不安装、不构建
+```
+
+脚本会依次做：
+
+1. **检测 Docker**：没有就按发行版自动安装（apt / dnf / yum / apk / zypper），并 `enable --now`
+   启动服务；国内拉不到镜像可加 `--registry-mirror https://docker.m.daocloud.io`；
+2. **拉最新源码**：目录里是 git 仓库就 `git pull`，否则下载 Gitee 的 `master.zip` 解压；
+3. **构建镜像**：`docker build --build-arg APP_VERSION=<VERSION>`，旧镜像自动标记为
+   `videodl:previous`（回滚用）；
+4. **启动容器**：`--restart unless-stopped`、`-p <端口>:5200`、`-v <数据目录>:/app/videodata`、
+   `VDL_CONFIG=/app/videodata/config.json`，并等 `/healthz` 通过；
+5. **再次执行 = 更新**：自动读取现有容器的端口与数据目录，重建镜像后替换容器；
+   新镜像启动失败会自动回滚到 `videodl:previous`。
+
+常用参数：`--port` / `--data` / `--source-dir` / `--registry-mirror` / `--no-install` / `--yes`，
+完整说明见 `./deploy.sh --help`。
 
 镜像不再内置 ffmpeg（二进制约 12MB，不再是 40MB）。运行时的解析顺序是：
 
@@ -156,14 +187,17 @@ git 提交哈希和构建时间一起通过 `-ldflags` 注入 `internal/version`
 
 ```bash
 ./videodl -version
-# videodl v1.3.0 (ced2295)
-#   commit: ced2295
+# videodl v1.3.1 (d943a63)
+#   commit: d943a63
 #   build : 2026-10-20 03:40:34
 #   go     : go1.26.0 linux/amd64
 #   mode   : Docker 容器
 ```
 
-「信息」页有**版本与更新**卡片：显示当前版本/提交/构建时间、一键检查、下载、编译、重启。
+「信息」页有**版本与更新**卡片：显示当前版本/提交/构建时间，可一键检查是否有新版本。
+
+**自动更新只在 Docker 容器内提供**；直接运行（单个二进制 / NAS 裸跑）只显示 Gitee 仓库链接，
+由用户自己下载最新版本手动替换（数据目录和 `config.json` 都不受影响）。
 
 ### 怎么判断有没有更新
 
@@ -173,41 +207,43 @@ git 提交哈希和构建时间一起通过 `-ldflags` 注入 `internal/version`
 2. 本机构建时记录了提交哈希，且与远端 `main` 最新提交不同；
 3. 本机没有提交哈希（直接 `go build`）时，远端提交时间晚于本机构建时间（2 分钟容差）。
 
-检查走 GitHub API；**直连失败会自动切国内镜像**（默认 `ghproxy.net`、`gh-proxy.com`）。
-镜像可用 `-update-proxy` / `VDL_UPDATE_PROXY` 覆盖（逗号分隔），例如：
+检查走 Gitee OpenAPI（`https://gitee.com/api/v5/repos/anglers/video/commits/master`），
+版本号读 `https://gitee.com/anglers/video/raw/master/VERSION`。
+**只支持 Gitee**（GitHub 仓库已删除，不再做镜像回退）。
+
+### 更新流程（仅 Docker 容器）
+
+源码包来自 `https://gitee.com/anglers/video/repository/archive/master.zip`，
+下载后解压到 `<数据目录>/update/src`，并校验 `go.mod` 与 `internal/web/static/index.html`
+是否存在（防止把登录/验证网页当成源码）。
+
+容器内没有 Go 工具链，也无法替换正在运行的镜像，所以「更新」只做两件事：
+把最新源码落到数据目录（`/app/videodata/update/src`），然后由你在宿主机项目目录执行：
 
 ```bash
-./videodl -update-proxy "https://ghproxy.net/,https://gh-proxy.com/"
-```
-
-### 更新流程
-
-源码包来自 `https://github.com/AnglerS888/video/archive/refs/heads/main.zip`，直连失败自动走镜像。
-下载后解压到 `<数据目录>/update/src`，并校验 `go.mod` 与 `internal/web/static/index.html` 是否存在
-（防镜像返回错误页）。
-
-**直接运行（单个二进制 / NAS 上裸跑）**
-
-- 用本机 Go 工具链在 `update/src` 里编译新二进制（`GOTOOLCHAIN=auto`，本机 Go 版本低时会自动下载对应工具链）；
-- 点「重启并应用」后：
-  - **Windows**：生成 `videodata/update/apply-update.bat`，进程退出后由脚本覆盖 exe 并**按原启动参数**
-    重新拉起（等 15 秒重试，避免文件占用）；
-  - **Linux / macOS**：先备份为 `*.bak`，再 `rename` 覆盖并 `exec` 新二进制，端口不中断太久。
-- 本机没装 Go 时不会强失败：源码会留在 `update/src`，页面给出提示与手动编译命令。
-
-**Docker**
-
-容器内没有 Go 工具链，也没有宿主机 docker 权限，所以只下载源码到 `<数据目录>/update/src`，
-然后在宿主机项目目录执行：
-
-```bash
+git pull                                   # 或把 update/src 同步到项目目录
 docker compose build && docker compose up -d
 ```
 
-数据目录是 volume，重建镜像不影响影片、进度与下载文件。想省事可在 compose 里加
-`- VDL_UPDATE_PROXY=...` 指定镜像。
+数据目录是 volume，重建镜像不影响影片、进度、下载文件与 `config.json`。
 
-> 更新只跟随 `main` 分支；想换源（fork）用 `-update-repo owner/name` 或 `VDL_UPDATE_REPO`。
+**直接运行（非容器）**
+
+不提供自动更新，接口也会直接拒绝。信息页只给「打开 Gitee 手动更新」按钮，流程是：
+
+1. 到 <https://gitee.com/anglers/video> 下载最新版二进制（自己编译也行）；
+2. 停掉旧进程，用新文件替换原程序；
+3. 重新启动（配置和数据目录都在 `config.json`/`videodata`，不用动）。
+
+> 想升级发行包/自己发布的二进制：在 Gitee 上传 Release 后把下载地址告诉我，可以再加一条
+> 「直接下载二进制替换」的路径；目前仓库只有源码包。
+
+> 匿名下载源码包时 Gitee 可能要求登录/验证（返回网页而不是 zip）。
+> 遇到这种情况在配置文件的 `update.token` 填 Gitee 私人令牌即可改走官方 `zipball` 接口。
+
+> 更新只跟随 `master` 分支；想换源（fork）改配置里的 `update.repo`。
+
+> 「下载最新源码」按钮**只有检测到新版本时才可点**；进信息页会自动检查一次（30 分钟内不重复查）。
 
 ## 数据目录
 
@@ -226,62 +262,116 @@ videodata/
 目录名历史：`data/` → `videos_data/` → **`videodata/`**。启动时如果只找到旧目录名（且里面有库），
 会自动改名迁移过来；改名失败（被占用 / 跨盘）则继续使用旧目录，保证程序能起来。
 
-## 配置参数
+## 配置文件
 
-### 命令行
+**所有配置都在 `config.json` 里，没有命令行参数**（只保留 `./videodl -version` 打印版本后退出）。
+改完重启生效。
 
-| 参数 | 默认 | 说明 |
+### 文件位置
+
+按顺序查找，都找不到就在第一个可写位置生成一份带默认值的 `config.json`：
+
+1. 环境变量 `VDL_CONFIG` 指定的路径（不存在会在该处生成；**容器里推荐指向 volume**，见 compose）
+2. 当前目录 `./config.json`
+3. 程序所在目录 `config.json`
+4. 当前目录 `videodata/config.json`
+
+文件是 JSON，但**允许 `//` 行注释和 `/* */` 块注释**（读取前会剥掉），可以放心加说明。
+仓库里附了 `config.example.json`（全字段带注释）与 `config.lowmem.json`（低配示例）。
+
+### 示例
+
+```json
+{
+  "server": { "addr": ":5200" },
+
+  // 数据目录：SQLite、封面、下载的视频、ffmpeg 缓存都在这里
+  "data_dir": "./videodata",
+  "log_level": "info",          // debug / info / warn / error
+
+  // 低配模式：先套一套 NAS 友好的默认值，本文件里显式写了的字段仍可覆盖它
+  "lowmem": false,
+  "mem_limit_mb": 0,            // Go GC 软上限（MiB），0=不限；lowmem 时默认 768
+  "max_procs": 0,               // GOMAXPROCS，0=自动；lowmem 时默认 min(核数,3)
+
+  "collect": { "pages": 6, "sources": 8, "incr_every": "1h", "incr_pages": 5 },
+
+  "download": {
+    "workers": 1,               // 同时下载的集数（实际固定串行）
+    "seg_concurrency": 16,      // 单任务分片并发
+    "seg_budget": 0,            // 全局分片并发，0=workers × seg_concurrency
+    "min_free_mb": 2048         // 磁盘剩余空间保护阈值，0=关闭
+  },
+
+  "cover": { "workers": 2, "concurrency": 4, "img_proxy": "" },
+
+  "ffmpeg": { "threads": 0, "reencode": true, "verify": true },
+
+  "db": { "cache_mb": 64, "mmap_mb": 1024, "conns": 4, "page_size": 0, "vacuum_pct": 15 },
+
+  "update": { "repo": "", "branch": "", "token": "" }
+}
+```
+
+### 字段说明
+
+| 字段 | 默认 | 说明 |
 |---|---|---|
-| `-addr` | `:5200` | HTTP 监听地址 |
-| `-data` | `./videodata` | 数据目录；不指定时自动查找已有 `videodl.db` 的目录并迁移旧名 |
-| `-version` | — | 打印版本后退出 |
-| `-log-level` | `info` | `debug` / `info` / `warn` / `error` |
-| `-pages` | `6` | 每个接口的分页采集并发数 |
-| `-sources` | `8` | 同时采集的接口数上限（上限硬顶 16） |
-| `-incr-every` | `1h` | 定时增量采集间隔 |
-| `-incr-pages` | `5` | 定时增量每次同步的页数，`0` 表示不限 |
-| `-dl-workers` | `1` | 同时下载的集数（固定串行，大于 1 会被忽略） |
-| `-seg-concurrency` | `16` | 单个下载任务内的分片并发数 |
-| `-seg-budget` | 自动 | 全局分片并发上限，默认 `dl-workers × seg-concurrency` |
-| `-cover-workers` | `2` | 封面预取协程数（下载速度由全局限速控制，2 个足够） |
-| `-cover-concurrency` | `4` | 封面同时连接源站/解码的并发上限 |
-| `-img-proxy` | 空 | 封面图片代理前缀，如 `https://wsrv.nl/?url=`，源站封面拉不到时使用 |
-| `-ffmpeg-threads` | 自动 | ffmpeg 线程数，NAS 建议 `1`~`2` |
-| `-ffmpeg-reencode` | `true` | 音画不同步时是否全量重编码（弱 CPU 上很慢，可关） |
-| `-ffmpeg-verify` | `true` | 合并后是否做音画同步自检 |
-| `-db-cache-mb` | `64` | SQLite **每个连接**的页缓存（MiB）；8G 内存建议 64~128，4G 用 `-lowmem`（24） |
-| `-db-mmap-mb` | `1024` | 内存映射大小（MiB，`0` 关闭）；数据库放 SMB/NFS 等网络盘时建议设 `0` |
-| `-db-conns` | `4` | 最大连接数；WAL 下一个写者 + 多个读者，`1` 会让慢查询堵住整站 |
-| `-db-page-size` | `0` | 页大小字节数（如 `8192`）；`0` 不改。改已有库会先 VACUUM 重写一次 |
-| `-vacuum-pct` | `15` | 空闲页占比超过该值时自动整理数据库，`0` 关闭 |
-| `-min-free-mb` | `2048` | 磁盘剩余空间保护阈值（MiB）：低于该值拒绝新下载并暂停队列，`0` 关闭 |
-| `-update-proxy` | 内置镜像 | 更新用的 GitHub 镜像前缀，逗号分隔（也可用 `VDL_UPDATE_PROXY`） |
-| `-update-repo` | `AnglerS888/video` | 更新源仓库 `owner/name`（也可用 `VDL_UPDATE_REPO`） |
-| `-lowmem` | `false` | 低配模式，自动下调并发、关闭全量重编码、限制 GC 内存 |
-| `-memlimit` | 不限 | Go GC 软内存上限（MiB），`-lowmem` 时默认 `768` |
-| `-maxprocs` | 自动 | `GOMAXPROCS`，`-lowmem` 时默认 `min(核数, 3)` |
+| `server.addr` | `:5200` | HTTP 监听地址 |
+| `data_dir` | `./videodata` | 数据目录；不写时自动查找已有 `videodl.db` 的目录并迁移旧名 |
+| `log_level` | `info` | 日志级别 |
+| `lowmem` | `false` | 低配模式（NAS 推荐）：下调并发、关全量重编码、限制 GC 内存 |
+| `mem_limit_mb` | `0` | Go GC 软内存上限（MiB），0=不限制 |
+| `max_procs` | `0` | `GOMAXPROCS`，0=自动 |
+| `collect.pages` | `6` | 每个接口的分页采集并发数 |
+| `collect.sources` | `8` | 同时采集的接口数上限 |
+| `collect.incr_every` | `1h` | 定时增量间隔（Go duration：`1h` / `30m` / `1h30m`） |
+| `collect.incr_pages` | `5` | 定时增量每次同步的页数，0=不限 |
+| `download.workers` | `1` | 同时下载的集数（固定串行） |
+| `download.seg_concurrency` | `16` | 单任务分片并发 |
+| `download.seg_budget` | `0` | 全局分片并发上限，0=自动 |
+| `download.min_free_mb` | `2048` | 磁盘保护阈值（MiB）：低于该值拒绝新下载并暂停队列，0=关闭 |
+| `cover.workers` | `2` | 封面预取协程数 |
+| `cover.concurrency` | `4` | 封面同时连接/解码的并发上限 |
+| `cover.img_proxy` | 空 | 封面图片代理前缀，如 `https://wsrv.nl/?url=` |
+| `ffmpeg.threads` | `0` | ffmpeg 线程数，0=默认；NAS 建议 1~2 |
+| `ffmpeg.reencode` | `true` | 音画不同步时是否全量重编码（弱 CPU 上很慢，可关） |
+| `ffmpeg.verify` | `true` | 合并后是否做音画同步自检 |
+| `db.cache_mb` | `64` | SQLite 每连接页缓存（MiB）；4G 内存建议 `lowmem`（24） |
+| `db.mmap_mb` | `1024` | 内存映射大小（MiB，0 关闭）；网络盘建议 0 |
+| `db.conns` | `4` | SQLite 最大连接数（WAL 一写多读） |
+| `db.page_size` | `0` | 页大小（如 `8192`）；0=不改。改已有库会先 VACUUM 重写一次 |
+| `db.vacuum_pct` | `15` | 空闲页占比超过该值自动整理，0 关闭 |
+| `update.repo` | `anglers/video` | 更新源仓库（Gitee） |
+| `update.branch` | `master` | 更新跟踪分支 |
+| `update.token` | 空 | 可选 Gitee 私人令牌，配了走官方 zipball 接口 |
 
-`-lowmem` 只在参数**没有被显式指定**时套用预设：`pages=3`、`sources=2`、`cover-workers=1`、
-`cover-concurrency=2`、`seg-concurrency=6`、`ffmpeg-threads=1`、`ffmpeg-reencode=false`、
-`memlimit=768`、`maxprocs=min(核数,3)`。所以可以写 `-lowmem -pages 8` 只覆盖单项。
+### 低配模式怎么生效
+
+`"lowmem": true` 时先取一套低配默认值（`pages=3`、`sources=2`、`cover.workers=1`、
+`cover.concurrency=2`、`download.seg_concurrency=6`、`ffmpeg.threads=1`、`ffmpeg.reencode=false`、
+`mem_limit_mb=768`、`max_procs=min(核数,3)`、`db.cache_mb=24`、`db.mmap_mb=256`、`db.conns=2`），
+**再用配置文件里显式写过的字段覆盖**。所以可以 `"lowmem": true` 同时单独写 `"pages": 8`。
 
 ### 环境变量
 
+只保留少量运行环境相关的开关，**常规配置一律走配置文件**：
+
 | 变量 | 说明 |
 |---|---|
-| `VDL_LOG_LEVEL` | 日志级别，等价于 `-log-level` |
-| `VDL_HTTP_LOG=1` | 打印每个 API 请求的访问日志（默认只记录耗时超过 1s 的慢请求） |
+| `VDL_CONFIG` | 指定配置文件路径（容器里指向 volume 上的 `config.json`） |
+| `VDL_HTTP_LOG=1` | 打印每个 API 请求的访问日志（默认只记慢请求） |
 | `VDL_COLLECT_RETRY_DELAY` | 采集失败后的等待秒数，默认 `180` |
-| `VDL_COLLECT_PAGE_DELAY` | 全量采集每页间隔，`3-5`（默认）/ `2` / `0`（不限速） |
-| `VDL_COVER_GAP_MS` | 封面下载间隔（毫秒），`500-1000`（默认）/ `800` / `0`（不限速） |
-| `VDL_FFMPEG` | 指定 ffmpeg 可执行文件路径，优先级最高（系统已装但不在 PATH 时用） |
+| `VDL_COLLECT_PAGE_DELAY` | 全量采集每页间隔，`3-5`（默认）/ `2` / `0` |
+| `VDL_COVER_GAP_MS` | 封面下载间隔（毫秒），`500-1000`（默认）/ `800` / `0` |
+| `VDL_FFMPEG` | 指定 ffmpeg 可执行文件路径（优先级最高） |
 
 ## 部署到 NAS
 
 以 4G 内存、J4125 这类弱 CPU 的机型为例：
 
 ```bash
-./videodl-linux-amd64 -addr :5200 -data /vol1/videodata -lowmem
+VDL_CONFIG=/vol1/videodata/config.json ./videodl-linux-amd64
 ```
 
 首次启动若系统没装 ffmpeg，进「信息」页点一次「下载 ffmpeg」即可（约 29MB，落在 `videodata/bin/`，
@@ -289,14 +379,14 @@ videodata/
 
 或直接用仓库里的 `docker-compose.yml`，已经配好：
 
-- `-lowmem -memlimit 768`
+- `lowmem: true`（配置见 `config.lowmem.json`）
 - 容器内存上限 1G，数据卷 `./videodata:/app/videodata`
 - `init: true` + `stop_grace_period: 30s`，`docker stop` 时能让合并中的 ffmpeg 收尾
 - 日志按 10MB × 3 份滚动，避免长期运行吃掉系统盘
 - 健康检查用 `/healthz`（只做 `SELECT 1`），不用会扫全表的 `/api/system`
 
 实测空载 / 小库时常驻约 80~120MB（不再内嵌 ffmpeg，省掉约 40MB 只读段），均不含转码时的额外开销；
-采集与封面预取高峰期会明显上升，NAS 建议配合 `-lowmem`。
+采集与封面预取高峰期会明显上升，NAS 建议在配置里开 `lowmem`。
 
 ### 构建多平台二进制
 
@@ -423,7 +513,7 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 
 ```
 .
-├── main.go                  # 启动、参数解析、目录迁移、优雅退出
+├── main.go                  # 启动、配置加载、目录迁移、优雅退出
 ├── internal/
 │   ├── collector/           # 采集、封面预取、下载队列
 │   ├── db/                  # 建表、迁移、聚合表、空间整理

@@ -5,6 +5,8 @@ data/
 .git/
 *.exe
 *.db
+# 本地配置（可能含 Gitee 令牌）不进镜像
+config.json
 *.db-shm
 *.db-wal
 # 前端源码与依赖不需要进镜像（只用构建好的 internal/web/static）
