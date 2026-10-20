@@ -100,7 +100,22 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------- 基础检查 ----------
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# 管道执行（curl ... | bash）时 BASH_SOURCE 未定义：退回当前目录，
+# 否则 set -u 会在 bash 4.2 上直接报「BASH_SOURCE[0]: 为绑定变量」
+SELF="${BASH_SOURCE[0]:-}"
+if [ -z "$SELF" ] || [ "$SELF" = "bash" ] || [ "$SELF" = "-" ] || [ "$SELF" = "/dev/stdin" ]; then
+  SCRIPT_DIR="$(pwd)"
+  PIPED=1
+else
+  SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+  PIPED=0
+fi
+
+if [ "$PIPED" = "1" ] && [ "$ASSUME_YES" != "1" ]; then
+  warn "检测到从管道执行（curl ... | bash）：stdin 不是终端，端口/数据目录将使用默认值。"
+  warn "想交互选择请先下载脚本：curl -fsSL https://gitee.com/${GITEE_REPO}/raw/${GITEE_BRANCH}/deploy.sh -o deploy.sh && chmod +x deploy.sh && ./deploy.sh"
+fi
+
 
 need_root() {
   [ "$DRY_RUN" = "1" ] && return 0
@@ -376,8 +391,9 @@ fetch_source() {
     [ -n "$top" ] || die "解压后没有目录，源码包异常"
     # 目标目录不是 git 仓库且有旧内容：先整体挪到 .bak，避免旧文件残留导致编译失败
     if [ -d "$SOURCE_DIR" ] && [ -n "$(ls -A "$SOURCE_DIR" 2>/dev/null || true)" ] && [ ! -d "$SOURCE_DIR/.git" ]; then
-      local bak="${SOURCE_DIR}.bak.$(date +%s)"
-      warn "源码目录已有旧内容，先备份到 $bak"
+      local bak="${SOURCE_DIR}.bak"
+      warn "源码目录已有旧内容，先备份到 $bak（只保留最近一份）"
+      [ -d "$bak" ] && run rm -rf "$bak"
       run mv "$SOURCE_DIR" "$bak"
     fi
     run mkdir -p "$SOURCE_DIR"
@@ -401,16 +417,21 @@ build_image() {
   fi
 
   info "版本：$ver（构建阶段会拉取 golang / alpine 基础镜像，首次较慢）"
-  local extra=()
-  [ -n "$APK_MIRROR" ] && extra+=(--build-arg "APK_MIRROR=$APK_MIRROR")
-  if [ ${#extra[@]} -gt 0 ]; then
+  # 注意：不要用数组累积 build-arg —— CentOS 7 自带 bash 4.2，
+  # set -u 下空数组展开 "\${arr[@]}" 会报「arr: 为绑定变量」，这里直接分两个分支。
+  if [ -n "$APK_MIRROR" ]; then
     info "Alpine 软件源：$APK_MIRROR"
+    run docker build \
+      --build-arg "APP_VERSION=$ver" \
+      --build-arg "GOPROXY=$GOPROXY_ARG" \
+      --build-arg "APK_MIRROR=$APK_MIRROR" \
+      -t "$IMAGE_NAME" "$SOURCE_DIR"
+  else
+    run docker build \
+      --build-arg "APP_VERSION=$ver" \
+      --build-arg "GOPROXY=$GOPROXY_ARG" \
+      -t "$IMAGE_NAME" "$SOURCE_DIR"
   fi
-  run docker build \
-    --build-arg "APP_VERSION=$ver" \
-    --build-arg "GOPROXY=$GOPROXY_ARG" \
-    "${extra[@]}" \
-    -t "$IMAGE_NAME" "$SOURCE_DIR"
   ok "镜像构建完成：$IMAGE_NAME"
 }
 
