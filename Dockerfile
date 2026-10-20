@@ -11,11 +11,12 @@
 # 否则构建时会临时下载新工具链，离线环境会直接失败。
 # 构建多架构（NAS 常见 amd64 / arm64）：
 #   docker buildx build --platform linux/amd64,linux/arm64 -t videodl:latest .
-# 基础镜像默认走国内加速（毫秒镜像 1ms.run）；海外或想用官方可覆盖：
-#   docker build --build-arg GOLANG_IMAGE=golang:1.26-alpine \
-#                --build-arg ALPINE_IMAGE=alpine:3.20 .
-ARG GOLANG_IMAGE=docker.1ms.run/library/golang:1.26-alpine
-ARG ALPINE_IMAGE=docker.1ms.run/library/alpine:3.20
+# 基础镜像默认走国内加速（1panel，实测大层 ~1.2MB/s）。
+# 1ms.run 的 manifest 很快但大层走 CloudFront，实测只有 ~29KB/s，不推荐做主力。
+# 海外或想用官方可覆盖：
+# 例：docker build --build-arg GOLANG_IMAGE=golang:1.26-alpine --build-arg ALPINE_IMAGE=alpine:3.20 .
+ARG GOLANG_IMAGE=docker.1panel.live/library/golang:1.26-alpine
+ARG ALPINE_IMAGE=docker.1panel.live/library/alpine:3.20
 
 FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE} AS builder
 ARG TARGETOS=linux
@@ -62,14 +63,26 @@ FROM ${ALPINE_IMAGE}
 # Alpine 软件源：国内 dl-cdn.alpinelinux.org 很慢（apk add 能跑几分钟），默认用阿里云。
 # 想用官方源：--build-arg APK_MIRROR=
 ARG APK_MIRROR=https://mirrors.aliyun.com/alpine
+# 注意：APK_MIRROR 是「带 /alpine 的根地址」，替换时只匹配到 /alpine 为止，
+# 否则会拼成 .../alpine/alpine/v3.20/main（实测镜像源直接 404）。
+# 镜像源不可用时自动回退官方源，避免构建直接失败。
 RUN set -eux; \
     if [ -n "${APK_MIRROR}" ]; then \
-      sed -i "s#https\?://dl-cdn.alpinelinux.org#${APK_MIRROR}#g" /etc/apk/repositories; \
+      sed -i -e "s#https://dl-cdn\.alpinelinux\.org/alpine#${APK_MIRROR}#g" -e "s#http://dl-cdn\.alpinelinux\.org/alpine#${APK_MIRROR}#g" /etc/apk/repositories; \
       echo "apk 源已切换：${APK_MIRROR}"; \
     fi; \
-    apk add --no-cache ca-certificates tzdata \
-    && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
-    && echo "Asia/Shanghai" > /etc/timezone
+    if ! apk add --no-cache ca-certificates tzdata; then \
+      if [ -n "${APK_MIRROR}" ]; then \
+        echo "镜像源不可用，回退官方源重试"; \
+        sed -i "s#${APK_MIRROR}#https://dl-cdn.alpinelinux.org/alpine#g" /etc/apk/repositories; \
+        apk add --no-cache ca-certificates tzdata; \
+      else \
+        exit 1; \
+      fi; \
+    fi; \
+    cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime; \
+    echo "Asia/Shanghai" > /etc/timezone
+
 WORKDIR /app
 COPY --from=builder /out/videodl /app/videodl
 VOLUME ["/app/videodata"]

@@ -30,8 +30,10 @@ DEFAULT_PORT="${DEFAULT_PORT:-5200}"
 DEFAULT_DATA="${DEFAULT_DATA:-}"          # 空 = 脚本目录下的 videodata
 SOURCE_DIR="${SOURCE_DIR:-}"       # 空 = 脚本目录（有 go.mod 时）否则 ~/videodl-src
 GOPROXY_ARG="${GOPROXY_ARG:-https://goproxy.cn,direct}"
-# 基础镜像仓库：默认毫秒镜像（1ms.run，国内直连快、匿名可用）
-REGISTRY="${REGISTRY:-docker.1ms.run}"
+# 基础镜像仓库：默认 1panel（实测大层 ~1.2MB/s）；1ms.run 的 manifest 很快但
+# 大层走 CloudFront，实测只有 ~29KB/s（用户那边 ~5KB/s），所以只作自动兜底。
+REGISTRY="${REGISTRY:-docker.1panel.live}"
+REGISTRY_FALLBACK="${REGISTRY_FALLBACK:-docker.1ms.run}"
 # Alpine 软件源：默认阿里云，避免 apk add 卡在 dl-cdn.alpinelinux.org
 APK_MIRROR="${APK_MIRROR:-https://mirrors.aliyun.com/alpine}"
 
@@ -69,7 +71,8 @@ usage() {
   --port N              宿主机端口（容器内固定 5200）
   --data PATH           数据存储路径（数据库、视频、config.json 都在这里）
   --source-dir PATH     源码目录（默认脚本目录；没有源码则放 ~/videodl-src）
-  --registry HOST       基础镜像仓库（默认 docker.1ms.run，国内直连；传空用官方）
+  --registry HOST       基础镜像仓库（默认 docker.1panel.live；传空用官方）
+  --registry-fallback H 备用仓库（默认 docker.1ms.run，主仓库不可达/构建失败时自动切换）
   --apk-mirror URL      Alpine 软件源（默认 https://mirrors.aliyun.com/alpine）
   --goproxy URL         Go 模块代理（默认 https://goproxy.cn,direct）
   --official            全部切回官方源（海外机器用：Docker Hub + Alpine CDN + proxy.golang.org）
@@ -94,7 +97,8 @@ while [ $# -gt 0 ]; do
     --source-dir)      SOURCE_DIR="${2:-}"; shift 2 ;;
     --registry-mirror) REGISTRY_MIRROR="${2:-}"; shift 2 ;;
     --apk-mirror)      APK_MIRROR="${2:-}"; shift 2 ;;
-    --registry)        REGISTRY="${2:-}"; shift 2 ;;
+    --registry)          REGISTRY="${2:-}"; shift 2 ;;
+    --registry-fallback) REGISTRY_FALLBACK="${2:-}"; shift 2 ;;
     --official)        REGISTRY=""; APK_MIRROR=""; GOPROXY_ARG="https://proxy.golang.org,direct"; shift ;;
     --goproxy)         GOPROXY_ARG="${2:-}"; shift 2 ;;
     --yes|-y)          ASSUME_YES=1; shift ;;
@@ -411,6 +415,26 @@ fetch_source() {
 }
 
 # ---------- 构建镜像 ----------
+# registry_alive 判断镜像仓库是否可用（/v2/ 返回 200/401/403 都算活着）
+registry_alive() {
+  [ -z "$1" ] && return 1
+  local code
+  code="$(curl -s -o /dev/null -m 8 -w '%{http_code}' "https://$1/v2/" 2>/dev/null || true)"
+  [ "$code" = "200" ] || [ "$code" = "401" ] || [ "$code" = "403" ]
+}
+
+# pick_images 按仓库拼出两个基础镜像名（空/docker.io = 官方简名）
+pick_images() {
+  local reg="$1"
+  if [ -n "$reg" ] && [ "$reg" != "docker.io" ]; then
+    GOLANG_IMG="${reg}/library/golang:1.26-alpine"
+    ALPINE_IMG="${reg}/library/alpine:3.20"
+  else
+    GOLANG_IMG="golang:1.26-alpine"
+    ALPINE_IMG="alpine:3.20"
+  fi
+}
+
 build_image() {
   step "构建镜像"
   local ver="dev"
@@ -424,25 +448,43 @@ build_image() {
   fi
 
   info "版本：$ver（构建阶段会拉取 golang / alpine 基础镜像，首次较慢）"
-  # 基础镜像按 REGISTRY 拼：国内默认 docker.1ms.run，官方则用简名。
-  # 这里所有 build-arg 都显式传，不用数组（CentOS 7 的 bash 4.2 空数组展开会报错）。
-  local golang_img alpine_img
-  if [ -n "$REGISTRY" ] && [ "$REGISTRY" != "docker.io" ]; then
-    golang_img="${REGISTRY}/library/golang:1.26-alpine"
-    alpine_img="${REGISTRY}/library/alpine:3.20"
-  else
-    golang_img="golang:1.26-alpine"
-    alpine_img="alpine:3.20"
+  # 仓库探活：主仓库不可达就直接换备用，免得 build 卡在拉取阶段
+  if [ -n "$REGISTRY" ] && ! registry_alive "$REGISTRY"; then
+    warn "镜像仓库 $REGISTRY 不可达"
+    if [ -n "$REGISTRY_FALLBACK" ] && [ "$REGISTRY_FALLBACK" != "$REGISTRY" ] && registry_alive "$REGISTRY_FALLBACK"; then
+      REGISTRY="$REGISTRY_FALLBACK"
+      info "已切换备用仓库：$REGISTRY"
+    fi
   fi
-  info "基础镜像：${golang_img}"
+
+  pick_images "$REGISTRY"
+  info "基础镜像：${GOLANG_IMG}"
   info "Alpine 软件源：${APK_MIRROR:-官方}    Go 代理：${GOPROXY_ARG}"
-  run docker build \
-    --build-arg "APP_VERSION=$ver" \
-    --build-arg "GOPROXY=$GOPROXY_ARG" \
-    --build-arg "GOLANG_IMAGE=$golang_img" \
-    --build-arg "ALPINE_IMAGE=$alpine_img" \
-    --build-arg "APK_MIRROR=$APK_MIRROR" \
-    -t "$IMAGE_NAME" "$SOURCE_DIR"
+
+  # 这里所有 build-arg 都显式传，不用数组（CentOS 7 的 bash 4.2 空数组展开会报错）
+  if ! run docker build \
+      --build-arg "APP_VERSION=$ver" \
+      --build-arg "GOPROXY=$GOPROXY_ARG" \
+      --build-arg "GOLANG_IMAGE=$GOLANG_IMG" \
+      --build-arg "ALPINE_IMAGE=$ALPINE_IMG" \
+      --build-arg "APK_MIRROR=$APK_MIRROR" \
+      -t "$IMAGE_NAME" "$SOURCE_DIR"; then
+    if [ -n "$REGISTRY_FALLBACK" ] && [ "$REGISTRY_FALLBACK" != "$REGISTRY" ]; then
+      warn "使用 $REGISTRY 构建失败，改用备用仓库 $REGISTRY_FALLBACK 重试"
+      REGISTRY="$REGISTRY_FALLBACK"
+      pick_images "$REGISTRY"
+      info "基础镜像：${GOLANG_IMG}"
+      run docker build \
+        --build-arg "APP_VERSION=$ver" \
+        --build-arg "GOPROXY=$GOPROXY_ARG" \
+        --build-arg "GOLANG_IMAGE=$GOLANG_IMG" \
+        --build-arg "ALPINE_IMAGE=$ALPINE_IMG" \
+        --build-arg "APK_MIRROR=$APK_MIRROR" \
+        -t "$IMAGE_NAME" "$SOURCE_DIR" || die "主仓库和备用仓库都构建失败，请检查网络或用 --official"
+    else
+      die "镜像构建失败（可加 --registry 换仓库，或 --official 用官方源）"
+    fi
+  fi
   ok "镜像构建完成：$IMAGE_NAME"
 }
 
