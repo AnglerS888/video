@@ -1,0 +1,12 @@
+# 构建产物与运行时数据不进镜像上下文
+bin/
+videodata/
+data/
+.git/
+*.exe
+*.db
+*.db-shm
+*.db-wal
+# 前端源码与依赖不需要进镜像（只用构建好的 internal/web/static）
+web/node_modules
+web/src

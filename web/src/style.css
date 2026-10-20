@@ -1,0 +1,158 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---------- 基础 ---------- */
+@layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
+    scrollbar-gutter: stable;
+  }
+  body {
+    @apply bg-slate-100 text-slate-900 antialiased dark:bg-[#0b0f17] dark:text-slate-200;
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC",
+      "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgb(148 163 184 / 0.35) transparent;
+  }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb {
+    background: rgb(148 163 184 / 0.35);
+    border-radius: 999px;
+  }
+}
+
+/* ---------- 组件层 ---------- */
+@layer components {
+  .card {
+    @apply rounded-2xl border border-slate-200 bg-white shadow-sm
+      dark:border-white/10 dark:bg-white/[0.035] dark:shadow-none;
+  }
+  .card-pad { @apply p-4 sm:p-5; }
+  .muted { @apply text-slate-500 dark:text-slate-400; }
+  .title { @apply text-base font-semibold text-slate-900 dark:text-slate-100; }
+
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-1.5 rounded-xl
+      px-3 py-2 text-sm font-medium transition-colors;
+    @apply disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply bg-amber-500 text-slate-950 hover:bg-amber-400 active:bg-amber-500;
+  }
+  .btn-ghost {
+    @apply border border-slate-200 bg-white text-slate-700 hover:bg-slate-50
+      dark:border-white/10 dark:bg-white/5 dark:text-slate-200 dark:hover:bg-white/10;
+  }
+  .btn-soft {
+    @apply bg-slate-100 text-slate-700 hover:bg-slate-200
+      dark:bg-white/10 dark:text-slate-200 dark:hover:bg-white/15;
+  }
+  .btn-danger {
+    @apply border border-rose-200 bg-rose-50 text-rose-600 hover:bg-rose-100
+      dark:border-rose-500/30 dark:bg-rose-500/10 dark:text-rose-300 dark:hover:bg-rose-500/20;
+  }
+  .btn-warn {
+    @apply border border-amber-300 bg-amber-100 text-amber-800 hover:bg-amber-200
+      dark:border-amber-500/30 dark:bg-amber-500/15 dark:text-amber-300 dark:hover:bg-amber-500/25;
+  }
+  .btn-sm { @apply rounded-lg px-2.5 py-1.5 text-xs; }
+  /* 纯图标按钮（主题切换等）：桌面 36×36，触屏由下方媒体查询放大到 44×44 */
+  .btn-icon { @apply inline-flex shrink-0 items-center justify-center p-0; width: 2.25rem; height: 2.25rem; }
+
+  .input, .select {
+    @apply w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm
+      text-slate-900 outline-none transition
+      placeholder:text-slate-400
+      focus:border-amber-400 focus:ring-2 focus:ring-amber-400/25
+      dark:border-white/10 dark:bg-white/5 dark:text-slate-100 dark:placeholder:text-slate-500;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-full border border-slate-200 bg-white
+      px-2.5 py-1 text-xs text-slate-600
+      dark:border-white/10 dark:bg-white/5 dark:text-slate-300;
+  }
+  .chip-on {
+    @apply border-amber-400/60 bg-amber-500/15 text-amber-700 dark:text-amber-300;
+  }
+  .chip-err {
+    @apply border-rose-400/60 bg-rose-500/10 text-rose-600 dark:text-rose-300;
+  }
+
+  /* 封面框：固定 2:3，图片加载不出来时只留一个中性底色（不放任何占位图） */
+  .cover-box {
+    @apply relative overflow-hidden bg-slate-200/70 dark:bg-white/[0.06];
+    aspect-ratio: 2 / 3;
+  }
+  .cover-box img {
+    @apply h-full w-full object-cover;
+  }
+
+  .table-wrap { @apply overflow-x-auto; }
+  .tbl { @apply w-full border-collapse text-sm; }
+  .tbl th {
+    @apply whitespace-nowrap px-3 py-2 text-left text-xs font-medium uppercase tracking-wide
+      text-slate-500 dark:text-slate-400;
+  }
+  .tbl td {
+    @apply border-t border-slate-100 px-3 py-2 align-middle dark:border-white/5;
+  }
+
+  .bar { @apply h-1.5 w-full overflow-hidden rounded-full bg-slate-200 dark:bg-white/10; }
+  .bar > i { @apply block h-full rounded-full bg-amber-500 transition-all duration-300; }
+
+  .fade-enter-active, .fade-leave-active { transition: opacity 0.18s ease; }
+  .fade-enter-from, .fade-leave-to { opacity: 0; }
+}
+
+/* ---------- 触屏（手机 / 平板）适配 ----------
+   两个触发条件任一满足即生效：
+   - pointer: coarse —— 手指操作（手机、平板、触屏笔记本）
+   - max-width: 639px —— 窄窗口（桌面把窗口拖窄时也按手机处理）
+
+   规则：
+   1. 所有可点控件高度 ≥ 40px、纯图标按钮 44×44，避免"点不中"；
+   2. 输入框/下拉字号 16px —— iOS Safari 聚焦时字号小于 16px 会自动放大整页，
+      这里用 !important 是因为模板里普遍带 text-sm / text-xs 工具类，
+      普通选择器会被工具类覆盖；
+   3. 桌面端保持原来的紧凑尺寸（这些规则不生效）。 */
+@media (pointer: coarse), (max-width: 639px) {
+  .btn { min-height: 2.75rem; }
+  .btn-sm {
+    min-height: 2.5rem;
+    padding-left: 0.75rem;
+    padding-right: 0.75rem;
+    font-size: 0.8125rem;
+  }
+  .btn-icon { width: 2.75rem; height: 2.75rem; min-height: 2.75rem; }
+  .input, .select {
+    min-height: 2.75rem;
+    font-size: 1rem !important;
+  }
+  .chip { min-height: 2rem; padding-left: 0.75rem; padding-right: 0.75rem; }
+  /* 详情页把来源/线路做成按钮，光靠 chip 的 32px 还不够 */
+  button.chip { min-height: 2.5rem; }
+
+  /* 自定义按钮（不是 .btn）用这两个类补足触控高度：
+     平板（768/1024）也是手指操作，不能像桌面那样只给 24~30px */
+  .tap { min-height: 2.5rem; }
+  .tap-sm { min-height: 2.25rem; }
+
+  /* DPlayer 自带的控制条按钮是 40×38，手指容易点偏 */
+  .dplayer .dplayer-icons .dplayer-icon {
+    width: 2.75rem !important;
+    height: 2.75rem !important;
+    line-height: 2.75rem !important;
+  }
+  .dplayer .dplayer-icons-right .dplayer-icon { margin-right: 0.125rem; }
+  /* 进度条加厚到 6px，手指拖动更好按 */
+  .dplayer .dplayer-bar-wrap { padding: 0.5rem 0 !important; }
+  .dplayer .dplayer-bar { height: 0.25rem !important; }
+}
+
+/* 刘海屏 / 手势条：底部导航与头部不要被安全区遮挡 */
+@supports (padding: env(safe-area-inset-bottom)) {
+  .safe-bottom { padding-bottom: max(0.5rem, env(safe-area-inset-bottom)); }
+  .safe-top { padding-top: env(safe-area-inset-top); }
+}

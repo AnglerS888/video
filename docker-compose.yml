@@ -1,0 +1,67 @@
+services:
+  videodl:
+    build:
+      context: .
+      args:
+        TARGETOS: linux
+        TARGETARCH: amd64        # ARM 机型（部分飞牛/群晖）改成 arm64
+        # 注意：镜像不再内置 ffmpeg。容器内没有 ffmpeg 时，打开「信息」页点一次
+        # 「下载 ffmpeg」即可（约 29MB，存进 videodata/bin/，重启不丢）。
+        # 想彻底离线就在这里挂载或自己 apk add ffmpeg。
+        # Go 模块代理：国内默认走 goproxy.cn（proxy.golang.org 连不上会导致
+        # "go mod download" 超时）。海外构建可改成 https://proxy.golang.org,direct
+        GOPROXY: "https://goproxy.cn,direct"
+    image: videodl:latest
+    container_name: videodl
+    restart: unless-stopped
+    # 低配模式：降低采集/下载/封面并发、关闭全量重编码、把 GC 堆限制在 768MiB。
+    # 4G 内存的 NAS 直接用这行即可；想调高并发就删掉 -lowmem 并显式给各并发参数。
+    command:
+      - "-addr"
+      - ":5200"
+      - "-data"
+      - "/app/videodata"
+      - "-lowmem"
+      - "-memlimit"
+      - "768"
+      # 日志级别：debug/info/warn/error；排障时可临时改成 debug
+      - "-log-level"
+      - "info"
+    ports:
+      - "5200:5200"
+    volumes:
+      # 数据库、ffmpeg 缓存、封面与下载的视频都在该目录，映射到 NAS 本地盘
+      - ./videodata:/app/videodata
+    environment:
+      - TZ=Asia/Shanghai
+      # 想让每个 API 请求都打一行访问日志时设为 1（默认只在慢请求时打）
+      - VDL_HTTP_LOG=0
+    # init: 让容器里 PID 1 有个小小的 init 负责收尸和转发信号，
+    # docker stop 时 SIGTERM 才能真正送到程序里（否则只会等 10s 后 SIGKILL）
+    init: true
+    # 优雅退出：给正在跑的 ffmpeg 合并/分片下载留出收尾时间
+    stop_grace_period: 30s
+    # 资源上限：容器总内存给 1G，进程自身 GC 软上限 768MiB（-memlimit），
+    # 两者配合可以避免容器被内核 OOM kill，也不至于把 NAS 拖死。
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          # cpus 在部分 NAS 的 compose 实现里不生效，可留空；要限制就填 "2.0"
+    # 容器日志限流：NAS 的 docker 日志默认不封顶，长期运行会吃掉系统盘
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      # 用轻量探活（只 SELECT 1），不要用 /api/system（会扫全表 COUNT）
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5200/healthz"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
