@@ -1,6 +1,6 @@
 import type {
   ApiResp, CoverFixStatus, Downloads, FavItem, FfmpegStatus, Filters, Progress, ShareInfo, SharePage, Source, SourceTest,
-  SysInfo, VideoDetail, VideoList, WatchHistoryItem,
+  SysInfo, UpdateInfo, UpdateStatus, VersionResp, VideoDetail, VideoList, WatchHistoryItem,
 } from './types'
 
 async function req<T>(path: string, init?: RequestInit): Promise<ApiResp<T>> {
@@ -191,6 +191,27 @@ export const api = {
   // 触发下载：接口立即返回，进度靠 ffmpegStatus() 轮询
   installFfmpeg() {
     return req<FfmpegStatus>('/api/ffmpeg/install', { method: 'POST' })
+  },
+
+  /* ---- 版本与在线更新 ---- */
+  /** 当前版本 + 上次检查结果（不联网） */
+  version() {
+    return req<VersionResp>('/api/version')
+  },
+  /** 主动联网检查 GitHub 最新提交 */
+  checkUpdate() {
+    return req<UpdateInfo>('/api/update/check', { method: 'POST' })
+  },
+  /** 下载源码（直接运行模式会自动编译） */
+  applyUpdate() {
+    return req<UpdateStatus>('/api/update/apply', { method: 'POST' })
+  },
+  updateStatus() {
+    return req<UpdateStatus>('/api/update/status')
+  },
+  /** 应用新版本并重启（仅直接运行模式） */
+  restartUpdate() {
+    return req<{ msg: string; relaunch: boolean }>('/api/update/restart', { method: 'POST' })
   },
 
   /* ---- 封面补充 ---- */

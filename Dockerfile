@@ -20,6 +20,12 @@ WORKDIR /src
 #   docker build --build-arg GOPROXY=https://proxy.golang.org,direct .
 ARG GOPROXY=https://goproxy.cn,direct
 ENV GOPROXY=${GOPROXY}
+# 版本信息：默认读仓库根目录 VERSION，也可用 --build-arg APP_VERSION=1.3.0 覆盖。
+# GIT_COMMIT / BUILD_TIME 用于「信息」页展示与在线更新判断（镜像里没有 .git，
+# 所以 commit 只能外部传；不传时更新检查会退化为「提交时间 vs 镜像构建时间」）。
+ARG APP_VERSION=
+ARG GIT_COMMIT=
+ARG BUILD_TIME=
 # 禁止自动下载新工具链：离线/受限网络下它会再触发一次外网请求，直接把构建拖死
 ENV GOTOOLCHAIN=local
 COPY go.mod go.sum ./
@@ -36,8 +42,14 @@ RUN set -eux; \
 # 这里不需要 Node；要改前端先在本地跑 `make web` 再构建镜像。
 COPY . .
 RUN set -eux; \
+    VER="${APP_VERSION:-$(cat VERSION 2>/dev/null || echo dev)}"; \
+    CMT="${GIT_COMMIT:-}"; \
+    BT="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
+    echo "building version=${VER} commit=${CMT} time=${BT}"; \
     CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-      go build -trimpath -ldflags="-s -w" -o /out/videodl .
+      go build -trimpath \
+        -ldflags="-s -w -X videoDownLoad/internal/version.Version=${VER} -X videoDownLoad/internal/version.Commit=${CMT} -X videoDownLoad/internal/version.BuildTime=${BT}" \
+        -o /out/videodl .
 
 # ---- 运行阶段（极简镜像）----
 FROM alpine:3.20

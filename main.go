@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,11 +22,10 @@ import (
 	"videoDownLoad/internal/imgproc"
 	"videoDownLoad/internal/logx"
 	"videoDownLoad/internal/scheduler"
+	"videoDownLoad/internal/updater"
+	"videoDownLoad/internal/version"
 	"videoDownLoad/internal/web"
 )
-
-// version 可由构建时注入：-ldflags "-X main.version=1.2.3"
-var version = "dev"
 
 func main() {
 	var (
@@ -73,11 +73,22 @@ func main() {
 		vacuumPct = flag.Int("vacuum-pct", 15, "空闲页占比超过该百分比时自动整理数据库（0=关闭）")
 
 		minFreeMB = flag.Int("min-free-mb", 2048, "磁盘剩余空间保护阈值（MiB）：低于该值拒绝新下载并把排队任务自动暂停（0=关闭）")
+
+		// 在线更新：默认跟踪 AnglerS888/video 的 main 分支。
+		// 国内直连 github.com 经常失败，下载/检查都会自动回退到内置镜像；
+		// 要换镜像或 fork 自建，用 -update-proxy / -update-repo 或对应环境变量覆盖。
+		updateProxy = flag.String("update-proxy", "", "GitHub 镜像前缀，多个用逗号分隔（默认 ghproxy.net、gh-proxy.com；也可用 VDL_UPDATE_PROXY）")
+		updateRepo  = flag.String("update-repo", "", "更新源仓库 owner/name（默认 AnglerS888/video；也可用 VDL_UPDATE_REPO）")
 	)
 	flag.Parse()
 
 	if *ver {
-		os.Stdout.WriteString("videodl " + version + " (" + runtime.Version() + ", " + runtime.GOOS + "/" + runtime.GOARCH + ")\n")
+		bt := "-"
+		if t := version.Time(); !t.IsZero() {
+			bt = t.Format("2006-01-02 15:04:05")
+		}
+		os.Stdout.WriteString(fmt.Sprintf("videodl %s\n  commit: %s\n  build : %s\n  go     : %s %s/%s\n  mode   : %s\n",
+			version.Short(), orDash(version.Commit), bt, runtime.Version(), runtime.GOOS, runtime.GOARCH, version.ModeText()))
 		return
 	}
 
@@ -147,7 +158,7 @@ func main() {
 		*dataDir = abs
 	}
 
-	logx.Infof("[startup] videodl %s | %s | pid=%d", version, runtime.Version(), os.Getpid())
+	logx.Infof("[startup] videodl %s | %s | %s | pid=%d", version.Short(), runtime.Version(), version.ModeText(), os.Getpid())
 	logx.Infof("[startup] 监听 %s | 数据目录 %s（%s）", *addr, *dataDir, dataWhy)
 
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
@@ -248,10 +259,38 @@ func main() {
 	// 预热播放地址计数（226 万行的 COUNT 要走 1s+），别让第一个访问者撞上
 	db.WarmupCounts(database)
 
+	// 在线更新器：数据目录下 update/ 里放下载的源码与编译产物
+	upRepo := *updateRepo
+	if upRepo == "" {
+		upRepo = os.Getenv("VDL_UPDATE_REPO")
+	}
+	if upRepo == "" {
+		upRepo = version.Repo // 与 updater.New 的默认值保持一致，日志里不要打成空
+	}
+	upProxy := *updateProxy
+	if upProxy == "" {
+		upProxy = os.Getenv("VDL_UPDATE_PROXY")
+	}
+	var upMirrors []string
+	for _, m := range strings.Split(upProxy, ",") {
+		if m = strings.TrimSpace(m); m != "" {
+			upMirrors = append(upMirrors, m)
+		}
+	}
+	up := updater.New(*dataDir, upRepo, version.Branch, upMirrors)
+	logx.Infof("[update] 在线更新：仓库 %s（分支 %s），运行方式 %s", upRepo, version.Branch, version.ModeText())
+
+	// 容器里 docker stop / 重启会先发 SIGTERM：优雅退出，避免 SQLite 留下 -wal 尾巴、
+	// 下载中的分片文件被硬切断（下次启动会按"已暂停"恢复）。
+	// 提前创建：更新接口「重启并应用」也复用同一个 stop，走同一条优雅退出路径。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	srv := &web.Server{
 		DB: database, Col: col, DataDir: *dataDir,
-		Version: version, StartedAt: time.Now(),
+		Version: version.Version, StartedAt: time.Now(),
 		VacuumPct: *vacuumPct,
+		Up:        up, Shutdown: stop,
 	}
 	// 显式设置超时：不带超时的裸 ListenAndServe 会让半开连接一直占着 goroutine 和内存
 	// （NAS 上被扫描/移动端切网时很常见）。写超时不设，避免中断大文件播放/下载。
@@ -263,10 +302,6 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 
-	// 容器里 docker stop / 重启会先发 SIGTERM：优雅退出，避免 SQLite 留下 -wal 尾巴、
-	// 下载中的分片文件被硬切断（下次启动会按"已暂停"恢复）
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	go func() {
 		<-ctx.Done()
 		logx.Infof("[shutdown] 收到退出信号，停止接收新请求（最多等待 20s）…")
@@ -288,6 +323,23 @@ func main() {
 	} else {
 		logx.Infof("[shutdown] 数据库已关闭，进程退出")
 	}
+
+	// 更新已替换二进制（Unix）：把当前进程直接换成新版本，端口不中断太久
+	if up.RelaunchPending() {
+		exe := up.ExePath()
+		logx.Infof("[update] 正在用新版本重新启动: %s", exe)
+		if err := relaunch(exe); err != nil {
+			logx.Errorf("[update] 重新启动失败，请手动运行 %s：%v", exe, err)
+		}
+	}
+}
+
+// orDash 空字符串时显示 "-"
+func orDash(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "-"
+	}
+	return s
 }
 
 // orNo 空字符串时显示 "无"，让启动日志更直观

@@ -264,6 +264,53 @@ export interface SysInfo {
   cover: { ok: number; failed: number; last_error: string }
 }
 
+/** 版本与在线更新：检查结果 */
+export interface UpdateInfo {
+  current_version: string
+  current_commit: string
+  /** 构建时间（RFC3339） */
+  build_time: string
+  /** docker / direct */
+  mode: string
+  repo: string
+  branch: string
+  latest_version: string
+  latest_commit: string
+  latest_commit_at: string
+  latest_commit_msg: string
+  available: boolean
+  reasons?: string[]
+  checked_at: string
+  /** 本次检查实际走通的通道：direct 或镜像地址 */
+  via?: string
+  error?: string
+}
+
+/** 版本与在线更新：任务进度 */
+export interface UpdateStatus {
+  /** idle/checking/downloading/extracting/building/staged/ready/applying/failed */
+  phase: string
+  percent: number
+  message: string
+  bytes: number
+  total: number
+  source_dir?: string
+  new_binary?: string
+  /** 已编译完成，可「重启并应用」 */
+  ready: boolean
+  /** 源码已下载但本机缺 Go 工具链 */
+  need_go: boolean
+  instructions?: string[]
+  error?: string
+  updated_at: string
+}
+
+export interface VersionResp {
+  info: UpdateInfo
+  status: UpdateStatus
+  mode: string
+}
+
 /** 封面补充任务进度（信息页手动触发） */
 export interface CoverFixStatus {
   running: boolean

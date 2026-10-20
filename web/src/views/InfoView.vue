@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../api'
 import { toast } from '../toast'
-import type { CoverFixStatus, FfmpegStatus, SysInfo } from '../types'
+import type { CoverFixStatus, FfmpegStatus, SysInfo, UpdateInfo, UpdateStatus } from '../types'
 
 const info = ref<SysInfo | null>(null)
 const loading = ref(true)
@@ -225,8 +225,113 @@ async function installFf() {
   pollFf()
 }
 
+// ---- 版本与在线更新 ----
+// 后端 /api/version 给当前版本 + 上次检查结果；检查/下载/编译走 /api/update/*。
+const upInfo = ref<UpdateInfo | null>(null)
+const upStatus = ref<UpdateStatus | null>(null)
+const upChecking = ref(false)
+const upApplying = ref(false)
+const restarting = ref(false)
+let upTimer: number | undefined
+
+const isDocker = computed(() => upInfo.value?.mode === 'docker')
+const upBusy = computed(() => ['downloading', 'extracting', 'building', 'applying'].includes(upStatus.value?.phase || ''))
+
+const upPhaseText = computed(() => {
+  const s = upStatus.value
+  if (!s) return ''
+  switch (s.phase) {
+    case 'downloading': return '正在下载最新源码…'
+    case 'extracting': return '正在解压…'
+    case 'building': return '正在编译新版本…'
+    case 'applying': return '正在替换并重启…'
+    case 'ready': return '新版本已编译完成'
+    case 'staged': return '源码已就绪'
+    case 'failed': return '更新失败'
+    default: return s.message || ''
+  }
+})
+
+async function loadVersion() {
+  const r = await api.version()
+  if (!r.ok || !r.data) return
+  upInfo.value = r.data.info
+  upStatus.value = r.data.status
+  if (['downloading', 'extracting', 'building'].includes(r.data.status?.phase || '')) {
+    upApplying.value = true
+    pollUp()
+  }
+}
+
+async function checkUp() {
+  if (upChecking.value) return
+  upChecking.value = true
+  const r = await api.checkUpdate()
+  upChecking.value = false
+  if (!r.ok || !r.data) return toast(r.msg || '检查更新失败', 'err', 4000)
+  upInfo.value = r.data
+  if (r.data.error) return toast(r.data.error, 'err', 5000)
+  toast(r.data.available ? '发现可用更新' : '当前已是最新版本', r.data.available ? 'ok' : 'info', 2400)
+}
+
+async function applyUp() {
+  if (upApplying.value || upBusy.value) return
+  const tip = isDocker.value
+    ? 'Docker 模式会把最新源码下载到数据目录 update/src。\n编译需要在宿主机执行 docker compose build，然后 up -d。继续？'
+    : '将下载最新源码，并用本机 Go 工具链编译新版本（约 1~2 分钟）。继续？'
+  if (!confirm(tip)) return
+  upApplying.value = true
+  const r = await api.applyUpdate()
+  if (!r.ok) {
+    upApplying.value = false
+    return toast(r.msg || '启动更新失败', 'err', 4000)
+  }
+  if (r.data) upStatus.value = r.data
+  pollUp()
+}
+
+function pollUp() {
+  if (upTimer) return
+  upTimer = window.setInterval(async () => {
+    const r = await api.updateStatus()
+    if (!r.ok || !r.data) return
+    upStatus.value = r.data
+    if (['ready', 'staged', 'failed'].includes(r.data.phase)) {
+      if (upTimer) { window.clearInterval(upTimer); upTimer = undefined }
+      upApplying.value = false
+      if (r.data.phase === 'failed') toast(r.data.error || '更新失败', 'err', 6000)
+      else if (r.data.phase === 'ready') toast('新版本已编译完成，点「重启并应用」生效', 'ok', 4000)
+      else toast(r.data.message || '源码已就绪', 'ok', 4000)
+      loadVersion()
+    }
+  }, 1200)
+}
+
+async function restartUp() {
+  if (restarting.value) return
+  if (!confirm('将替换程序文件并重启服务，页面会短暂断开（约 3~15 秒）。继续？')) return
+  restarting.value = true
+  const r = await api.restartUpdate()
+  if (!r.ok) {
+    restarting.value = false
+    return toast(r.msg || '重启失败', 'err', 5000)
+  }
+  toast(r.data?.msg || '正在重启…', 'ok', 3000)
+  // 轮询 /healthz，服务回来后自动刷新（重启成功后进程会重载页面数据）
+  for (let i = 0; i < 40; i++) {
+    await new Promise((res) => setTimeout(res, 1500))
+    try {
+      const h = await fetch('/healthz', { cache: 'no-store' })
+      if (h.ok) { location.reload(); return }
+    } catch { /* 还没起来，继续等 */ }
+  }
+  toast('服务 60 秒内未恢复，请手动刷新或查看进程日志', 'err', 8000)
+  restarting.value = false
+}
+
 onMounted(() => {
   load()
+  loadVersion()
   loadFix().then(() => { if (fix.value?.running) pollFix() })
   // 续上「已在下载」的状态（比如刷新过页面）
   api.ffmpegStatus().then((r) => {
@@ -242,6 +347,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer)
   if (fixTimer) window.clearInterval(fixTimer)
+  if (upTimer) window.clearInterval(upTimer)
   stopFfPoll()
 })
 </script>
@@ -451,6 +557,89 @@ onBeforeUnmount(() => {
               系统未检测到 ffmpeg。点击下载后会自动解压到数据目录 <code>bin/</code>，约 29MB，只下一次，之后直接复用（合并、封面缩放都需要它）。
             </p>
           </div>
+        </section>
+
+        <!-- 版本与在线更新 -->
+        <section class="card card-pad space-y-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="title">版本与更新</span>
+            <span class="chip">{{ upInfo?.current_version ? 'v' + upInfo.current_version : '—' }}</span>
+            <span v-if="upInfo?.current_commit" class="chip">提交 {{ upInfo.current_commit.slice(0, 7) }}</span>
+            <span class="chip">{{ isDocker ? 'Docker 容器' : '直接运行' }}</span>
+            <span v-if="upInfo?.available" class="chip chip-on">有新版本</span>
+            <button class="btn btn-ghost btn-sm ml-auto" :disabled="upChecking || upBusy" @click="checkUp">
+              {{ upChecking ? '检查中…' : '检查更新' }}
+            </button>
+          </div>
+
+          <dl class="grid grid-cols-1 gap-x-4 gap-y-1.5 text-xs sm:grid-cols-2">
+            <div class="flex justify-between gap-3">
+              <dt class="muted">构建时间</dt>
+              <dd class="tabular-nums">{{ upInfo?.build_time ? upInfo.build_time.replace('T', ' ').replace('Z', '') : '—' }}</dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="muted">更新源</dt>
+              <dd class="truncate" :title="(upInfo?.repo || '') + '@' + (upInfo?.branch || '')">{{ upInfo?.repo || '—' }}@{{ upInfo?.branch || '—' }}</dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="muted">最新提交</dt>
+              <dd class="tabular-nums">{{ upInfo?.latest_commit ? upInfo.latest_commit.slice(0, 7) : '—' }}</dd>
+            </div>
+            <div class="flex justify-between gap-3">
+              <dt class="muted">提交时间</dt>
+              <dd class="tabular-nums">{{ upInfo?.latest_commit_at ? upInfo.latest_commit_at.replace('T', ' ').replace('Z', '') : '—' }}</dd>
+            </div>
+          </dl>
+          <p v-if="upInfo?.latest_commit_msg" class="truncate text-[11px] muted" :title="upInfo.latest_commit_msg">
+            最新说明：{{ upInfo.latest_commit_msg }}
+          </p>
+
+          <ul v-if="upInfo?.reasons?.length" class="space-y-0.5 rounded-lg bg-amber-500/10 px-2.5 py-2 text-[11px] text-amber-700 dark:text-amber-300">
+            <li v-for="r in upInfo.reasons" :key="r">· {{ r }}</li>
+          </ul>
+          <p v-if="upInfo?.error" class="break-all rounded-lg bg-rose-500/10 px-2.5 py-2 text-[11px] text-rose-500">{{ upInfo.error }}</p>
+          <p v-if="upInfo?.checked_at" class="text-[11px] muted">
+            上次检查：{{ upInfo.checked_at }}<span v-if="upInfo.via"> · 通道 {{ upInfo.via === 'direct' ? 'GitHub 直连' : upInfo.via }}</span>
+          </p>
+
+          <!-- 进行中 -->
+          <div v-if="upBusy" class="rounded-lg bg-slate-50 px-2.5 py-2 dark:bg-white/5">
+            <div class="flex items-center justify-between text-xs">
+              <span class="font-medium">{{ upPhaseText }}</span>
+              <span class="tabular-nums muted">{{ upStatus?.percent || 0 }}%</span>
+            </div>
+            <div class="mt-1.5 h-1.5 overflow-hidden rounded-full bg-slate-200 dark:bg-white/10">
+              <i class="block h-full rounded-full bg-sky-500 transition-all" :style="{ width: Math.max(2, upStatus?.percent || 0) + '%' }"></i>
+            </div>
+            <p v-if="upStatus?.total" class="mt-1 text-[11px] muted">{{ fmtBytes(upStatus.bytes) }} / {{ fmtBytes(upStatus.total) }}</p>
+          </div>
+
+          <!-- 结果：已编译 / 源码已就位 / 失败 -->
+          <div v-else-if="upStatus && ['ready', 'staged', 'failed'].includes(upStatus.phase)" class="rounded-lg bg-slate-50 px-2.5 py-2 dark:bg-white/5">
+            <p class="text-xs" :class="upStatus.phase === 'failed' ? 'text-rose-500' : 'font-medium'">{{ upStatus.message }}</p>
+            <ul v-if="upStatus.instructions?.length" class="mt-1 space-y-0.5 break-all text-[11px] muted">
+              <li v-for="(t, i) in upStatus.instructions" :key="i">{{ t }}</li>
+            </ul>
+            <p v-if="upStatus.source_dir" class="mt-1 break-all text-[11px] text-slate-400">{{ upStatus.source_dir }}</p>
+          </div>
+
+          <div class="flex flex-wrap items-center gap-2">
+            <button class="btn btn-primary btn-sm" :disabled="upApplying || upBusy || restarting" @click="applyUp">
+              {{ upApplying || upBusy ? '更新中…' : isDocker ? '下载最新源码' : '下载并更新' }}
+            </button>
+            <button v-if="!isDocker" class="btn btn-ghost btn-sm" :disabled="!upStatus?.ready || restarting" @click="restartUp">
+              {{ restarting ? '重启中…' : '重启并应用' }}
+            </button>
+            <a
+              class="btn btn-ghost btn-sm"
+              :href="`https://github.com/${upInfo?.repo || 'AnglerS888/video'}`"
+              target="_blank" rel="noopener"
+            >GitHub 仓库</a>
+          </div>
+          <p v-if="isDocker" class="text-[11px] muted">
+            Docker 模式容器内没有 Go 工具链，不会自动编译：源码下载到数据目录后，在宿主机执行
+            <code>docker compose build && docker compose up -d</code> 生效（volume 数据不受影响）。
+          </p>
         </section>
 
         <!-- 封面 / 备份 -->

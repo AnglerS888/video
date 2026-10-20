@@ -91,6 +91,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/cover/fix", s.startCoverFix)
 	mux.HandleFunc("POST /api/cover/fix/stop", s.stopCoverFix)
 
+	// 版本与在线更新：检查 GitHub 最新提交 / 下载源码 / 编译 / 重启
+	mux.HandleFunc("GET /api/version", s.versionInfo)
+	mux.HandleFunc("POST /api/update/check", s.checkUpdate)
+	mux.HandleFunc("POST /api/update/apply", s.applyUpdate)
+	mux.HandleFunc("GET /api/update/status", s.updateStatus)
+	mux.HandleFunc("POST /api/update/restart", s.restartUpdate)
+
 	// 容器健康检查：只做一次极轻量的 DB 探活，不扫全表（/api/system 会 COUNT 三张表）
 	mux.HandleFunc("GET /healthz", s.healthz)
 

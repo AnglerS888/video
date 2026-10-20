@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
+import { api } from './api'
 import { isDark, toggleTheme } from './theme'
 import { toasts } from './toast'
 
@@ -20,6 +21,14 @@ const title = computed(() => (route.meta.title as string) || '影视库')
 const isDetail = computed(() => route.name === 'detail')
 // 分享页（/s/:id）独立成页：不显示站点导航，避免收到链接的人被带进后台
 const bare = computed(() => route.meta.bare === true)
+
+// 版本号：顶栏右下角显示真实版本（来自 /api/version，取不到就不显示）
+const appVersion = ref('')
+onMounted(async () => {
+  const r = await api.version()
+  const v = r.ok ? r.data?.info?.current_version : ''
+  if (v) appVersion.value = 'v' + v
+})
 </script>
 
 <template>
@@ -96,7 +105,7 @@ const bare = computed(() => route.meta.bare === true)
               <path d="M20 14.5A8.5 8.5 0 0 1 9.5 4a8.5 8.5 0 1 0 10.5 10.5z" />
             </svg>
           </button>
-          <span class="text-[11px] text-slate-400">v1.0</span>
+          <span v-if="appVersion" class="text-[11px] text-slate-400">{{ appVersion }}</span>
         </div>
       </div>
     </header>

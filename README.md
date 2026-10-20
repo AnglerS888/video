@@ -149,6 +149,66 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct -t videodl:late
 - 下载全局限速：**每张间隔 500~1000ms**，所有协程共用一条队列；遇到 `429/403` 时按 `Retry-After`
   （默认 30 秒）暂停整个队列，等负缓存过期后再试
 
+## 版本与在线更新
+
+版本号的唯一来源是仓库根目录的 **`VERSION`** 文件；构建时（Makefile / Dockerfile）会把它、
+git 提交哈希和构建时间一起通过 `-ldflags` 注入 `internal/version`：
+
+```bash
+./videodl -version
+# videodl v1.3.0 (ced2295)
+#   commit: ced2295
+#   build : 2026-10-20 03:40:34
+#   go     : go1.26.0 linux/amd64
+#   mode   : Docker 容器
+```
+
+「信息」页有**版本与更新**卡片：显示当前版本/提交/构建时间、一键检查、下载、编译、重启。
+
+### 怎么判断有没有更新
+
+仓库没有 release / tag，所以按三个信号判断，任一命中即提示有更新：
+
+1. 远端 `VERSION` 文件里的版本号大于本机；
+2. 本机构建时记录了提交哈希，且与远端 `main` 最新提交不同；
+3. 本机没有提交哈希（直接 `go build`）时，远端提交时间晚于本机构建时间（2 分钟容差）。
+
+检查走 GitHub API；**直连失败会自动切国内镜像**（默认 `ghproxy.net`、`gh-proxy.com`）。
+镜像可用 `-update-proxy` / `VDL_UPDATE_PROXY` 覆盖（逗号分隔），例如：
+
+```bash
+./videodl -update-proxy "https://ghproxy.net/,https://gh-proxy.com/"
+```
+
+### 更新流程
+
+源码包来自 `https://github.com/AnglerS888/video/archive/refs/heads/main.zip`，直连失败自动走镜像。
+下载后解压到 `<数据目录>/update/src`，并校验 `go.mod` 与 `internal/web/static/index.html` 是否存在
+（防镜像返回错误页）。
+
+**直接运行（单个二进制 / NAS 上裸跑）**
+
+- 用本机 Go 工具链在 `update/src` 里编译新二进制（`GOTOOLCHAIN=auto`，本机 Go 版本低时会自动下载对应工具链）；
+- 点「重启并应用」后：
+  - **Windows**：生成 `videodata/update/apply-update.bat`，进程退出后由脚本覆盖 exe 并**按原启动参数**
+    重新拉起（等 15 秒重试，避免文件占用）；
+  - **Linux / macOS**：先备份为 `*.bak`，再 `rename` 覆盖并 `exec` 新二进制，端口不中断太久。
+- 本机没装 Go 时不会强失败：源码会留在 `update/src`，页面给出提示与手动编译命令。
+
+**Docker**
+
+容器内没有 Go 工具链，也没有宿主机 docker 权限，所以只下载源码到 `<数据目录>/update/src`，
+然后在宿主机项目目录执行：
+
+```bash
+docker compose build && docker compose up -d
+```
+
+数据目录是 volume，重建镜像不影响影片、进度与下载文件。想省事可在 compose 里加
+`- VDL_UPDATE_PROXY=...` 指定镜像。
+
+> 更新只跟随 `main` 分支；想换源（fork）用 `-update-repo owner/name` 或 `VDL_UPDATE_REPO`。
+
 ## 数据目录
 
 所有状态都在 `-data` 指定的目录里，迁移或备份只需要拷这个目录：
@@ -159,7 +219,8 @@ videodata/
 ├── videodl.db-wal          # WAL（运行中才有）
 ├── img/                    # 封面缓存，按哈希分片：img/3f/3fa2...9c.jpg
 ├── videos/                 # 下载好的 mp4
-└── bin/                    # 按需下载的 ffmpeg（信息页点「下载」后才有，约 80MB 解压后）
+├── bin/                    # 按需下载的 ffmpeg（信息页点「下载」后才有，约 80MB 解压后）
+└── update/                 # 在线更新缓存：src/ 源码、编译产物、Windows 替换脚本（可随时删）
 ```
 
 目录名历史：`data/` → `videos_data/` → **`videodata/`**。启动时如果只找到旧目录名（且里面有库），
@@ -193,6 +254,9 @@ videodata/
 | `-db-conns` | `4` | 最大连接数；WAL 下一个写者 + 多个读者，`1` 会让慢查询堵住整站 |
 | `-db-page-size` | `0` | 页大小字节数（如 `8192`）；`0` 不改。改已有库会先 VACUUM 重写一次 |
 | `-vacuum-pct` | `15` | 空闲页占比超过该值时自动整理数据库，`0` 关闭 |
+| `-min-free-mb` | `2048` | 磁盘剩余空间保护阈值（MiB）：低于该值拒绝新下载并暂停队列，`0` 关闭 |
+| `-update-proxy` | 内置镜像 | 更新用的 GitHub 镜像前缀，逗号分隔（也可用 `VDL_UPDATE_PROXY`） |
+| `-update-repo` | `AnglerS888/video` | 更新源仓库 `owner/name`（也可用 `VDL_UPDATE_REPO`） |
 | `-lowmem` | `false` | 低配模式，自动下调并发、关闭全量重编码、限制 GC 内存 |
 | `-memlimit` | 不限 | Go GC 软内存上限（MiB），`-lowmem` 时默认 `768` |
 | `-maxprocs` | 自动 | `GOMAXPROCS`，`-lowmem` 时默认 `min(核数, 3)` |

@@ -11,6 +11,11 @@ services:
         # Go 模块代理：国内默认走 goproxy.cn（proxy.golang.org 连不上会导致
         # "go mod download" 超时）。海外构建可改成 https://proxy.golang.org,direct
         GOPROXY: "https://goproxy.cn,direct"
+        # 版本信息：APP_VERSION 留空时读仓库根目录 VERSION 文件；
+        # 想显示提交哈希就在宿主机执行：
+        #   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build
+        APP_VERSION: "${APP_VERSION:-}"
+        GIT_COMMIT: "${GIT_COMMIT:-}"
     image: videodl:latest
     container_name: videodl
     restart: unless-stopped
@@ -36,6 +41,9 @@ services:
       - TZ=Asia/Shanghai
       # 想让每个 API 请求都打一行访问日志时设为 1（默认只在慢请求时打）
       - VDL_HTTP_LOG=0
+      # 在线更新：容器内只下载源码，编译要在宿主机 docker compose build 完成。
+      # 国内直连 GitHub 失败时会自动走内置镜像；要换镜像解开下面这行（逗号分隔）：
+      # - VDL_UPDATE_PROXY=https://ghproxy.net/,https://gh-proxy.com/
     # init: 让容器里 PID 1 有个小小的 init 负责收尸和转发信号，
     # docker stop 时 SIGTERM 才能真正送到程序里（否则只会等 10s 后 SIGKILL）
     init: true
