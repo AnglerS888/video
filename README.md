@@ -88,7 +88,7 @@ sudo ./deploy.sh --yes           # 不交互；已有容器则沿用它的端口
 | 环节 | 默认值 | 说明 |
 |---|---|---|
 | 基础镜像 | `docker.1ms.run`（毫秒镜像） | `golang:1.26-alpine`、`alpine:3.20` 都从这里拉，匿名可用 |
-| Alpine 软件源 | `https://mirrors.aliyun.com/alpine` | `apk add` 从几十秒/几分钟降到几秒 |
+| Alpine 软件源 | `https://mirrors.aliyun.com/alpine` | `apk add` 从几十秒/几分钟降到几秒；**填到 `/alpine` 这一级**，填错（如多一层 /alpine）会 404 |
 | Go 模块代理 | `https://goproxy.cn,direct` | 构建阶段的 `go mod download` |
 
 也就是说国内服务器直接 `sudo ./deploy.sh` 就是全国内链路。要调整：
@@ -99,6 +99,8 @@ sudo ./deploy.sh --apk-mirror ""               # 用 Alpine 官方源
 sudo ./deploy.sh --official                    # 全部切回官方（海外机器）
 ```
 
+> apk 源不可用时会**自动回退官方源**重试，不会让构建直接失败。
+>
 > 不再需要给 Docker daemon 配 `registry-mirrors`（那会重启 Docker，影响机器上的其它容器）。
 > 基础镜像是**带仓库前缀的完整名字**，只影响本次构建。确实想给全局加速再加
 > `--registry-mirror https://docker.1ms.run`。
