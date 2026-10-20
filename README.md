@@ -68,7 +68,7 @@ sudo ./deploy.sh --yes           # 不交互；已有容器则沿用它的端口
 脚本会依次做：
 
 1. **检测 Docker**：没有就按发行版自动安装（apt / dnf / yum / apk / zypper），并 `enable --now`
-   启动服务；国内拉不到镜像可加 `--registry-mirror https://docker.m.daocloud.io`；
+   启动服务；构建默认走国内源（见下），不需要手动配镜像加速；
 2. **拉最新源码**：目录里是 git 仓库就 `git pull`，否则下载 Gitee 的 `master.zip` 解压；
 3. **构建镜像**：`docker build --build-arg APP_VERSION=<VERSION>`，旧镜像自动标记为
    `videodl:previous`（回滚用）；
@@ -77,22 +77,32 @@ sudo ./deploy.sh --yes           # 不交互；已有容器则沿用它的端口
 5. **再次执行 = 更新**：自动读取现有容器的端口与数据目录，重建镜像后替换容器；
    新镜像启动失败会自动回滚到 `videodl:previous`。
 
-常用参数：`--port` / `--data` / `--source-dir` / `--registry-mirror` / `--apk-mirror` / `--goproxy` /
-`--no-install` / `--yes`，完整说明见 `./deploy.sh --help`。
+常用参数：`--port` / `--data` / `--source-dir` / `--registry` / `--apk-mirror` / `--goproxy` /
+`--official` / `--registry-mirror` / `--no-install` / `--yes`，完整说明见 `./deploy.sh --help`。
 
-**国内网络首次构建很慢？** 首次要拉 `golang:1.26-alpine`（约 250MB）和 `alpine:3.20`，
-`apk add` 也要连 Alpine CDN。实测限速环境下 67MB 的层能跑 7 分钟。加两个镜像参数会快很多：
+首次构建正常 2~5 分钟（国内走 1ms.run + 阿里云源）；中断后重跑会复用已下载的层，
+之后的更新构建通常 1~2 分钟。
+
+**国内加速（默认已开启，不用你配）**
+
+| 环节 | 默认值 | 说明 |
+|---|---|---|
+| 基础镜像 | `docker.1ms.run`（毫秒镜像） | `golang:1.26-alpine`、`alpine:3.20` 都从这里拉，匿名可用 |
+| Alpine 软件源 | `https://mirrors.aliyun.com/alpine` | `apk add` 从几十秒/几分钟降到几秒 |
+| Go 模块代理 | `https://goproxy.cn,direct` | 构建阶段的 `go mod download` |
+
+也就是说国内服务器直接 `sudo ./deploy.sh` 就是全国内链路。要调整：
 
 ```bash
-sudo ./deploy.sh --registry-mirror https://docker.m.daocloud.io \
-                 --apk-mirror https://mirrors.aliyun.com/alpine
+sudo ./deploy.sh --registry docker.1ms.run     # 换基础镜像仓库（传空或 docker.io 用官方）
+sudo ./deploy.sh --apk-mirror ""               # 用 Alpine 官方源
+sudo ./deploy.sh --official                    # 全部切回官方（海外机器）
 ```
 
-- `--registry-mirror` 会写入 `/etc/docker/daemon.json` 并重启 docker（其他容器会短暂中断）；
-- `--apk-mirror` 只是构建参数，改的是镜像内的 apk 源，不影响宿主机。
+> 不再需要给 Docker daemon 配 `registry-mirrors`（那会重启 Docker，影响机器上的其它容器）。
+> 基础镜像是**带仓库前缀的完整名字**，只影响本次构建。确实想给全局加速再加
+> `--registry-mirror https://docker.1ms.run`。
 
-首次构建正常 2~5 分钟（好网络）/ 10~30 分钟（限速网络）；**中断后重跑会复用已下载的层**，
-之后的更新构建通常 1~2 分钟。
 
 镜像不再内置 ffmpeg（二进制约 12MB，不再是 40MB）。运行时的解析顺序是：
 

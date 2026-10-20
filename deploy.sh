@@ -30,6 +30,10 @@ DEFAULT_PORT="${DEFAULT_PORT:-5200}"
 DEFAULT_DATA="${DEFAULT_DATA:-}"          # 空 = 脚本目录下的 videodata
 SOURCE_DIR="${SOURCE_DIR:-}"       # 空 = 脚本目录（有 go.mod 时）否则 ~/videodl-src
 GOPROXY_ARG="${GOPROXY_ARG:-https://goproxy.cn,direct}"
+# 基础镜像仓库：默认毫秒镜像（1ms.run，国内直连快、匿名可用）
+REGISTRY="${REGISTRY:-docker.1ms.run}"
+# Alpine 软件源：默认阿里云，避免 apk add 卡在 dl-cdn.alpinelinux.org
+APK_MIRROR="${APK_MIRROR:-https://mirrors.aliyun.com/alpine}"
 
 PORT=""
 DATA_DIR=""
@@ -37,7 +41,6 @@ ASSUME_YES=0
 DRY_RUN=0
 NO_INSTALL=0
 REGISTRY_MIRROR=""
-APK_MIRROR="${APK_MIRROR:-}"
 FORCE=0
 
 # ---------- 输出 ----------
@@ -66,9 +69,11 @@ usage() {
   --port N              宿主机端口（容器内固定 5200）
   --data PATH           数据存储路径（数据库、视频、config.json 都在这里）
   --source-dir PATH     源码目录（默认脚本目录；没有源码则放 ~/videodl-src）
-  --registry-mirror URL Docker 镜像加速地址（如 https://docker.m.daocloud.io）
-  --apk-mirror URL      Alpine 软件源（如 https://mirrors.aliyun.com/alpine），加速 apk add
+  --registry HOST       基础镜像仓库（默认 docker.1ms.run，国内直连；传空用官方）
+  --apk-mirror URL      Alpine 软件源（默认 https://mirrors.aliyun.com/alpine）
   --goproxy URL         Go 模块代理（默认 https://goproxy.cn,direct）
+  --official            全部切回官方源（海外机器用：Docker Hub + Alpine CDN + proxy.golang.org）
+  --registry-mirror URL 额外给 Docker daemon 配镜像加速（会重启 docker，默认不改）
   --yes, -y             不交互，使用默认值 / 沿用已有容器
   --no-install          不自动安装 Docker（已装好时用）
   --dry-run             演练模式：只打印命令
@@ -89,6 +94,8 @@ while [ $# -gt 0 ]; do
     --source-dir)      SOURCE_DIR="${2:-}"; shift 2 ;;
     --registry-mirror) REGISTRY_MIRROR="${2:-}"; shift 2 ;;
     --apk-mirror)      APK_MIRROR="${2:-}"; shift 2 ;;
+    --registry)        REGISTRY="${2:-}"; shift 2 ;;
+    --official)        REGISTRY=""; APK_MIRROR=""; GOPROXY_ARG="https://proxy.golang.org,direct"; shift ;;
     --goproxy)         GOPROXY_ARG="${2:-}"; shift 2 ;;
     --yes|-y)          ASSUME_YES=1; shift ;;
     --dry-run)         DRY_RUN=1; shift ;;
@@ -417,21 +424,25 @@ build_image() {
   fi
 
   info "版本：$ver（构建阶段会拉取 golang / alpine 基础镜像，首次较慢）"
-  # 注意：不要用数组累积 build-arg —— CentOS 7 自带 bash 4.2，
-  # set -u 下空数组展开 "\${arr[@]}" 会报「arr: 为绑定变量」，这里直接分两个分支。
-  if [ -n "$APK_MIRROR" ]; then
-    info "Alpine 软件源：$APK_MIRROR"
-    run docker build \
-      --build-arg "APP_VERSION=$ver" \
-      --build-arg "GOPROXY=$GOPROXY_ARG" \
-      --build-arg "APK_MIRROR=$APK_MIRROR" \
-      -t "$IMAGE_NAME" "$SOURCE_DIR"
+  # 基础镜像按 REGISTRY 拼：国内默认 docker.1ms.run，官方则用简名。
+  # 这里所有 build-arg 都显式传，不用数组（CentOS 7 的 bash 4.2 空数组展开会报错）。
+  local golang_img alpine_img
+  if [ -n "$REGISTRY" ] && [ "$REGISTRY" != "docker.io" ]; then
+    golang_img="${REGISTRY}/library/golang:1.26-alpine"
+    alpine_img="${REGISTRY}/library/alpine:3.20"
   else
-    run docker build \
-      --build-arg "APP_VERSION=$ver" \
-      --build-arg "GOPROXY=$GOPROXY_ARG" \
-      -t "$IMAGE_NAME" "$SOURCE_DIR"
+    golang_img="golang:1.26-alpine"
+    alpine_img="alpine:3.20"
   fi
+  info "基础镜像：${golang_img}"
+  info "Alpine 软件源：${APK_MIRROR:-官方}    Go 代理：${GOPROXY_ARG}"
+  run docker build \
+    --build-arg "APP_VERSION=$ver" \
+    --build-arg "GOPROXY=$GOPROXY_ARG" \
+    --build-arg "GOLANG_IMAGE=$golang_img" \
+    --build-arg "ALPINE_IMAGE=$alpine_img" \
+    --build-arg "APK_MIRROR=$APK_MIRROR" \
+    -t "$IMAGE_NAME" "$SOURCE_DIR"
   ok "镜像构建完成：$IMAGE_NAME"
 }
 
@@ -509,6 +520,7 @@ summary() {
   printf '  数据目录：%s\n' "$DATA_DIR"
   printf '  配置文件：%s/config.json（首次启动自动生成，改完重启容器生效）\n' "$DATA_DIR"
   printf '  容器名称：%s    镜像：%s\n' "$CONTAINER_NAME" "$IMAGE_NAME"
+  printf '  基础镜像：%s（golang:1.26-alpine / alpine:3.20）\n' "${REGISTRY:-官方 Docker Hub}"
   printf '\n常用命令：\n'
   printf '  docker logs -f %s          # 看日志\n' "$CONTAINER_NAME"
   printf '  docker restart %s          # 重启\n' "$CONTAINER_NAME"

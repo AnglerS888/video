@@ -16,6 +16,11 @@ services:
         #   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build
         APP_VERSION: "${APP_VERSION:-}"
         GIT_COMMIT: "${GIT_COMMIT:-}"
+        # 国内优先：基础镜像走毫秒镜像 1ms.run，apk 走阿里云。
+        # 海外或想用官方：GOLANG_IMAGE=golang:1.26-alpine ALPINE_IMAGE=alpine:3.20 APK_MIRROR= docker compose build
+        GOLANG_IMAGE: "${GOLANG_IMAGE:-docker.1ms.run/library/golang:1.26-alpine}"
+        ALPINE_IMAGE: "${ALPINE_IMAGE:-docker.1ms.run/library/alpine:3.20}"
+        APK_MIRROR: "${APK_MIRROR:-https://mirrors.aliyun.com/alpine}"
     image: videodl:latest
     container_name: videodl
     restart: unless-stopped

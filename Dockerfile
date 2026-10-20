@@ -11,7 +11,13 @@
 # 否则构建时会临时下载新工具链，离线环境会直接失败。
 # 构建多架构（NAS 常见 amd64 / arm64）：
 #   docker buildx build --platform linux/amd64,linux/arm64 -t videodl:latest .
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
+# 基础镜像默认走国内加速（毫秒镜像 1ms.run）；海外或想用官方可覆盖：
+#   docker build --build-arg GOLANG_IMAGE=golang:1.26-alpine \
+#                --build-arg ALPINE_IMAGE=alpine:3.20 .
+ARG GOLANG_IMAGE=docker.1ms.run/library/golang:1.26-alpine
+ARG ALPINE_IMAGE=docker.1ms.run/library/alpine:3.20
+
+FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE} AS builder
 ARG TARGETOS=linux
 ARG TARGETARCH=amd64
 WORKDIR /src
@@ -52,10 +58,10 @@ RUN set -eux; \
         -o /out/videodl .
 
 # ---- 运行阶段（极简镜像）----
-FROM alpine:3.20
-# Alpine 软件源镜像：国内 dl-cdn.alpinelinux.org 很慢（apk add 能跑几分钟）。
-# 构建时传 --build-arg APK_MIRROR=https://mirrors.aliyun.com/alpine 即可换源。
-ARG APK_MIRROR=
+FROM ${ALPINE_IMAGE}
+# Alpine 软件源：国内 dl-cdn.alpinelinux.org 很慢（apk add 能跑几分钟），默认用阿里云。
+# 想用官方源：--build-arg APK_MIRROR=
+ARG APK_MIRROR=https://mirrors.aliyun.com/alpine
 RUN set -eux; \
     if [ -n "${APK_MIRROR}" ]; then \
       sed -i "s#https\?://dl-cdn.alpinelinux.org#${APK_MIRROR}#g" /etc/apk/repositories; \
