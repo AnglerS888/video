@@ -1,0 +1,52 @@
+# ============================================================
+# videoDownLoad —— Git 忽略规则
+# 只忽略「本地生成、不入库」的东西；
+# internal/web/static（前端构建产物）是 go:embed 的输入，必须入库，不要在这里忽略。
+# ffmpeg 二进制已不再入库（2026-10-19 删除 internal/ffmpeg/assets），
+# 运行时按需下载到 videodata/bin/，那目录本来就被 /videodata/ 忽略。
+# ============================================================
+
+# ---- 构建产物 ----
+/bin/
+*.exe
+*.exe~
+*.test
+*.out
+*.prof
+
+# ---- 运行时数据（SQLite 库、封面缓存、下载的视频、ffmpeg 解压缓存）----
+/videodata/
+/videos_data/
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# ---- 日志与临时文件 ----
+*.log
+*.tmp
+*.bak
+*.orig
+*~
+.tmp_*/
+
+# ---- 前端 ----
+/web/node_modules/
+/web/dist/
+/web/.vite/
+/web/*.tsbuildinfo
+
+# ---- IDE / 系统 ----
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 本地环境与工作区文件 ----
+.env
+.env.local
+go.work
+go.work.sum
+
+# ---- 本工具链的本地记忆（如需要团队共享，删掉这行）----
+/.workbuddy/
