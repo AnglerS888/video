@@ -67,9 +67,14 @@ docker compose up -d
 
 ```bash
 GOLANG_IMAGE=golang:1.26-alpine RUNTIME_IMAGE=golang:1.26-alpine \
-GOPROXY=https://proxy.golang.org,direct GOSUMDB=sum.golang.org \
-docker compose up -d --build
+VDL_GOPROXY=https://proxy.golang.org,direct VDL_GOSUMDB=sum.golang.org \
+VDL_PORT=8080 docker compose up -d --build
 ```
+
+> ⚠️ compose 读的是 **`VDL_` 前缀**的变量（`VDL_GOPROXY` / `VDL_GOSUMDB` /
+> `VDL_GOTOOLCHAIN` / `VDL_PORT`），故意不用 `GOPROXY` / `GOSUMDB` 这些名字：
+> 那是宿主机 Go 环境变量的名字，`go env -w GOPROXY=off` 或 export 过的人
+> 会把本机设置带进容器（容器内「立即更新」编译会直接失败）。
 
 ### Linux 一键部署 / 更新（推荐）
 
@@ -94,7 +99,8 @@ sudo ./deploy.sh --check         # 网络体检：Gitee / Go 代理 / 校验库�
    旧镜像自动标记为 `videodl:previous`（回滚用）；
 4. **启动容器**：`--restart unless-stopped`、`-p <端口>:5200`、`-v <数据目录>:/app/videodata`、
    `VDL_CONFIG=/app/videodata/config.yml`，并等 `/healthz` 通过；
-5. **再次执行 = 更新**：自动读取现有容器的端口与数据目录，重建镜像后替换容器；
+5. **再次执行 = 更新**：自动读取现有容器的端口、数据目录，以及当初手动 `-e` 加进去的
+   `VDL_*` 变量（更新令牌、管理口令等），重建镜像后替换容器；
    新镜像启动失败会自动回滚到 `videodl:previous`。
 
 常用参数：`--port` / `--data` / `--source-dir` / `--registry` / `--registry-list` / `--apk-mirror` /
@@ -195,7 +201,11 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct \
 > `go env GOARCH`（= 宿主架构）。两种情况都是「给谁构建就出谁的架构」。
 > ⚠️ 不要在 Dockerfile / `docker-compose.yml` 里写死 `TARGETARCH=amd64` —— 那会盖掉
 > BuildKit 注入的值，ARM 机器（部分飞牛/群晖 NAS）上编出 x86 二进制，容器起来直接
-> `exec format error`。`docker-compose.yml` 里这两项刻意留空（null）。
+> `exec format error`。compose 里已经**删掉**了这两项，不要加回去；要换架构请换**平台**：
+> `DOCKER_DEFAULT_PLATFORM=linux/arm64 docker compose build` 或
+> `docker buildx build --platform linux/arm64 --load`。
+> （`--build-arg TARGETARCH=arm64` 只换编译出的二进制，基础镜像和镜像平台标记仍是
+> 宿主架构，跑到目标机器上照样 exec format error。）
 
 ### 第一次使用
 

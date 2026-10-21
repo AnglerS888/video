@@ -75,6 +75,13 @@ ENV GOPROXY=${GOPROXY} \
 ARG APP_VERSION=
 ARG GIT_COMMIT=
 ARG BUILD_TIME=
+# ⚠️ 必须有这个 WORKDIR：官方 golang 镜像默认 WORKDIR=/go（正好等于 $GOPATH），
+# 在 $GOPATH 根目录放 go.mod 会被 Go **直接忽略**，实测报：
+#   go: warning: ignoring go.mod in $GOPATH /go
+# 后果是 go mod download 白跑（依赖全推迟到 go build 才拉，分层缓存失效），
+# 某些版本下还会直接报 "go.mod file not found" 让构建失败。
+# 用 /src 和模块缓存（/go/pkg/mod）彻底分开。
+WORKDIR /src
 # 先把依赖清单放进镜像（后面 go mod download / go build 都要用）
 COPY go.mod go.sum ./
 # 校验工具链版本是否满足 go.mod（国内镜像站的 golang 镜像偶尔会滞后）
@@ -115,12 +122,15 @@ COPY . .
 # 拿不到（老 Docker / 未指定）就回落到当前镜像自身的架构（go env GOARCH）——
 # 也就是「给谁构建就出谁的架构」，不会编出错架构的二进制。
 RUN set -eux; \
-    VER="${APP_VERSION:-$(cat VERSION 2>/dev/null || echo dev)}"; \
+    VER="${APP_VERSION:-}"; \
+    [ -n "$VER" ] || VER="$(cat VERSION 2>/dev/null | tr -d '\r\n' || true)"; \
+    [ -n "$VER" ] || VER="dev"; \
     CMT="${GIT_COMMIT:-}"; \
     BT="${BUILD_TIME:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"; \
     OS="${TARGETOS:-$(go env GOOS)}"; \
     ARCH="${TARGETARCH:-$(go env GOARCH)}"; \
     echo "building version=${VER} commit=${CMT} time=${BT} target=${OS}/${ARCH}"; \
+    mkdir -p /out; \
     CGO_ENABLED=0 GOOS="$OS" GOARCH="$ARCH" \
       go build -trimpath \
         -ldflags="-s -w -X videoDownLoad/internal/version.Version=${VER} -X videoDownLoad/internal/version.Commit=${CMT} -X videoDownLoad/internal/version.BuildTime=${BT}" \
@@ -137,6 +147,7 @@ RUN set -eux; \
 FROM ${RUNTIME_IMAGE}
 # 容器内在线更新时 go build 用的代理：跟随构建参数 GOPROXY，
 # 不传就用国内镜像（竖线串联多个国内代理 + direct 兜底）；运行时也能用 `-e GOPROXY=...` 覆盖。
+# 默认值必须和构建阶段（上面那条 ARG GOPROXY）保持一致，否则两段行为不同。
 ARG GOPROXY=https://goproxy.cn|https://mirrors.aliyun.com/goproxy/|https://mirrors.cloud.tencent.com/go/|https://goproxy.io|direct
 # 同上：容器内 go build 也走国内代理；sumdb 查询同样经代理转发，所以校验库不用关。
 ARG GOSUMDB=sum.golang.org
@@ -150,27 +161,33 @@ ENV GOPROXY=${GOPROXY} \
 ARG APK_MIRROR=https://mirrors.aliyun.com/alpine
 # 备用源：阿里云抽风时依次尝试（清华源实测可用）
 ARG APK_FALLBACK_MIRRORS=https://mirrors.tuna.tsinghua.edu.cn/alpine
-# 注意：APK_MIRROR 是「带 /alpine 的根地址」，替换时只匹配到 /alpine 为止，
-# 否则会拼成 .../alpine/alpine/v3.20/main（实测镜像源直接 404）。
-# ⚠️ 这一步是「尽力而为」，**绝不允许让构建失败**：
-#   - 时区库已编进二进制（main.go 的 `_ "time/tzdata"`），不需要 apk 装 tzdata；
+# 注意：APK_MIRROR 是「带 /alpine 的根地址」，拼出来的地址形如
+#   https://mirrors.aliyun.com/alpine/v3.24/main
+# ⚠️ 换源必须**整份重写** /etc/apk/repositories：
+#   原来用 sed 把 dl-cdn.alpinelinux.org 换成候选源，但第一轮替换后文件里
+#   已经没有这个 host，第二轮 sed 就成了空操作 —— 表现为「日志说换源了、
+#   实际还在连上一个源」（2026-10-21 在 Rocky 9.4 + Docker 29 上实测到）。
+# ⚠️ 这一步是「尽力而为」，**绝不允许让构建失败**，也不能无限等：
+#   - 时区库已编进二进制（main.go 的 `_ "time/tzdata"`），不装 tzdata 也能正确解析 TZ；
 #   - CA 证书 golang 官方镜像自带（/etc/ssl/certs/ca-certificates.crt）；
-#   - NAS/VM 上 apk 镜像源的 DNS 经常抖（2026-10-21 实测 aliyun 与官方源同时
-#     "DNS: transient error"，回退也救不了，直接把构建卡死在这里）。
+#   - NAS/VM 上 apk 镜像源的 DNS 经常抖（"DNS: transient error"），这里给每次尝试
+#     加 30s 上限，失败就跳过，不把整个构建卡死在这里。
 RUN set -eux; \
     if command -v apk >/dev/null 2>&1; then \
       need=""; \
       [ -s /etc/ssl/certs/ca-certificates.crt ] || need="${need} ca-certificates"; \
       [ -f /usr/share/zoneinfo/Asia/Shanghai ] || need="${need} tzdata"; \
       if [ -n "${need}" ]; then \
+        ver="v$(cut -d. -f1,2 /etc/alpine-release 2>/dev/null || echo 3.20)"; \
+        ok=0; \
         for m in ${APK_MIRROR} ${APK_FALLBACK_MIRRORS}; do \
           [ -n "$m" ] || continue; \
-          sed -i -e "s#https://dl-cdn\.alpinelinux\.org/alpine#${m}#g" -e "s#http://dl-cdn\.alpinelinux\.org/alpine#${m}#g" /etc/apk/repositories || true; \
-          echo "尝试 apk 源：${m}"; \
-          if apk add --no-cache ${need}; then break; fi; \
+          printf '%s/%s/main\n%s/%s/community\n' "$m" "$ver" "$m" "$ver" > /etc/apk/repositories; \
+          echo "尝试 apk 源：${m}（${ver}）"; \
+          if timeout 30 apk add --no-cache ${need}; then ok=1; break; fi; \
           echo "WARN: 源 ${m} 不可用，换下一个"; \
         done; \
-        echo "WARN: apk 装证书/时区失败，继续构建（时区已内置；证书缺失会影响 HTTPS）"; \
+        [ "$ok" = "1" ] || echo "WARN: apk 装证书/时区失败，继续构建（时区已内置；证书缺失会影响 HTTPS）"; \
       else \
         echo "证书与时区已就绪，跳过 apk"; \
       fi; \
@@ -194,6 +211,9 @@ LABEL org.opencontainers.image.title="videodl" \
 # 优雅退出：给正在跑的 ffmpeg 合并/分片下载留出收尾时间。
 STOPSIGNAL SIGTERM
 # 轻量探活（只 SELECT 1），不要用 /api/system（会扫全表 COUNT）
+# ⚠️ 端口写死 5200：如果改了 config.yml 的 server.addr（容器里改端口本来就要
+#    同时改 -p 映射），或者把 RUNTIME_IMAGE 换成没有 wget 的非 alpine 镜像，
+#    这里会一直 unhealthy，记得同步修改。
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \
   CMD wget -qO- http://127.0.0.1:5200/healthz >/dev/null 2>&1 || exit 1
 ENTRYPOINT ["/app/videodl"]

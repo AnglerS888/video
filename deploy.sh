@@ -18,13 +18,16 @@
 #   ./deploy.sh --help
 #
 # 说明：容器内配置在 <数据目录>/config.yml，首次启动自动生成；
-#       更新只会重建镜像和容器，数据目录（含视频、数据库、配置）不受影响。
+#       更新只会重建镜像和容器，数据目录（含视频、数据库、配置）不受影响；
+#       旧容器里手动加过的 VDL_* 变量（更新令牌、管理口令等）会自动带到新容器。
 #
 # 环境变量（等价于同名参数）：
-#   IMAGE_NAME IMAGE_PREV CONTAINER_NAME GITEE_REPO GITEE_BRANCH
-#   GOPROXY GOSUMDB APK_MIRROR APK_FALLBACK_MIRRORS
+#   IMAGE_NAME IMAGE_PREV CONTAINER_NAME GITEE_REPO GITEE_BRANCH DEFAULT_PORT DEFAULT_DATA
+#   GOPROXY_ARG GOSUMDB_ARG GOTOOLCHAIN_ARG APK_MIRROR APK_FALLBACK_MIRRORS
 #   REGISTRY REGISTRY_FALLBACK REGISTRY_CANDIDATES DOCKER_CE_MIRROR
-#   BASE_IMAGE_TAG BUILD_NETWORK PULL_TIMEOUT
+#   BASE_IMAGE_TAG TARGET_ARCH_ARG TARGET_OS_ARG BUILD_NETWORK PULL_TIMEOUT HEALTH_RETRIES
+#   注意：Go 代理叫 GOPROXY_ARG（**故意**不叫 GOPROXY），避免和宿主机已导出的
+#        Go 环境变量撞名；`GOPROXY=... sudo ./deploy.sh` 是无效的，请用 GOPROXY_ARG。
 # ============================================================
 set -Eeuo pipefail
 
@@ -96,6 +99,8 @@ FORCE=0
 CHECK_ONLY=0
 BUILD_PULL=0
 BUILD_NO_CACHE=0
+# 重建容器时用来「带过去」旧容器 VDL_* 变量的临时 env 文件（空 = 还没生成）
+CARRY_ENV=""
 
 # ---------- 输出 ----------
 if [ -t 1 ]; then
@@ -548,6 +553,21 @@ container_data() {
     "$CONTAINER_NAME" 2>/dev/null || true
 }
 
+# 把旧容器里用户自己加的 VDL_* 环境变量写成 docker --env-file 格式（一行一个 VAR=VALUE）。
+# 为什么需要：脚本重建容器是 `docker rm -f` + `docker run`，只有在脚本里写死的 -e 会保留，
+# 用户当初手动加的（例如 VDL_UPDATE_TOKEN、VDL_ADMIN_TOKEN、VDL_PUBLIC_URL）会静静丢掉，
+# 表现为「更新一次之后管理口令/更新令牌失效」。
+# VDL_CONFIG 不在这里带：它由脚本自己设，统一指向 volume 上的 config.yml。
+container_env_file() {
+  local f
+  f="$(mktemp)"
+  if existing_container; then
+    docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_NAME" 2>/dev/null \
+      | grep -E '^VDL_[A-Za-z0-9_]+=' | grep -v '^VDL_CONFIG=' >>"$f" 2>/dev/null || true
+  fi
+  printf '%s' "$f"
+}
+
 ask() {
   # ask <提示> <默认值> -> 结果写入 REPLY_VALUE
   local prompt="$1" def="${2:-}" ans=""
@@ -908,16 +928,19 @@ build_image() {
   if [ "$BUILD_NO_CACHE" = "1" ]; then extra="$extra --no-cache"; fi
   if [ -n "$BUILD_NETWORK" ]; then extra="$extra --network=$BUILD_NETWORK"; fi
 
-  # 目标架构：默认**不传** TARGETARCH。
-  #   - BuildKit 会自动注入 TARGETOS/TARGETARCH（对应 --platform），脚本再传一遍
-  #     反而会盖掉 --platform 的值；
-  #   - 老 Docker（classic builder）没有这两个变量，Dockerfile 里会回落到
-  #     `go env GOOS/GOARCH`（= 宿主架构），同样正确。
-  # 只有用户显式 --arch 时才传。
-  local arch_args=""
+  # 目标架构：默认不传任何架构相关参数（BuildKit 会按 --platform 自动注入
+  # TARGETOS/TARGETARCH；Dockerfile 拿不到时回落到 `go env GOARCH`）。
+  # ⚠️ 跨架构**绝不能**只传 --build-arg TARGETARCH：那只会改「编译出来的二进制」，
+  #    两个 FROM 仍然按宿主架构拉基础镜像，最终镜像的平台标记也是宿主架构，
+  #    跑到目标机器上就是 exec format error。必须用 --platform 让基础镜像一起换平台。
+  local arch_args="" builder="docker build"
   if [ -n "$TARGET_ARCH_ARG" ]; then
-    arch_args="--build-arg TARGETOS=$TARGET_OS_ARG --build-arg TARGETARCH=$TARGET_ARCH_ARG"
-    warn "按要求构建 $TARGET_OS_ARG/$TARGET_ARCH_ARG 架构（跨架构需要宿主机装 QEMU，否则会失败）"
+    if ! docker buildx version >/dev/null 2>&1; then
+      die "--arch 需要 buildx（--platform 只有 BuildKit 支持）：请先安装 docker-buildx-plugin"
+    fi
+    builder="docker buildx build --load"
+    arch_args="--platform ${TARGET_OS_ARG}/${TARGET_ARCH_ARG}"
+    warn "跨架构构建 ${TARGET_OS_ARG}/${TARGET_ARCH_ARG}（需要 QEMU：docker run --privileged --rm tonistiigi/binfmt --install all）"
   else
     info "目标架构：自动（跟随宿主/--platform，宿主为 $(uname -m)）"
   fi
@@ -930,7 +953,7 @@ build_image() {
     ref="$(image_ref_for "$host")"
     info "使用基础镜像：$ref"
     # 这里所有 build-arg 都显式传，不用数组（CentOS 7 的 bash 4.2 空数组展开会报错）
-    if run docker build \
+    if run $builder \
         $extra \
         $arch_args \
         --build-arg "APP_VERSION=$ver" \
@@ -966,9 +989,17 @@ build_image() {
 # ---------- 启动 / 更新容器 ----------
 start_container() {
   local image="$1"
+  # 旧容器带来的自定义变量先加载，后面的显式 -e 会覆盖同名项（docker 里 -e 优先于 --env-file），
+  # 所以 VDL_CONFIG / GOPROXY 这些由脚本自己管的项永远以脚本为准。
+  local env_file="${CARRY_ENV:-/dev/null}"
+  # 日志限流：NAS/云主机的 docker 日志默认不封顶，采集/下载日志量不小，
+  # 不限制的话 json-file 会把系统盘写满（与 docker-compose.yml 里的 logging 保持一致）。
   run docker run -d \
     --name "$CONTAINER_NAME" \
     --restart unless-stopped \
+    --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 \
+    --ulimit nofile=65536:65536 \
+    --env-file "$env_file" \
     -p "${PORT}:5200" \
     -v "${DATA_DIR}:/app/videodata" \
     -e "TZ=${TZ:-Asia/Shanghai}" \
@@ -989,6 +1020,12 @@ run_container() {
   fi
 
   if existing_container; then
+    # 必须在 rm 之前取：重建容器会丢掉「手动 -e 加进去的」变量（VDL_UPDATE_TOKEN 等），
+    # 先提取旧容器的 VDL_* 存成 env 文件，等会儿用 --env-file 原样带回去。
+    CARRY_ENV="$(container_env_file)"
+    if [ -n "$CARRY_ENV" ] && [ -s "$CARRY_ENV" ]; then
+      info "沿用旧容器的自定义环境变量：$(sed 's/=.*//' "$CARRY_ENV" | tr '\n' ' ')"
+    fi
     info "停止并删除旧容器 ${CONTAINER_NAME}"
     run docker rm -f "$CONTAINER_NAME"
   fi
@@ -1003,6 +1040,7 @@ run_container() {
     fi
   }
   ok "容器已启动"
+  if [ -n "$CARRY_ENV" ]; then rm -f "$CARRY_ENV"; CARRY_ENV=""; fi
 }
 
 wait_healthy() {
@@ -1057,6 +1095,11 @@ main() {
   detect_os
 
   if [ "$CHECK_ONLY" = "1" ]; then
+    # 体检全程要用 curl：极简系统上没装的话，所有探测都会返回 000，看起来像全网挂了
+    if ! has curl; then
+      [ "$(id -u)" -eq 0 ] && { install_pkg curl || true; }
+      has curl || warn "缺少 curl：下面的探测会全部显示 000（先装 curl 或用 root 再跑 --check）"
+    fi
     check_docker_env
     check_network
     exit 0
@@ -1067,6 +1110,16 @@ main() {
     docker_ready || die "docker 命令存在但服务不可用，请先启动 Docker"
   elif docker_ready; then
     info "Docker 已安装：$(docker --version 2>/dev/null | head -n1)"
+  elif has docker; then
+    # 装了但服务没起来（NAS/云主机重启后很常见）：先尝试启动，别上来就重装
+    warn "docker 命令存在但服务未就绪，先尝试启动服务（起不来再重装）"
+    start_docker_service
+    sleep 3
+    if docker_ready; then
+      ok "Docker 服务已启动：$(docker --version 2>/dev/null | head -n1)"
+    else
+      install_docker
+    fi
   else
     install_docker
   fi

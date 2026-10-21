@@ -3,34 +3,34 @@ services:
     build:
       context: .
       args:
-        # ⚠️ 目标平台留空（这里是 null，**不是**空字符串），**绝对不要写默认值**：
-        #   - BuildKit 会自动注入 TARGETOS / TARGETARCH（对应 --platform）。
-        #     一旦这里写了值就会覆盖自动值 —— 写死 amd64 会让 ARM NAS 编出 x86 二进制，
-        #     容器起来直接 "exec format error"。
-        #     （写 `${TARGETARCH:-}` 也不行：那是空字符串，同样会覆盖自动值。）
-        #   - 老 Docker（20.10 classic builder，群晖/飞牛 NAS 常见）没有这两个自动变量，
-        #     Dockerfile 会回落到 `go env GOOS / GOARCH`（= 宿主架构），行为同样正确。
-        # 需要指定架构时在命令行传（优先级从高到低）：
-        #   docker compose build --build-arg TARGETARCH=arm64
-        #   TARGETARCH=arm64 docker compose build
-        TARGETOS:
-        TARGETARCH:
+        # ⚠️ 这里**不要**出现 TARGETOS / TARGETARCH：BuildKit 会自动注入它们
+        #    （对应 --platform），一旦传了值就会覆盖自动值 —— 写死 amd64 会让
+        #    ARM NAS 编出 x86 二进制，容器起来直接 "exec format error"。
+        #    老 Docker（20.10 classic builder，群晖/飞牛 NAS 常见）没有这两个变量，
+        #    Dockerfile 会回落到 `go env GOOS / GOARCH`（= 宿主架构），同样正确。
+        # ⚠️ 要给别的架构出镜像，改的是**平台**而不是编译目标，只有下面两条有效：
+        #      DOCKER_DEFAULT_PLATFORM=linux/arm64 docker compose build
+        #      docker buildx build --platform linux/arm64 --load -t videodl:latest .
+        #    `--build-arg TARGETARCH=arm64` 只改编译出来的二进制，两个 FROM 仍按宿主
+        #    架构拉镜像、镜像平台标记也不变 → 拿到目标机器上照样 exec format error。
         # Go 模块代理：国内默认走 goproxy.cn / 阿里云 / 腾讯云 / goproxy.io（proxy.golang.org 连不上会
         # "go mod download" 超时）。竖线 | 的含义是「前一个代理出错（超时/DNS 抖动）也换下一个」，
         # 逗号 , 的含义是「前一个返回 404 才换下一个」——国内网络抖，必须用竖线。
-        # 海外构建可改成 https://proxy.golang.org,direct
-        GOPROXY: "${GOPROXY:-https://goproxy.cn|https://mirrors.aliyun.com/goproxy/|https://mirrors.cloud.tencent.com/go/|https://goproxy.io|direct}"
+        # ⚠️ 变量名用 VDL_ 前缀：**不能**写 ${GOPROXY:-...}，那是本机 Go 环境变量的名字，
+        #    执行过 `go env -w GOPROXY=off` 或 export 过的人会把本机值带进构建。
+        # 海外构建：VDL_GOPROXY=https://proxy.golang.org,direct docker compose build
+        GOPROXY: "${VDL_GOPROXY:-https://goproxy.cn|https://mirrors.aliyun.com/goproxy/|https://mirrors.cloud.tencent.com/go/|https://goproxy.io|direct}"
         # 校验数据库：**默认不要关**（国内也用得上）。
         #   sum.golang.org 本身国内连不上，但 Go 会把 sumdb 查询**转发给 GOPROXY 里的代理**
         #   （<代理>/sumdb/sum.golang.org/lookup/...），实测 goproxy.cn / 阿里云 / 腾讯云都返回 200。
         #   关掉（GOSUMDB=off）会让 golang.org/toolchain 无法通过校验 →
         #   基础镜像 Go 版本低于 go.mod 要求、或容器内「立即更新」时直接报
         #   "checksum database disabled by GOSUMDB=off" 而失败。
-        GOSUMDB: "${GOSUMDB:-sum.golang.org}"
+        GOSUMDB: "${VDL_GOSUMDB:-sum.golang.org}"
         # 工具链策略：auto = 基础镜像自带的 Go 版本低于 go.mod 要求时，
         #   go 会自动经 GOPROXY 下载对应版本的工具链（国内代理实测可下，约 70MB，一次性开销）。
         #   离线/完全不能出网的环境改成 local：此时版本不够会立刻失败并给出可操作提示。
-        GOTOOLCHAIN: "${GOTOOLCHAIN:-auto}"
+        GOTOOLCHAIN: "${VDL_GOTOOLCHAIN:-auto}"
         # 版本信息：APP_VERSION 留空时读仓库根目录 VERSION 文件；
         # 想显示提交哈希就在宿主机执行：
         #   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build
@@ -54,7 +54,8 @@ services:
     # 需要重启的配置在 config.yml（VDL_CONFIG 指向 volume 上的那份），
     # 采集/下载/封面/ffmpeg 在「信息」页改，落在 volume 里的 ui.yml。
     ports:
-      - "5200:5200"
+      # 宿主端口可覆盖，容器内固定 5200：VDL_PORT=8080 docker compose up -d
+      - "${VDL_PORT:-5200}:5200"
     volumes:
       # 数据库、ffmpeg 缓存、封面与下载的视频都在该目录，映射到 NAS 本地盘
       - ./videodata:/app/videodata
@@ -67,11 +68,13 @@ services:
       # 想让每个 API 请求都打一行访问日志时设为 1（默认只在慢请求时打）
       - VDL_HTTP_LOG=0
       # 容器内「立即更新」要下源码 + go build，代理必须指向国内（竖线串联多代理自动兜底）
-      - GOPROXY=${GOPROXY:-https://goproxy.cn|https://mirrors.aliyun.com/goproxy/|https://mirrors.cloud.tencent.com/go/|https://goproxy.io|direct}
+      # 变量名用 VDL_ 前缀（宿主侧），容器里的名字仍是 GOPROXY / GOSUMDB / GOTOOLCHAIN：
+      # 直接用 ${GOPROXY:-...} 会和宿主机 Go 环境变量撞名，把本机设置带进容器。
+      - GOPROXY=${VDL_GOPROXY:-https://goproxy.cn|https://mirrors.aliyun.com/goproxy/|https://mirrors.cloud.tencent.com/go/|https://goproxy.io|direct}
       # 校验库同样经代理转发，所以容器内编译不必关校验（关掉会导致工具链下载失败）
-      - GOSUMDB=${GOSUMDB:-sum.golang.org}
+      - GOSUMDB=${VDL_GOSUMDB:-sum.golang.org}
       # 容器内编译时基础镜像 Go 版本偏低也能自动补齐工具链
-      - GOTOOLCHAIN=${GOTOOLCHAIN:-auto}
+      - GOTOOLCHAIN=${VDL_GOTOOLCHAIN:-auto}
       # 在线更新：更新源固定为 Gitee（anglers/video），点「立即更新」后容器内
       # 自动下载源码 → go build → 替换二进制 → 由 restart 策略拉起新进程，
       # 全程不用登录宿主机。更新令牌用环境变量 VDL_UPDATE_TOKEN（可选）。
@@ -100,6 +103,8 @@ services:
         hard: 65536
     healthcheck:
       # 用轻量探活（只 SELECT 1），不要用 /api/system（会扫全表 COUNT）
+      # ⚠️ 这里写的是**容器内**端口（固定 5200，与 VDL_PORT 无关）：改了 config.yml
+      #    的 server.addr 就会一直 unhealthy；命令依赖 wget，换非 alpine 的运行基座要同步改。
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5200/healthz"]
       interval: 60s
       timeout: 5s
