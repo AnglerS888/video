@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../api'
+import { confirmDialog } from '../confirm'
 import { toast } from '../toast'
 import type { ConfigData, ConfigInfo, CoverFixStatus, FfmpegStatus, SysInfo, UpdateInfo, UpdateStatus } from '../types'
 
@@ -93,7 +94,11 @@ async function vacuum() {
   const msg =
     `整理数据库会重写整个库文件，预计回收 ${fmtBytes(reclaimable.value)}。\n` +
     '整理期间服务会暂停响应（大库可能要几分钟），采集/下载中无法执行。\n\n确定继续？'
-  if (!confirm(msg)) return
+  if (!(await confirmDialog({
+    title: '整理数据库',
+    message: msg,
+    okText: '开始整理',
+  }))) return
   vacuuming.value = true
   const t0 = Date.now()
   const r = await api.vacuum()
@@ -294,7 +299,11 @@ async function loadConfig() {
 
 async function saveCfg() {
   if (!cfgForm.value || !cfgDirty.value || cfgSaving.value) return
-  if (!confirm('保存后立即生效：正在采集的接口、正在下载的这一集不受影响，下一轮采集 / 下一集开始用新值。继续？')) return
+  if (!(await confirmDialog({
+    title: '保存配置',
+    message: '保存后立即生效：正在采集的接口、正在下载的这一集不受影响，下一轮采集 / 下一集开始用新值。继续？',
+    okText: '保存并生效',
+  }))) return
   cfgSaving.value = true
   const r = await api.saveConfig(hotOf(cfgForm.value))
   cfgSaving.value = false
@@ -370,7 +379,7 @@ const cfgGroups: CfgGroup[] = [
     fields: [
       { path: 'cover.workers', label: '封面任务并发', type: 'number', unit: '个', min: 1, max: 8, hint: '同时处理几张封面' },
       { path: 'cover.concurrency', label: '单站点并发', type: 'number', unit: '个', min: 1, max: 16, hint: '同一个图床同时连几个' },
-      { path: 'cover.img_proxy', label: '图片代理', type: 'text', hint: '留空 = 直连；仅在直连失败时使用' },
+      { path: 'cover.img_proxy', label: '图片代理', type: 'text', hint: '留空 = 只用直连；填写后取图优先走代理，如 https://wsrv.nl/?url=' },
     ],
   },
   {
@@ -490,7 +499,11 @@ async function applyUp() {
     return toast('直接运行模式不支持自动更新，请到 Gitee 下载最新版', 'info', 3000)
   }
   const tip = '会自动下载最新源码、在容器内编译并替换程序，然后自动重启生效。\n期间服务会中断几秒到几分钟（编译耗时取决于机器性能）。继续？'
-  if (!confirm(tip)) return
+  if (!(await confirmDialog({
+    title: '在线更新',
+    message: tip,
+    okText: '开始更新',
+  }))) return
   upApplying.value = true
   const r = await api.applyUpdate()
   if (!r.ok) {

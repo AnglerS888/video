@@ -163,8 +163,13 @@ func (c *Collector) runCoverSupplement(stop <-chan struct{}) {
 	}()
 
 	imgDir := c.CoverDir
-	logx.Infof("[coverfix] 开始检查封面缓存；直连失败时走图片代理 %s（间隔 %v~%v）",
-		coverProxyBase(), coverProxyGapMin, coverProxyGapMax)
+	if proxy := currentImgProxy(); proxy != "" {
+		logx.Infof("[coverfix] 开始检查封面缓存；取图优先走图片代理 %s，失败再直连（代理请求间隔 %v~%v）",
+			proxy, coverProxyGapMin, coverProxyGapMax)
+	} else {
+		logx.Infof("[coverfix] 开始检查封面缓存；未配置图片代理，直连失败后用 %s 兜底（间隔 %v~%v）",
+			coverProxyBase(), coverProxyGapMin, coverProxyGapMax)
+	}
 
 	// ---- 1. 扫描全库封面地址 ----
 	// 分批扫（keyset 分页，按 id 递增），不要一次把整表结果集攥在手里：
@@ -305,7 +310,8 @@ const (
 
 // ---- 图片代理兜底 ----
 //
-// 直连和「同剧其它源」都失败时，最后走图片代理再试一次（默认 https://wsrv.nl/?url=）：
+// 代理来源优先级：页面上配置的 cover.img_proxy（保存即生效）> 环境变量 VDL_COVER_PROXY > 内置 https://wsrv.nl/?url=。
+// 配置了代理时取图优先走代理，失败再直连；直连和「同剧其它源」都失败时，最后再用代理兜底一次。
 // 防盗链、源站被墙、证书不兼容的图，代理那边通常还能抓到。
 // 免费代理对频率很敏感（连打会直接 429），所以两次请求之间固定等 2~3 秒。
 //
@@ -318,8 +324,12 @@ var (
 	coverProxyGapMax = 3 * time.Second
 )
 
-// coverProxyBase 图片代理前缀（默认 wsrv.nl）。每次现读环境变量，方便运行时切换/测试。
+// coverProxyBase 图片代理前缀：优先页面上配置的 cover.img_proxy（保存即生效），
+// 其次环境变量 VDL_COVER_PROXY，都没有则用内置的 wsrv.nl。
 func coverProxyBase() string {
+	if p := currentImgProxy(); p != "" {
+		return p
+	}
 	if v := strings.TrimSpace(os.Getenv("VDL_COVER_PROXY")); v != "" {
 		return v
 	}
@@ -518,39 +528,42 @@ func (x *coverFixCtx) fixOne(t coverFixTarget, alts []string) int {
 		lastErr = fmt.Errorf("复制其它源封面失败")
 	}
 
-	// d) 直连全失败：走图片代理（默认 wsrv.nl，全局 2~3 秒一次）
-	if raw, err := x.fetchProxy(t.URL); err == nil {
-		if err := storeCoverBytes(x.imgDir, t.URL, raw); err == nil {
-			return coverFixProxied
+	// d) 未配置页面代理时：直连全失败后走代理兜底（默认 wsrv.nl，全局 2~3 秒一次）。
+	// 页面已配置代理时 b/c 两步（fetchCoverBytes）已经优先走过代理，这里不再重复。
+	if currentImgProxy() == "" {
+		if raw, err := x.fetchProxy(t.URL); err == nil {
+			if err := storeCoverBytes(x.imgDir, t.URL, raw); err == nil {
+				return coverFixProxied
+			} else {
+				lastErr = err
+			}
 		} else {
 			lastErr = err
 		}
-	} else {
-		lastErr = err
-	}
 
-	// e) 代理再试一个同剧其它源的地址（只试一个，代理请求本身就很慢）
-	for _, alt := range alts {
-		if alt == t.URL {
-			continue
-		}
-		if x.proxyOff {
+		// e) 代理再试一个同剧其它源的地址（只试一个，代理请求本身就很慢）
+		for _, alt := range alts {
+			if alt == t.URL {
+				continue
+			}
+			if x.proxyOff {
+				break
+			}
+			raw, err := x.fetchProxy(alt)
+			if err != nil {
+				lastErr = err
+				break
+			}
+			if err := storeCoverBytes(x.imgDir, alt, raw); err != nil {
+				lastErr = err
+				break
+			}
+			if err := copyCoverFile(CoverPath(x.imgDir, alt), targetPath); err == nil {
+				return coverFixProxied
+			}
+			lastErr = fmt.Errorf("复制代理下载的封面失败")
 			break
 		}
-		raw, err := x.fetchProxy(alt)
-		if err != nil {
-			lastErr = err
-			break
-		}
-		if err := storeCoverBytes(x.imgDir, alt, raw); err != nil {
-			lastErr = err
-			break
-		}
-		if err := copyCoverFile(CoverPath(x.imgDir, alt), targetPath); err == nil {
-			return coverFixProxied
-		}
-		lastErr = fmt.Errorf("复制代理下载的封面失败")
-		break
 	}
 
 	if lastErr != nil {

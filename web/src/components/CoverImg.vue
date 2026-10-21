@@ -6,7 +6,8 @@ import { coverURL } from '../api'
  * 封面：
  *  - 只显示"服务端已成功下载并压缩落盘"的本地图片（/api/img 命中本地文件才 200）
  *  - 加载失败先换同名其它源的封面；都失败就等一会儿重试（单源等源站刷新）
- *  - 全程不显示任何占位图：没图就留空底色
+ *  - 底下垫一层占位图（web/public/doudi.png）：加载中 / 加载不出来都显示它，
+ *    真实封面加载成功后再淡入覆盖，重试期间不会闪成空白
  */
 const props = withDefaults(defineProps<{
   src?: string
@@ -86,6 +87,15 @@ onBeforeUnmount(clearTimer)
 
 <template>
   <div class="cover-box">
+    <!-- 占位图：加载中与加载失败都显示，真实封面成功后由下面的 img 淡入覆盖 -->
+    <img
+      src="/doudi.png"
+      alt=""
+      aria-hidden="true"
+      loading="lazy"
+      decoding="async"
+      class="absolute inset-0"
+    />
     <img
       v-if="current && !dead"
       :key="current + '#' + nonce"
@@ -95,7 +105,7 @@ onBeforeUnmount(clearTimer)
       decoding="async"
       referrerpolicy="no-referrer"
       :class="shown ? 'opacity-100' : 'opacity-0'"
-      class="transition-opacity duration-300"
+      class="relative transition-opacity duration-300"
       @load="onLoad"
       @error="onError"
     />

@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import CoverImg from '../components/CoverImg.vue'
 import { api } from '../api'
+import { confirmDialog } from '../confirm'
 import { toast } from '../toast'
 import type { WatchHistoryItem } from '../types'
 
@@ -100,7 +101,12 @@ async function remove(h: WatchHistoryItem) {
 
 async function clearAll() {
   if (!all.value.length) return
-  if (!confirm(`清空全部 ${all.value.length} 条观看记录？\n只会删除进度，已下载的视频文件不受影响。`)) return
+  if (!(await confirmDialog({
+    title: '清空观看历史',
+    message: `清空全部 ${all.value.length} 条观看记录？\n只会删除进度，已下载的视频文件不受影响。`,
+    okText: '清空',
+    danger: true,
+  }))) return
   const r = await api.clearHistory()
   if (!r.ok) return toast(r.msg || '清空失败', 'err')
   all.value = []

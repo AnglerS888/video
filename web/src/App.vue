@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from './api'
+import ConfirmDialog from './components/ConfirmDialog.vue'
 import QrShareDialog from './components/QrShareDialog.vue'
 import { isDark, toggleTheme } from './theme'
 import { toasts } from './toast'
@@ -146,6 +147,8 @@ onMounted(async () => {
     </header>
 
     <QrShareDialog v-if="shareURL" :url="shareURL" title="影视库" @close="shareURL = ''" />
+    <!-- 全局确认弹窗：替代浏览器原生 confirm（各页面 await confirmDialog(...) 触发） -->
+    <ConfirmDialog />
 
     <main
       class="mx-auto w-full max-w-[1680px] flex-1 px-3 sm:px-4 lg:px-6"
@@ -169,18 +172,25 @@ onMounted(async () => {
       class="mx-auto w-full max-w-[1680px] px-3 text-center text-xs muted sm:px-4 lg:px-6
         pb-28 pt-2 lg:pb-8"
     >
-      <RouterLink
-        to="/api-docs"
-        class="tap-sm inline-flex min-h-8 items-center gap-1.5 rounded-lg px-2.5 hover:text-amber-500"
-        active-class="text-amber-500!"
-      >
-        <svg viewBox="0 0 24 24" class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M9 4 4 12l5 8M15 4l5 8-5 8" />
-        </svg>
-        接口文档
-      </RouterLink>
-      <span v-if="appVersion" class="mx-1">·</span>
-      <span v-if="appVersion">{{ appVersion }}</span>
+      <!-- 链接与版本号放进同一条 flex 行统一 items-center。
+           链接自带 min-h-8（移动端 .tap-sm 是 36px），版本号如果还是普通行内文本，
+           两者会按基线对齐、视觉上错位好几个像素。 -->
+      <div class="inline-flex flex-wrap items-center justify-center gap-x-1">
+        <RouterLink
+          to="/api-docs"
+          class="tap-sm inline-flex min-h-8 items-center gap-1.5 rounded-lg px-2.5 hover:text-amber-500"
+          active-class="text-amber-500!"
+        >
+          <svg viewBox="0 0 24 24" class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 4 4 12l5 8M15 4l5 8-5 8" />
+          </svg>
+          接口文档
+        </RouterLink>
+        <template v-if="appVersion">
+          <span class="mx-1" aria-hidden="true">·</span>
+          <span class="inline-flex min-h-8 items-center px-1">{{ appVersion }}</span>
+        </template>
+      </div>
     </footer>
 
     <!-- 底部导航（手机 / 平板）；分享页不显示。

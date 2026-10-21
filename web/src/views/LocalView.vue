@@ -4,6 +4,7 @@ import { useRouter } from 'vue-router'
 import CoverImg from '../components/CoverImg.vue'
 import { api, playURL } from '../api'
 import { copyText } from '../clipboard'
+import { confirmDialog } from '../confirm'
 import { toast } from '../toast'
 import type { DownloadTask, WatchHistoryItem } from '../types'
 
@@ -143,7 +144,12 @@ function srcList(tasks: DownloadTask[]): string[] {
 
 // 删除单集：文件存在就删文件，文件不存在就只删记录（后端统一处理）
 async function delEp(t: DownloadTask) {
-  if (!confirm(`删除「${t.vod_name} ${epLabel(t)}」？\n本地文件存在会一并删除，文件已不存在则只删记录。`)) return
+  if (!(await confirmDialog({
+    title: '删除本地视频',
+    message: `删除「${t.vod_name} ${epLabel(t)}」？\n本地文件存在会一并删除，文件已不存在则只删记录。`,
+    okText: '删除',
+    danger: true,
+  }))) return
   const r = await api.delDownload(t.id)
   if (!r.ok) return toast(r.msg || '删除失败', 'err')
   toast('已删除', 'ok', 1500)
@@ -153,7 +159,12 @@ async function delEp(t: DownloadTask) {
 // 删除整部（该剧名下的全部已下载集）
 async function delGroup(g: Group) {
   const n = g.episodes.length
-  if (!confirm(`删除「${g.name}」的全部 ${n} 集？文件和记录都会删除，不可恢复。`)) return
+  if (!(await confirmDialog({
+    title: '删除整部',
+    message: `删除「${g.name}」的全部 ${n} 集？文件和记录都会删除，不可恢复。`,
+    okText: '全部删除',
+    danger: true,
+  }))) return
   const r = await api.batchDownload('delete', g.episodes.map((e) => e.id))
   if (!r.ok) return toast(r.msg || '删除失败', 'err')
   toast(r.data || `已删除 ${n} 集`, 'ok')

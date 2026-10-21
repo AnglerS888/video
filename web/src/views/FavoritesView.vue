@@ -2,6 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import CoverImg from '../components/CoverImg.vue'
 import { api } from '../api'
+import { confirmDialog } from '../confirm'
 import { toast } from '../toast'
 import type { FavItem } from '../types'
 
@@ -27,7 +28,11 @@ async function seen(f: FavItem) {
 }
 
 async function remove(f: FavItem) {
-  if (!confirm(`取消收藏「${f.vod_name}」？`)) return
+  if (!(await confirmDialog({
+    title: '取消收藏',
+    message: `取消收藏「${f.vod_name}」？`,
+    okText: '取消收藏',
+  }))) return
   const r = await api.delFav(f.vod_name)
   if (!r.ok) return toast(r.msg || '操作失败', 'err')
   toast('已取消收藏', 'ok', 1500)

@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import CoverImg from '../components/CoverImg.vue'
 import { api } from '../api'
+import { confirmDialog } from '../confirm'
 import { toast } from '../toast'
 import type { DownloadTask } from '../types'
 
@@ -161,7 +162,12 @@ function toggleAll() {
 }
 
 async function act(t: DownloadTask, action: 'pause' | 'resume' | 'retry' | 'priority' | 'delete') {
-  if (action === 'delete' && !confirm(`删除「${t.vod_name} ${epLabel(t)}」会同时删除本地文件，继续？`)) return
+  if (action === 'delete' && !(await confirmDialog({
+    title: '删除下载任务',
+    message: `删除「${t.vod_name} ${epLabel(t)}」会同时删除本地文件，继续？`,
+    okText: '删除',
+    danger: true,
+  }))) return
   const r = action === 'pause' ? await api.pauseDownload(t.id)
     : action === 'resume' ? await api.resumeDownload(t.id)
       : action === 'retry' ? await api.retryDownload(t.id)
@@ -185,7 +191,12 @@ function srcList(tasks: DownloadTask[]): string[] {
 async function batch(action: 'pause' | 'resume' | 'retry' | 'delete') {
   const ids = [...picked.value]
   if (!ids.length) return toast('先选择任务', 'info', 1500)
-  if (action === 'delete' && !confirm(`删除选中的 ${ids.length} 个任务会同时删除本地文件，继续？`)) return
+  if (action === 'delete' && !(await confirmDialog({
+    title: '批量删除',
+    message: `删除选中的 ${ids.length} 个任务会同时删除本地文件，继续？`,
+    okText: '删除',
+    danger: true,
+  }))) return
   const r = await api.batchDownload(action, ids)
   if (!r.ok) return toast(r.msg || '操作失败', 'err')
   toast(r.data || '操作成功', 'ok')
@@ -208,7 +219,7 @@ async function delGroup(g: Group) {
   const tip = done.length
     ? `删除「${g.name}」的 ${g.tasks.length} 个任务（含 ${done.length} 个已下载文件）？不可恢复。`
     : `删除「${g.name}」的 ${g.tasks.length} 个任务？`
-  if (!confirm(tip)) return
+  if (!(await confirmDialog({ title: '删除整组任务', message: tip, okText: '删除', danger: true }))) return
   const r = await api.batchDownload('delete', g.tasks.map((t) => t.id))
   if (!r.ok) return toast(r.msg || '操作失败', 'err')
   toast(r.data || '已删除', 'ok')

@@ -215,6 +215,7 @@ export const api = {
       config: ConfigData
     }>('/api/config', {
       method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ config }),
     })
   },

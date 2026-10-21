@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
+import { confirmDialog } from '../confirm'
 import { toast } from '../toast'
 import type { Source, SourceProgress, SourceTest } from '../types'
 
@@ -161,10 +162,13 @@ async function toggleAutoIncr(s: Source) {
 
 async function remove(s: Source) {
   const detail = s.videos ? `该来源现有 ${num(s.videos)} 部影片、${num(s.plays)} 条播放地址，` : '该来源还没有采集数据，'
-  const okc = confirm(
-    `删除来源「${s.name}」？\n\n${detail}删除后会一并清空：\n` +
-    `· 影片记录、播放地址\n· 下载记录与已下载文件\n· 封面缓存\n· 采集断点\n\n该操作不可恢复。`,
-  )
+  const okc = await confirmDialog({
+    title: '删除来源',
+    message: `删除来源「${s.name}」？\n\n${detail}删除后会一并清空：\n` +
+      `· 影片记录、播放地址\n· 下载记录与已下载文件\n· 封面缓存\n· 采集断点\n\n该操作不可恢复。`,
+    okText: '删除',
+    danger: true,
+  })
   if (!okc) return
   busy.value = true
   const r = await api.delSource(s.id)
@@ -235,7 +239,11 @@ async function collect(s: Source, full: boolean) {
 }
 
 async function collectAll(full: boolean) {
-  if (full && !confirm('对全部启用来源重新全量采集，耗时较长，确认继续？')) return
+  if (full && !(await confirmDialog({
+    title: '全量采集',
+    message: '对全部启用来源重新全量采集，耗时较长，确认继续？',
+    okText: '开始采集',
+  }))) return
   const r = await api.collect(full, undefined, full)
   if (!r.ok) return toast(r.msg || '启动失败', 'err', 2600)
   toast(r.data || '已开始', 'ok', 2600)

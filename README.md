@@ -8,6 +8,16 @@
 
 > 程序本身**不内置、不预置任何采集接口**，所有片源都由使用者自行添加。
 
+## 一键安装
+
+Linux 服务器（已装 Docker）一条命令部署，脚本会询问对外端口和数据存储目录：
+
+```bash
+curl -fsSL https://gitee.com/anglers/video/raw/master/deploy.sh | bash
+```
+
+数据目录不存在会自动创建；再次执行就是更新，默认沿用原来的端口与数据目录。
+
 ## 功能
 
 - **多接口采集** —— 添加任意数量的影视接口，只填域名，按域名自动补全接口路径
@@ -17,10 +27,11 @@
 - **下载** —— m3u8 分片并发拉取，ffmpeg 合并为 mp4，带进度、速度、暂停与续传
 - **本地库** —— 按剧分组管理已下载内容，记录播放位置，支持续播与自动下一集
 - **收藏** —— 按剧名收藏，显示源站更新时间是否变化
-- **分享** —— 生成局域网「分享页」链接与二维码；对方打开的是页面，可自行播放/下载，不会直接拿到视频文件地址
-- **封面本地化** —— 抓取并压缩封面存到本地，页面只读本地文件，不出现破图
+- **分享** —— 生成局域网「分享页」链接与二维码；链接带随机令牌和有效期（24 小时 / 7 天 / 永久），
+  对方打开的是页面，可自行播放/下载，不会直接拿到视频文件地址
+- **封面本地化** —— 抓取并压缩封面存到本地，页面只读本地文件；确实拉不到时显示内置占位图
 - 搜索可按**片名 / 演员**切换范围（默认全部）
-- 「接口」页把站点自身的 HTTP 接口列出来，可复制 curl
+- 「接口文档」页把站点自身的 HTTP 接口列出来，可复制 curl
 
 
 ## 技术栈
@@ -59,93 +70,52 @@ cp config.example.yml config.yml   # 精简模板：默认值与低配/标准预
 docker compose up -d
 ```
 
-仓库里的 `docker-compose.yml` **已经把国内链路配好**（基础镜像走国内镜像站、Go 模块代理 /
-校验库 / 工具链都走国内代理、apk 走阿里云源），在国内直接 `docker compose up -d` 即可，
-不需要手动改任何源。目标架构由构建器自动决定，ARM 机型（部分飞牛 / 群晖 NAS）也适用。
+仓库里的 `docker-compose.yml` 已经配好数据目录（`./videodata`）、端口（`5200`）、
+Go 模块代理（`goproxy.cn` / `goproxy.io`）和阿里云 apk 源，`docker compose up -d` 直接可用。
+基础镜像 `golang:1.26-alpine` 来自 Docker Hub，国内网络慢时给 Docker 配镜像加速即可。
 
 需要调整时用环境变量覆盖，例如：
 
 ```bash
-GOLANG_IMAGE=golang:1.26-alpine RUNTIME_IMAGE=golang:1.26-alpine \
-VDL_GOPROXY=https://proxy.golang.org,direct VDL_GOSUMDB=sum.golang.org \
-VDL_PORT=8080 docker compose up -d --build
+VDL_PORT=8080 VDL_GOPROXY=https://proxy.golang.org,direct docker compose up -d --build
 ```
 
-> ⚠️ compose 读的是 **`VDL_` 前缀**的变量（`VDL_GOPROXY` / `VDL_GOSUMDB` /
-> `VDL_GOTOOLCHAIN` / `VDL_PORT`），故意不用 `GOPROXY` / `GOSUMDB` 这些名字：
+> ⚠️ compose 只认 `VDL_PORT` / `VDL_GOPROXY` 两个变量，且故意不用 `GOPROXY` 这些名字：
 > 那是宿主机 Go 环境变量的名字，`go env -w GOPROXY=off` 或 export 过的人
 > 会把本机设置带进容器（容器内「立即更新」编译会直接失败）。
 
 ### Linux 一键部署 / 更新（推荐）
 
 ```bash
+# 一键执行：询问对外端口和数据目录
+curl -fsSL https://gitee.com/anglers/video/raw/master/deploy.sh | bash
+
+# 或者先下载再执行
 chmod +x deploy.sh
-sudo ./deploy.sh                 # 交互式：询问宿主端口、数据存储路径
-sudo ./deploy.sh --yes           # 不交互；已有容器则沿用它的端口与数据目录
-sudo ./deploy.sh --check         # 网络体检：Gitee / Go 代理 / 校验库转发 / Alpine 源 / 镜像站逐个探活
-./deploy.sh --dry-run            # 只打印将要执行的命令，不安装、不构建
+sudo ./deploy.sh                       # 交互式：询问对外端口、数据存储目录
+sudo ./deploy.sh --port 8080 --data /data/videodl
+sudo ./deploy.sh --yes                 # 非交互：默认 5200 + 当前目录下的 videodata
 ```
 
 脚本会依次做：
 
-1. **检测 Docker**：没有就自动装 —— **优先用国内 docker-ce 源**（阿里云 `mirrors.aliyun.com/docker-ce`，
-   apt / dnf / yum 全覆盖），失败才回退官方脚本 `get.docker.com`，再失败用发行版自带的 `docker.io`；
-   装完 `enable --now` 启动服务；
-2. **拉最新源码**：目录里是 git 仓库就 `git pull`，空目录用 `git clone --depth 1`，
-   都不行就下载 Gitee 的 `master.zip` 解压（下载固定用命令行风格 UA —— Gitee 对浏览器 UA
-   会返回登录页 HTML 而不是 zip，脚本会校验文件头并给出明确报错）；
-3. **构建镜像**：先把基础镜像显式 `docker pull` 下来（国内大层慢，先拉一次能看清进度），
-   再 `docker build`；**镜像站按候选顺序逐个探活，第一个可用的就用它，构建失败自动换下一个重试**；
-   旧镜像自动标记为 `videodl:previous`（回滚用）；
-4. **启动容器**：`--restart unless-stopped`、`-p <端口>:5200`、`-v <数据目录>:/app/videodata`、
-   `VDL_CONFIG=/app/videodata/config.yml`，并等 `/healthz` 通过；
-5. **再次执行 = 更新**：自动读取现有容器的端口、数据目录，以及当初手动 `-e` 加进去的
-   `VDL_*` 变量（更新令牌、管理口令等），重建镜像后替换容器；
-   新镜像启动失败会自动回滚到 `videodl:previous`。
+1. **检查 Docker / curl / tar**（未安装会提示安装命令，不会自动改系统）；
+2. **确认部署参数**：询问对外端口和数据存储目录 —— 目录不存在自动 `mkdir -p`，
+   相对路径按当前目录展开，端口校验 1~65535；
+3. **下载 Gitee 最新源码**（固定命令行 UA，避免拿到登录页 HTML）；
+4. **构建镜像** `videodl`；
+5. **重建容器**：`--restart unless-stopped`、`-p <端口>:5200`、
+   `-v <数据目录>:/app/videodata`、`VDL_CONFIG=/app/videodata/config.yml`；
+6. **等 `/healthz` 通过**后输出访问地址；60 秒没过会打印容器日志。
 
-常用参数：`--port` / `--data` / `--source-dir` / `--registry` / `--registry-list` / `--apk-mirror` /
-`--goproxy` / `--gosumdb` / `--gotoolchain` / `--arch` / `--official` / `--registry-mirror` /
-`--no-install` / `--check` / `--yes`，
-完整说明见 `./deploy.sh --help`。
+**再次执行就是更新**：检测到已有容器时，默认沿用它的端口和数据目录，直接回车确认即可。
+旧版本用的是命名数据卷（`videodl-data`），会原样沿用；如果手动输入了新目录，旧数据不会自动迁移，
+脚本会提示迁移命令，请先备份再切换。
 
-首次构建正常 2~5 分钟（国内走镜像站 + 阿里云源）；中断后重跑会复用已下载的层，
-之后的更新构建通常 1~2 分钟。
+首次构建正常 2~5 分钟，之后的更新构建通常 1~2 分钟。
 
-**国内加速（默认已开启，不用你配）**
-
-| 环节 | 默认值 | 说明 |
-|---|---|---|
-| 基础镜像 | `docker.1panel.live` | 候选顺序：1panel → 1ms.run → daocloud → amingg，逐个探活取第一个可用的 |
-| Alpine 软件源 | `https://mirrors.aliyun.com/alpine` | 备用 `https://mirrors.tuna.tsinghua.edu.cn/alpine`；**填到 `/alpine` 这一级**，填错（如多一层 /alpine）会 404 |
-| Go 模块代理 | `goproxy.cn｜阿里云｜腾讯云｜goproxy.io｜direct` | 竖线 `\|` = 前一个代理**出错**也立刻换下一个（国内网络抖必须用竖线，逗号只在 404 时才换） |
-| 校验数据库 | `GOSUMDB=sum.golang.org` | **不关**。`sum.golang.org` 本身连不上，但 Go 会把 sumdb 查询**转发给 GOPROXY 里的代理**（`<代理>/sumdb/sum.golang.org/lookup/...`），实测 goproxy.cn / 阿里云 / 腾讯云都返回 200 |
-| Go 工具链 | `GOTOOLCHAIN=auto` | 基础镜像的 Go 版本低于 `go.mod` 要求时，自动经代理下载对应版本工具链（约 70MB，一次性开销）；离线环境可设 `local` |
-| Docker 本体安装源 | `https://mirrors.aliyun.com/docker-ce` | apt / dnf / yum 全覆盖，比 `get.docker.com` 快得多 |
-
-也就是说国内服务器直接 `sudo ./deploy.sh` 就是全国内链路。要调整：
-
-```bash
-sudo ./deploy.sh --check                           # 先体检：看哪个镜像站/代理当前可用
-sudo ./deploy.sh --registry docker.1ms.run         # 指定基础镜像仓库
-sudo ./deploy.sh --registry-list "a.example.com b.example.com"  # 自定义候选镜像站（按顺序探活）
-sudo ./deploy.sh --registry-fallback ""            # 关掉自动备用仓库
-sudo ./deploy.sh --apk-mirror ""                   # 用 Alpine 官方源
-sudo ./deploy.sh --goproxy "https://proxy.golang.org,direct"  # 用官方 Go 代理
-sudo ./deploy.sh --official                        # 全部切回官方（海外机器）
-```
-
-> 镜像站探活用的是「能不能取到 `golang:1.26-alpine` 的 manifest」，判定规则：
-> 返回 **200** 直接可用；返回 **401/403 且带 `WWW-Authenticate: Bearer`** 说明镜像站愿意发 token
-> （docker 自己能完成握手），同样可用；返回**裸 403**（没有 `WWW-Authenticate` 头）
-> 说明镜像站直接拒绝、docker 也拿不到 token，**判为不可用并自动跳过**
-> （`docker.xuanyuan.me` / `docker.nju.edu.cn` 实测就是这种，已从候选列表里移除）。
->
-> apk 源不可用时会**自动换下一个源**重试，不会让构建直接失败。
->
-> 默认不给 Docker daemon 配 `registry-mirrors`（那会重启 Docker，影响机器上的其它容器）。
-> 基础镜像是**带仓库前缀的完整名字**，只影响本次构建。确实想给全局加速再加
-> `--registry-mirror https://docker.1ms.run`（可给多个，用逗号分隔；脚本会**保留
-> `daemon.json` 里已有的其它配置**，只改 `registry-mirrors` 一个键）。
+> Docker 未安装时先装：`curl -fsSL https://get.docker.com | sh`（国内网络可先配置镜像加速）。
+> 基础镜像 `golang:1.26-alpine` 来自 Docker Hub；Go 模块代理、apk 源已在 Dockerfile 里配成国内源。
 
 
 镜像不再内置 ffmpeg（二进制约 12MB，不再是 40MB）。运行时的解析顺序是：
@@ -182,36 +152,33 @@ go: download go1.26.9: golang.org/toolchain@v0.0.1-go1.26.9.linux-amd64:
     verifying module: checksum database disabled by GOSUMDB=off
 ```
 
-这会让「基础镜像 Go 版本略旧」的场景直接构建失败。海外机器可以覆盖成官方源：
+这会让「基础镜像 Go 版本略旧」的场景直接构建失败。海外机器可以覆盖代理：
 
 ```bash
-docker build --build-arg GOPROXY=https://proxy.golang.org,direct \
-             --build-arg GOSUMDB=sum.golang.org -t videodl:latest .
+docker build --build-arg GOPROXY=https://proxy.golang.org,direct -t videodl:latest .
 ```
 
-> 基础镜像也可以整条链换掉（国内镜像站 → 官方）：
-> `docker build --build-arg GOLANG_IMAGE=golang:1.26-alpine --build-arg RUNTIME_IMAGE=golang:1.26-alpine .`
+（`GOSUMDB` 在 Dockerfile 里固定为 `sum.golang.org`，不需要改。）
+
+> 想换基础镜像 / 软件源，直接改 `Dockerfile` 里的 `FROM` 和 `ARG APK_MIRROR`
+> （apk 源也可以用 `docker build --build-arg APK_MIRROR=dl-cdn.alpinelinux.org .` 临时切回官方）。
 >
-> 构建时会先校验基础镜像里的 Go 版本是否满足 `go.mod`（国内镜像站的 golang 镜像偶尔滞后）。
-> 默认 `GOTOOLCHAIN=auto`：版本不够时只告警，随后 Go 自动经代理补齐工具链继续构建；
-> 离线环境可以传 `--build-arg GOTOOLCHAIN=local`，此时版本不够会**立刻失败**并给出可操作提示。
+> 基础镜像的 Go 版本低于 `go.mod` 要求时，`GOTOOLCHAIN=auto`（Dockerfile 默认）会经
+> `GOPROXY` 自动下载对应工具链（约 70MB，一次性开销）；完全离线时把 Dockerfile 里的
+> `GOTOOLCHAIN` 改成 `local`，此时版本不够会直接构建失败。
 >
-> **目标架构不用配**：BuildKit 会自动注入 `TARGETARCH`（跟随 `--platform`），
-> 老版本 Docker（20.10 的 classic builder）没有这个变量，Dockerfile 会回落到
-> `go env GOARCH`（= 宿主架构）。两种情况都是「给谁构建就出谁的架构」。
-> ⚠️ 不要在 Dockerfile / `docker-compose.yml` 里写死 `TARGETARCH=amd64` —— 那会盖掉
-> BuildKit 注入的值，ARM 机器（部分飞牛/群晖 NAS）上编出 x86 二进制，容器起来直接
-> `exec format error`。compose 里已经**删掉**了这两项，不要加回去；要换架构请换**平台**：
-> `DOCKER_DEFAULT_PLATFORM=linux/arm64 docker compose build` 或
+> **目标架构不用配**：`docker build` 在目标机器上构建，产出就是该机器的架构；
+> 多架构用 `docker buildx build --platform linux/amd64,linux/arm64`（基础镜像会按目标平台拉取）。
+> ⚠️ 不要在 Dockerfile / `docker-compose.yml` 里写死 `TARGETARCH=amd64` —— ARM 机器
+> （部分飞牛/群晖 NAS）上会编出 x86 二进制，容器起来直接 `exec format error`。
+> 要换架构请换**平台**：`DOCKER_DEFAULT_PLATFORM=linux/arm64 docker compose build` 或
 > `docker buildx build --platform linux/arm64 --load`。
-> （`--build-arg TARGETARCH=arm64` 只换编译出的二进制，基础镜像和镜像平台标记仍是
-> 宿主架构，跑到目标机器上照样 exec format error。）
 
 ### 第一次使用
 
 > 首次启动片库是空的，**需要自己添加接口**。
 
-1. 进「接口」页，点添加，**只填域名即可** —— 例如 `https://www.example.com`，
+1. 进「来源」页，点添加，**只填域名即可** —— 例如 `https://www.example.com`，
    后端会自动补成 `https://www.example.com/api.php/provide/vod/`
 2. 点「测试」确认接口通（显示 HTTP 状态、页数、条数）
 3. 点「全量采集」把片库同步下来（几万部片子通常几十分钟到数小时，可随时停止）
@@ -230,10 +197,11 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct \
 | 观看历史 | `/history` | 全部播放记录（进度、上次观看时间），可只看未看完、移除单条或清空 |
 | 播放（本地） | `/watch/:id` | 播放已下载的 mp4，自动续播、自动下一集；← → 切集；倍速会被记住 |
 | 在线播放 | `/online/:vid` | 直接播源站 m3u8，不占磁盘；可换线路 |
-| 分享页 | `/s/:id` | 发给别人的独立页面（无站点导航），可播放/下载，同剧其它集可直接切换 |
+| 分享页 | `/s/:token` | 发给别人的独立页面（无站点导航），可播放/下载，同剧其它集可直接切换；令牌过期即失效（旧数字 id 链接仍兼容） |
 | 收藏 | `/favorites` | 按剧名收藏，提示源站是否有更新 |
-| 接口 | `/sources` | 接口增删改、连通性测试、全量/增量/停止、自动增量开关 |
-| 网站信息 | `/info` | 版本、运行环境、数据占用、磁盘、内存、数据库空闲页 |
+| 来源 | `/sources` | 接口增删改、连通性测试、全量/增量/停止、自动增量开关 |
+| 接口文档 | `/api-docs` | 站点自身 HTTP 接口一览（方法、路径、参数），可复制 curl |
+| 网站信息 | `/info` | 版本与在线更新、运行环境、数据占用、磁盘、内存、数据库空闲页、ffmpeg 安装、封面缓存检查 |
 
 ### 采集策略
 
@@ -277,6 +245,13 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct \
 - **本地删除**：本地页每一集可用「×」单独删除、整部可用「删除」批量删除；
   文件存在就删文件，文件已不存在则只删记录（两种都成功，不会报错）
 
+### 分享
+
+- 本地播放页（`/watch/:id`）点分享，生成 `/s/{token}` 分享页链接与二维码；首页与详情页的二维码分享的是页面本身
+- 可选有效期：永久（默认）/ 24 小时 / 7 天（对应 `?hours=0` / `24` / `168`，上限一年）；过期后分享页与文件都不再可访问
+- 分享页不直接暴露视频文件地址，只给播放/下载按钮；同剧其它已下载集可直接切换
+- 本地播放走短期播放令牌（`/api/play-token`，6 小时，进程内存态），刷新页面会自动重新获取
+
 ### 多源标注
 
 同一部剧如果从多个接口都下载过，列表里会显示「多源 N」标记，
@@ -286,8 +261,14 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct \
 
 - 采集时把封面下载并压缩（480px 宽、质量 80）存到 `videodata/img/<hash 前两位>/<hash>.jpg`
 - `/api/img` **只返回本地已缓存的图**，没有就返回 `204`；列表接口同时返回同名的其它源封面供前端换源
+- 前端加载不到封面时显示内置占位图 `web/public/doudi.png`（构建后位于站点根路径 `/doudi.png`）
 - 下载全局限速：**每张间隔 500~1000ms**，所有协程共用一条队列；遇到 `429/403` 时按 `Retry-After`
   （默认 30 秒）暂停整个队列，等负缓存过期后再试
+- **检查封面缓存**（信息页）：逐条确认本地缓存，缺失的按「同剧其它源已缓存 → 重新下载 → 图片代理兜底」
+  补齐；同一图床连续失败 5 次就整轮跳过，代理请求全局串行、每 2~3 秒一次。进度和统计都在信息页，
+  也可以直接调接口（`/api/cover/fix`，见下文）
+- **图片代理**：页面填 `cover.img_proxy`（如 `https://wsrv.nl/?url=`）后，取图**优先走代理**，失败再直连；
+  留空则只用直连。代理来源优先级：页面配置 > 环境变量 `VDL_COVER_PROXY` > 内置 `https://wsrv.nl/?url=`
 
 ## 版本与在线更新
 
@@ -296,7 +277,7 @@ git 提交哈希和构建时间一起通过 `-ldflags` 注入 `internal/version`
 
 ```bash
 ./videodl -version
-# videodl v1.4.0 (11d5782)
+# videodl v1.4.1 (11d5782)
 #   commit: 11d5782
 #   build : 2026-10-21 00:10:00
 #   go     : go1.26.0 linux/amd64
@@ -334,14 +315,15 @@ git 提交哈希和构建时间一起通过 `-ldflags` 注入 `internal/version`
 3. 原子替换 `/app/videodl` 后进程退出，由 `restart: unless-stopped` 拉起新进程——
    全程不用登录宿主机，数据目录（volume）不受影响。
 
-> 编译时内存开销比日常运行大不少（modernc/sqlite 很吃内存），compose 的内存上限
-> 因此给到 2G；编译并发压到 `-p 2`、GOGC=50。弱机上编译可能要几分钟，属正常现象。
+> 编译时内存开销比日常运行大不少（modernc/sqlite 很吃内存），建议给容器留够 2G 以上
+> （compose 默认不设上限，需要时自己加 `mem_limit`）；编译并发压到 `-p 2`、GOGC=50。
+> 弱机上编译可能要几分钟，属正常现象。
 
 > 容器内自更新只替换**容器里**的程序文件：`docker restart` / 重启 NAS 后仍是新版本，
 > 但 `docker compose up -d --force-recreate` 或重新 `build` 镜像会回到镜像里那份旧版本。
 > 想把版本固化进镜像，仍需要在宿主机执行一次 `docker compose build && docker compose up -d`。
 
-如果运行镜像被换成了精简 alpine（`RUNTIME_IMAGE=...alpine:3.20`，容器里没有 `go` 命令），
+如果把 Dockerfile 的运行阶段换成不含 `go` 的精简镜像（如 `alpine:3.20`），
 在线更新自动退回老模式：只把源码落到 `/app/videodata/update/src`，
 由你在宿主机项目目录执行：
 
@@ -371,12 +353,13 @@ docker compose build && docker compose up -d
 
 ## 数据目录
 
-所有状态都在 `-data` 指定的目录里，迁移或备份只需要拷这个目录：
+所有状态都在 `data_dir` 指定的目录里，迁移或备份只需要拷这个目录：
 
 ```
 videodata/
-├── videodl.db              # SQLite 库（影片、播放地址、下载记录、观看历史、收藏）
+├── videodl.db              # SQLite 库（影片、播放地址、下载记录、观看历史、收藏、分享令牌）
 ├── videodl.db-wal          # WAL（运行中才有）
+├── ui.yml                  # 页面可改的运行配置（采集 / 下载 / 封面 / ffmpeg）
 ├── img/                    # 封面缓存，按哈希分片：img/3f/3fa2...9c.jpg
 ├── videos/                 # 下载好的 mp4
 ├── bin/                    # 按需下载的 ffmpeg（信息页点「下载」后才有，约 80MB 解压后）
@@ -407,7 +390,7 @@ videodata/
 3. 程序所在目录 `config.yml`
 4. 当前目录 `videodata/config.yml`
 
-文件是 JSON，但**允许 `//` 行注释和 `/* */` 块注释**（读取前会剥掉），可以放心加说明。
+文件是 **YAML**（用 `#` 写注释）；旧版 JSON 配置（含 `//`、`/* */` 注释）仍然能读，读取前会剥掉注释。
 仓库里只附了一份 `config.example.yml`（精简模板）。
 `ui.yml` 由程序首次启动时自动生成，之后由页面维护，不需要模板。
 **默认值、标准预设、低配预设都写死在代码里**（`internal/config`），配置文件里不重复这些数值。
@@ -491,7 +474,7 @@ ffmpeg:
 | `download.min_free_mb` | `2048` | 磁盘保护阈值（MiB）：低于该值拒绝新下载并暂停队列，0=关闭 |
 | `cover.workers` | `2` | 封面预取协程数 |
 | `cover.concurrency` | `4` | 封面同时连接/解码的并发上限 |
-| `cover.img_proxy` | 空 | 封面图片代理前缀，如 `https://wsrv.nl/?url=` |
+| `cover.img_proxy` | 空 | 图片代理前缀，如 `https://wsrv.nl/?url=`；填写后取图优先走代理，留空只用直连 |
 | `ffmpeg.threads` | `0` | ffmpeg 线程数，0=默认；NAS 建议 1~2 |
 | `ffmpeg.reencode` | `true` | 音画不同步时是否全量重编码（弱 CPU 上很慢，可关） |
 | `ffmpeg.verify` | `true` | 合并后是否做音画同步自检 |
@@ -542,9 +525,14 @@ ffmpeg:
 | `VDL_CONFIG` | 指定配置文件路径（容器里指向 volume 上的 `config.yml`） |
 | `VDL_LOWMEM=1` | 强制套用代码里的低配预设（等同页面的「低配预设」，不需要额外配置文件） |
 | `VDL_HTTP_LOG=1` | 打印每个 API 请求的访问日志（默认只记慢请求） |
+| `VDL_ADMIN_TOKEN` | 管理口令：设置后所有写接口要带 `X-Admin-Token` 头或 `?token=`（公网/半公网部署建议开） |
+| `VDL_PUBLIC_URL` | 分享链接使用的站点根地址（如 `https://media.example.com`），不设则自动推断局域网 IP |
 | `VDL_COLLECT_RETRY_DELAY` | 采集失败后的等待秒数，默认 `180` |
 | `VDL_COLLECT_PAGE_DELAY` | 全量采集每页间隔，`3-5`（默认）/ `2` / `0` |
 | `VDL_COVER_GAP_MS` | 封面下载间隔（毫秒），`500-1000`（默认）/ `800` / `0` |
+| `VDL_COVER_PROXY` | 图片代理前缀（页面没配 `cover.img_proxy` 时使用），如 `https://wsrv.nl/?url=` |
+| `VDL_COVER_PROXY_GAP_MS` | 代理请求间隔（毫秒），`2000-3000`（默认）/ `1000` / `0`（不限速） |
+| `VDL_UPDATE_TOKEN` | Gitee 私人令牌：匿名下载源码包被要求登录时使用 |
 | `VDL_FFMPEG` | 指定 ffmpeg 可执行文件路径（优先级最高） |
 
 ## 部署到 NAS
@@ -560,14 +548,15 @@ VDL_CONFIG=/vol1/videodata/config.yml ./videodl-linux-amd64
 
 或直接用仓库里的 `docker-compose.yml`，已经配好：
 
-- `lowmem: true`（或启动前设 `VDL_LOWMEM=1`，`make run-lowmem` 就是这么跑的）
-- 容器内存上限 2G（留出来给「在线更新」时在容器内 `go build` 用，弱机可改回 1G），数据卷 `./videodata:/app/videodata`
+- 端口 `5200`（可用 `VDL_PORT=8080` 覆盖）、数据目录 `./videodata:/app/videodata`
 - `init: true` + `stop_grace_period: 30s`，`docker stop` 时能让合并中的 ffmpeg 收尾
 - 日志按 10MB × 3 份滚动，避免长期运行吃掉系统盘
 - 健康检查用 `/healthz`（只做 `SELECT 1`），不用会扫全表的 `/api/system`
-- **国内链路已配好**：基础镜像走国内镜像站、Go 模块代理 / 校验库 / 工具链都走国内代理、
-  apk 走阿里云源，`docker compose up -d` 直接可用；`TARGETOS`/`TARGETARCH` 刻意留空，
-  让构建器自动决定架构（ARM NAS 不会被编成 x86）
+- Go 模块代理走国内（`goproxy.cn` / `goproxy.io`）、apk 走阿里云源；基础镜像
+  `golang:1.26-alpine` 来自 Docker Hub，需要时自行配置镜像加速
+
+弱机建议在 `config.yml` 里开 `lowmem: true`（或启动前设 `VDL_LOWMEM=1`）；需要限制容器内存时
+自己加 compose 的 `mem_limit`（在线更新会在容器内 `go build`，建议至少留 2G）。
 
 实测空载 / 小库时常驻约 80~120MB（不再内嵌 ffmpeg，省掉约 40MB 只读段），均不含转码时的额外开销；
 采集与封面预取高峰期会明显上升，NAS 建议在配置里开 `lowmem`。
@@ -584,6 +573,20 @@ ffmpeg 与平台无关地按需下载（Windows x64 / Linux x64 / Linux arm64 �
 
 ## 数据库
 
+### 1.4.1 结构升级
+
+1.4.1 新增分享令牌表 `vod_share_token`，并给 `vod_download` 补 `priority` / `share_expires_at` 列、
+`vod_info` 补 `src_time`、`vod_source` 补 `auto_incr`。**直接启动新版程序会自动补齐**；不想先启动服务时：
+
+```bash
+# 推荐：Go 工具（自动判断库结构、先备份，可反复执行）
+go run ./tools/dbupgrade -db /path/to/videodata/videodl.db
+
+# 或手动跑 SQL（先备份 videodl.db、videodl.db-wal、videodl.db-shm 三个文件）
+sqlite3 videodl.db < migrations/upgrade-v1.4.1-current.sql
+# 旧结构（vod_download 没有 ep_index 列）用 upgrade-v1.4.1-old-shape.sql
+```
+
 ### 表
 
 | 表 | 说明 |
@@ -598,6 +601,7 @@ ffmpeg 与平台无关地按需下载（Windows x64 / Linux x64 / Linux arm64 �
 | `vod_sync_state` | 采集断点（全量/增量） |
 | `vod_watch_history` | 观看进度（≥95% 记完成） |
 | `vod_fav` | 收藏（按剧名） |
+| `vod_share_token` | 分享令牌（随机串、失效时间；避免用自增 id 当凭据） |
 | `app_meta` | 一次性维护任务的标记（如历史数据清理） |
 
 ### 设计要点
@@ -608,8 +612,11 @@ ffmpeg 与平台无关地按需下载（Windows x64 / Linux x64 / Linux arm64 �
 - **播放地址拆成 `host_id` + `path`**，主机域名单独存 `play_host` 字典 —— 源站就那么几十个 CDN 域名，
   原来每条记录都要重复写一遍完整 URL。
 - **空值不存**。`ep_name` 能由集号推导时留空，`created_at` 这类无人引用的列直接去掉。
-- **只有一个数据库连接**（`SetMaxOpenConns(1)`）。写并发靠 SQLite 串行化就够了；
-  但也意味着**任何 handler 里都不能在 `rows` 还没读完时再发查询**，否则会永久阻塞。
+- **连接池默认 4 个连接**（`db.conns`）。WAL 下可以「多读 + 单写」，慢查询不会堵住整站；
+  写操作本身由 SQLite 串行化（`busy_timeout=10s` 兜住短暂排队）。但**任何 handler 里都不能在
+  `rows` 还没读完时再发查询**（同一条连接会被占住，连接池耗尽后请求永久阻塞）。
+- **播放/分享不靠自增 id**。本地播放要短期令牌（`/api/play-token`，6 小时、内存态），
+  分享链接用带有效期的随机令牌（`vod_share_token`），枚举 `/play/1`、`/play/2` 拿不到文件。
 - **自动整理空闲页**。采集时每条播放地址都是"先删后插"，SQLite 不会把删掉的页还给文件系统，
   库文件会一路涨。启动 2 分钟后、之后每 6 小时检查一次，空闲页占比超过阈值且服务空闲时自动 `VACUUM`。
 
@@ -635,6 +642,13 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 
 所有接口返回 `{"ok": true, "data": ...}` 或 `{"ok": false, "msg": "..."}`。
 
+**写接口防护**（`POST/PUT/DELETE` 统一由 `guard()` 处理）：
+
+- 设了 `VDL_ADMIN_TOKEN` 时，必须带 `X-Admin-Token` 头或 `?token=`；
+- 跨站 `Origin` 直接拒绝（CSRF）；
+- 带请求体时 `Content-Type` 必须是 `application/json`；
+- 请求体上限 1MB，批量数组最多 500 项。读接口不鉴权。
+
 ### 接口管理 / 采集
 
 | 方法 | 路径 | 说明 |
@@ -646,6 +660,8 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 | GET | `/api/sources/{id}/test` | 测试连通性与分页 |
 | POST | `/api/sources/probe` | 添加前预检（填域名，自动试 4 种地址，不写库）`{"url":"…"}` |
 | POST | `/api/sources/{id}/auto-incr` | 开关「自动增量」`{"on":0\|1}` |
+| GET | `/api/sources/export` | 导出全部接口为 JSON（换机/重装备份） |
+| POST | `/api/sources/import` | 导入接口 JSON（按 `api_url` 去重） |
 | POST | `/api/collect/full` | 全量采集（`?source_id=N` 单个，`?restart=1` 从头） |
 | POST | `/api/collect/incr` | 增量采集 |
 | POST | `/api/collect/stop` | 停止采集（`?source_id=N` 停单个，不传停全部） |
@@ -660,9 +676,11 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 | GET | `/api/filters` | 筛选项（年份 / 地区 / 类型） |
 | GET | `/api/img` | 封面图（只返回本地已缓存，没有则 `204`） |
 | GET | `/api/live` | HLS 播放代理（改写 m3u8 + 转发分片） |
-| GET | `/play/{id}` | 播放已下载的 mp4，支持 Range；`?dl=1` 作为附件下载 |
-| GET | `/api/downloads/{id}/share` | 生成分享页链接（`/s/{id}`）+ 直链，自动推断局域网 IP |
-| GET | `/api/share/{id}` | 分享页数据：封面、集数、同剧其它已下载集 |
+| GET | `/api/play-token` | 签发本地播放令牌（6 小时，内存态，重启失效） |
+| GET | `/play/{id}` | 播放已下载的 mp4，支持 Range；本地播放要带 `?t=<播放令牌>`（或管理口令），`?dl=1` 作为附件下载；也接受分享令牌 `/play/{token}` |
+| GET | `/api/downloads/{id}/share` | 生成分享页链接（`/s/{token}`）+ 直链；`?hours=24`（默认永久，可 `168`=7 天） |
+| GET | `/api/share/base` | 分享用的站点根地址（本机访问时换成局域网 IP） |
+| GET | `/api/share/{token}` | 分享页数据：封面、集数、同剧其它已下载集（旧数字 id 仍兼容） |
 
 ### 下载 / 观看
 
@@ -672,6 +690,7 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 | GET | `/api/downloads` | 下载任务列表 |
 | POST | `/api/downloads/{id}/pause` | 暂停 |
 | POST | `/api/downloads/{id}/resume` | 继续 |
+| POST | `/api/downloads/{id}/retry` | 失败任务重试（重置为排队，已下好的分片复用） |
 | POST | `/api/downloads/{id}/priority` | 优先下载：当前这一集下完后立刻轮到它 |
 | DELETE | `/api/downloads/{id}` | 删除任务（连带删除半成品文件） |
 | POST | `/api/downloads/batch` | 批量暂停 / 继续 / 删除 |
@@ -691,6 +710,17 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 | GET | `/api/system` | 轻量统计（兼容保留） |
 | GET | `/api/sysinfo` | 运行环境、数据占用、磁盘、内存、记录数（`?fresh=1` 绕过 10s 缓存） |
 | POST | `/api/system/vacuum` | 手动整理数据库 |
+| GET | `/api/ffmpeg/status` | ffmpeg 状态（路径、版本、是否可下载安装） |
+| POST | `/api/ffmpeg/install` | 按需下载并安装 ffmpeg |
+| GET | `/api/cover/fix` | 封面缓存检查进度与统计 |
+| POST | `/api/cover/fix` | 开始检查封面缓存 |
+| POST | `/api/cover/fix/stop` | 停止封面检查 |
+| GET | `/api/config` | 读取配置（合并 config.yml + ui.yml，含两套预设） |
+| PUT | `/api/config` | 保存配置（`{"config":{...}}` 或整段原文 `{"text":"..."}`） |
+| GET | `/api/version` | 当前版本 + 上次检查更新结果 |
+| POST | `/api/update/check` | 检查 Gitee 是否有新版本 |
+| POST | `/api/update/apply` | 下载源码并在容器内编译更新（仅 Docker） |
+| GET | `/api/update/status` | 更新进度 |
 | GET | `/healthz` | 健康检查（`SELECT 1`） |
 
 ## 项目结构
@@ -699,17 +729,23 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 .
 ├── main.go                  # 启动、配置加载、目录迁移、优雅退出
 ├── internal/
-│   ├── collector/           # 采集、封面预取、下载队列
-│   ├── db/                  # 建表、迁移、聚合表、空间整理
+│   ├── collector/           # 采集、封面预取/补充、下载队列
+│   ├── db/                  # 建表、迁移、聚合表、分享令牌、空间整理
 │   ├── downloader/          # m3u8 分片下载、ffmpeg 合并
 │   ├── ffmpeg/              # ffmpeg 解析（env → data/bin → PATH）、按需下载安装、版本缓存
 │   ├── imgproc/             # 封面压缩（YCbCr 平面定点缩放）
 │   ├── logx/                # 结构化日志
+│   ├── netguard/            # 出站 HTTP 客户端（SSRF 防护、超时）
 │   ├── scheduler/           # 定时增量采集
 │   ├── sysinfo/             # 磁盘/内存/目录占用（分平台实现）
+│   ├── updater/             # 在线更新（下载源码、容器内编译、原子替换）
+│   ├── version/             # 版本信息（VERSION + 提交 + 构建时间）
 │   └── web/                 # HTTP 服务：路由 + 各业务 handler + 内嵌前端产物
 │       ├── routes.go        #   路由注册（接口契约一览）
+│       ├── guard.go         #   写接口守卫（管理口令 / CSRF / 请求体限额）
+│       ├── playtoken.go     #   本地播放令牌
 │       ├── web.go           #   Server 结构、列表缓存、中间件、通用响应
+│       ├── config.go        #   配置读取 / 保存（config.yml + ui.yml）
 │       ├── sources.go       #   接口管理与连通性测试
 │       ├── collect.go       #   采集触发、停止、进度
 │       ├── videos.go        #   影片列表 / 详情 / 筛选 / 封面代理
@@ -717,15 +753,24 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 │       ├── downloads.go     #   下载任务、播放、分享
 │       ├── watch.go         #   观看进度与历史
 │       ├── system.go        #   系统信息、数据库整理、健康检查
+│       ├── update.go        #   版本检查与在线更新
 │       ├── live.go          #   HLS 在线播放代理（改写 m3u8 + 转发分片）
 │       └── static/          #   前端构建产物（go:embed 打包）
 ├── web/                     # Vue 前端源码
-│   ├── src/components/      #   CoverImg / Pager / ShareDialog / VideoCard / VideoPlayer
-│   └── src/views/           #   LibraryView / DetailView / LocalView / DownloadsView
-│                            #   PlayerView / OnlineView / FavoritesView
-│                            #   SourcesView / InfoView
+│   ├── src/components/      #   CoverImg / Pager / ShareDialog / QrShareDialog
+│   │                        #   VideoCard / VideoPlayer / ConfirmDialog
+│   ├── src/views/           #   LibraryView / DetailView / LocalView / DownloadsView
+│   │                        #   PlayerView / OnlineView / FavoritesView / HistoryView
+│   │                        #   ShareView / SourcesView / ApiDocsView / InfoView
+│   ├── src/api.ts           #   HTTP 封装（写接口自动带 JSON Content-Type）
+│   ├── src/confirm.ts       #   全局确认弹窗（替代浏览器原生 confirm）
+│   └── src/toast.ts         #   轻提示
+├── migrations/              # 1.4.1 数据库升级 SQL（同时提供 Go 工具）
+├── tools/dbupgrade/         # 独立数据库升级工具（自动备份、幂等）
 ├── videodata/               # 运行时数据（库、封面、下载的视频、ffmpeg 缓存）
 ├── bin/                     # 构建产物（不入库）
+├── config.example.yml       # config.yml 精简模板
+├── deploy.sh                # Linux 一键部署 / 更新脚本
 ├── Dockerfile
 ├── docker-compose.yml
 └── Makefile
@@ -746,7 +791,8 @@ make clean                       # 只清 bin/，绝不删 videodata/
 约定：
 
 - 前端是 history 路由，后端 `spaHandler` 把未知路径回退到 `index.html`，新增后端路由时不要抢掉 `GET /`
-- **加接口先改 `internal/web/routes.go`**，实现按域放到对应文件
+- **加接口先改 `internal/web/routes.go`**，实现按域放到对应文件；写接口（POST/PUT/DELETE）
+  必须用 `guard()` 包一层，否则没有管理口令 / CSRF / JSON 校验
 - 修改前端后必须 `make web` 重新构建，产物已提交进仓库，否则 `go build` 拿到的是旧界面
 - 项目不含自动化测试文件，验证方式：起服务后打接口（`/healthz`、`/api/sysinfo`、`/api/videos`、
   `/api/sources`）并打开 SPA 深链接（如 `/sources`、`/online/1`）
@@ -754,12 +800,15 @@ make clean                       # 只清 bin/，绝不删 videodata/
 ## 常见问题
 
 **封面不显示**
-源站封面 CDN 可能有防盗链或被网络阻断。`/api/sysinfo` 的 `cover` 字段会给出成功/失败张数和最近一次错误原因。
-可以加 `-img-proxy https://wsrv.nl/?url=` 走图片代理。
+页面会先显示内置占位图，说明本地还没有这张缓存。源站封面 CDN 可能有防盗链或被网络阻断，
+`/api/sysinfo` 的 `cover` 字段会给出成功/失败张数和最近一次错误原因。
+到「信息」页把「图片代理」填成 `https://wsrv.nl/?url=`（保存即生效，取图优先走代理），
+再点「检查封面缓存」补一遍；日志会显示「取图优先走图片代理 https://wsrv.nl/?url=」。
 
 **封面加载很慢**
 这是故意的：默认每张间隔 500~1000ms，避免被图床限流。一页 100 条大约 1~2 分钟铺完，
-页面会先出占位、下完自动补上。想调快用 `VDL_COVER_GAP_MS=300-600`。
+页面会先显示占位图、下完自动补上。想调快用 `VDL_COVER_GAP_MS=300-600`。
+封面检查走代理时是另一种节流：每 2~3 秒一张（`VDL_COVER_PROXY_GAP_MS` 可调，自建代理可设 `0`）。
 
 **某个源采集一会儿就失败退出了**
 日志里看「连续 3 轮抓取失败」的具体 HTTP 状态。如果是 `520`/`522`，通常是源站被 Cloudflare 拦住，
@@ -779,6 +828,11 @@ make clean                       # 只清 bin/，绝不删 videodata/
 **在线播放提示"这条线路打不开"**
 先换下一条线路。若所有线路都不行，多半是该源 CDN 从本机不可达（可先用 `curl -I <m3u8>` 验证），
 或源站限制了外链播放；下载走的是同一批地址，也会一起失败。
+
+**分享链接提示「无效或已过期」/ 本地播放 403**
+分享链接按令牌的有效期判定（生成时选 24 小时、7 天或永久，上限一年），过期后重新分享即可。
+本地播放要求短期播放令牌（`/api/play-token`，6 小时、进程内存态），重启或超时后刷新页面会自动重新获取；
+设了 `VDL_ADMIN_TOKEN` 时也可以用管理口令直接访问。
 
 ## 说明
 
