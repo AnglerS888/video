@@ -14,9 +14,8 @@
 # 基础镜像默认走国内加速（1panel，实测大层 ~1.2MB/s）。
 # 1ms.run 的 manifest 很快但大层走 CloudFront，实测只有 ~29KB/s，不推荐做主力。
 # 海外或想用官方可覆盖：
-# 例：docker build --build-arg GOLANG_IMAGE=golang:1.26-alpine --build-arg ALPINE_IMAGE=alpine:3.20 .
+# 例：docker build --build-arg GOLANG_IMAGE=golang:1.26-alpine .
 ARG GOLANG_IMAGE=docker.1panel.live/library/golang:1.26-alpine
-ARG ALPINE_IMAGE=docker.1panel.live/library/alpine:3.20
 
 FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE} AS builder
 ARG TARGETOS=linux
@@ -58,8 +57,17 @@ RUN set -eux; \
         -ldflags="-s -w -X videoDownLoad/internal/version.Version=${VER} -X videoDownLoad/internal/version.Commit=${CMT} -X videoDownLoad/internal/version.BuildTime=${BT}" \
         -o /out/videodl .
 
-# ---- 运行阶段（极简镜像）----
-FROM ${ALPINE_IMAGE}
+# ---- 运行阶段（带 Go 工具链：容器内一键更新）----
+# 自 2026-10-21 起运行基座从纯 alpine 换成 golang（镜像约 400MB，比原来大 ~350MB）：
+# 换来 NAS 上「信息」页点一次「立即更新」，就能在容器内下载源码 → go build →
+# 替换二进制 → 自动重启（靠 restart: unless-stopped），不用再登录宿主机重建镜像。
+# 编译用的模块/构建缓存放在数据目录（volume），容器重建不丢，下次更新只增量编译。
+# 介意体积可以切回精简镜像，在线更新会自动退回「下载源码 + 宿主机重建」的老模式：
+#   docker build --build-arg RUNTIME_IMAGE=docker.1panel.live/library/alpine:3.20 .
+# 注意：不要写成 ${GOLANG_IMAGE} 这种「引用另一个 ARG」的默认值——部分 Docker 版本不展开，
+# 会拼出空的 FROM 直接失败。compose / deploy.sh 都会显式传这个同名参数。
+ARG RUNTIME_IMAGE=docker.1panel.live/library/golang:1.26-alpine
+FROM ${RUNTIME_IMAGE}
 # Alpine 软件源：国内 dl-cdn.alpinelinux.org 很慢（apk add 能跑几分钟），默认用阿里云。
 # 想用官方源：--build-arg APK_MIRROR=
 ARG APK_MIRROR=https://mirrors.aliyun.com/alpine
@@ -90,5 +98,9 @@ EXPOSE 5200
 # 配置全部来自 config.yml（没有命令行参数）；页面可改的项在同目录 ui.yml。
 # 默认把配置放在 volume 上：首次启动自动生成，之后改配置只需改这个文件并重启容器。
 ENV VDL_CONFIG=/app/videodata/config.yml
+# 容器内在线更新要跑 go build：模块走国内代理（海外用 docker run -e GOPROXY=... 覆盖）、
+# 禁止联网换工具链（go.mod 声明 1.26，golang:1.26-alpine 自带的工具链正好够）。
+ENV GOPROXY=https://goproxy.cn,direct \
+    GOTOOLCHAIN=local
 # 日志统一输出到 stdout（单行、带毫秒时间戳），由 docker 的 json-file 驱动负责轮转。
 ENTRYPOINT ["/app/videodl"]

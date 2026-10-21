@@ -408,7 +408,8 @@ const upApplying = ref(false)
 let upTimer: number | undefined
 
 const isDocker = computed(() => upInfo.value?.mode === 'docker')
-const upBusy = computed(() => ['downloading', 'extracting'].includes(upStatus.value?.phase || ''))
+// restarting 也算进行中：进程马上退出，接口会断几秒，docker 重启后新进程回 done
+const upBusy = computed(() => ['downloading', 'extracting', 'building', 'restarting'].includes(upStatus.value?.phase || ''))
 
 const upPhaseText = computed(() => {
   const s = upStatus.value
@@ -416,6 +417,9 @@ const upPhaseText = computed(() => {
   switch (s.phase) {
     case 'downloading': return '正在下载最新源码…'
     case 'extracting': return '正在解压…'
+    case 'building': return '正在容器内编译…'
+    case 'restarting': return '正在重启到新版本…'
+    case 'done': return '更新完成'
     case 'staged': return '源码已就绪'
     case 'failed': return '更新失败'
     default: return s.message || ''
@@ -427,7 +431,7 @@ async function loadVersion() {
   if (!r.ok || !r.data) return
   upInfo.value = r.data.info
   upStatus.value = r.data.status
-  if (['downloading', 'extracting'].includes(r.data.status?.phase || '')) {
+  if (['downloading', 'extracting', 'building', 'restarting'].includes(r.data.status?.phase || '')) {
     upApplying.value = true
     pollUp()
   }
@@ -465,7 +469,7 @@ async function applyUp() {
   if (!isDocker.value) {
     return toast('直接运行模式不支持自动更新，请到 Gitee 下载最新版', 'info', 3000)
   }
-  const tip = '会把最新源码下载到数据目录 update/src。\n容器里没有 Go，编译需要在宿主机执行 docker compose build，然后 up -d。继续？'
+  const tip = '会自动下载最新源码、在容器内编译并替换程序，然后自动重启生效。\n期间服务会中断几秒到几分钟（编译耗时取决于机器性能）。继续？'
   if (!confirm(tip)) return
   upApplying.value = true
   const r = await api.applyUpdate()
@@ -481,12 +485,14 @@ function pollUp() {
   if (upTimer) return
   upTimer = window.setInterval(async () => {
     const r = await api.updateStatus()
+    // restarting 阶段接口会断（进程退出、docker 拉起新进程），失败就等下一轮
     if (!r.ok || !r.data) return
     upStatus.value = r.data
-    if (['staged', 'failed'].includes(r.data.phase)) {
+    if (['staged', 'failed', 'done'].includes(r.data.phase)) {
       if (upTimer) { window.clearInterval(upTimer); upTimer = undefined }
       upApplying.value = false
       if (r.data.phase === 'failed') toast(r.data.error || '更新失败', 'err', 6000)
+      else if (r.data.phase === 'done') toast(r.data.message || '更新完成，已自动重启', 'ok', 6000)
       else toast(r.data.message || '源码已就绪，请到宿主机重建镜像', 'ok', 5000)
       loadVersion()
     }
@@ -783,8 +789,8 @@ onBeforeUnmount(() => {
             <p v-if="upStatus?.total" class="mt-1 text-[11px] muted">{{ fmtBytes(upStatus.bytes) }} / {{ fmtBytes(upStatus.total) }}</p>
           </div>
 
-          <!-- 结果：已编译 / 源码已就位 / 失败 -->
-          <div v-else-if="upStatus && ['staged', 'failed'].includes(upStatus.phase)" class="rounded-lg bg-slate-50 px-2.5 py-2 dark:bg-white/5">
+          <!-- 结果：更新完成 / 源码已就位（旧镜像） / 失败 -->
+          <div v-else-if="upStatus && ['done', 'staged', 'failed'].includes(upStatus.phase)" class="rounded-lg bg-slate-50 px-2.5 py-2 dark:bg-white/5">
             <p class="text-xs" :class="upStatus.phase === 'failed' ? 'text-rose-500' : 'font-medium'">{{ upStatus.message }}</p>
             <ul v-if="upStatus.instructions?.length" class="mt-1 space-y-0.5 break-all text-[11px] muted">
               <li v-for="(t, i) in upStatus.instructions" :key="i">{{ t }}</li>
@@ -797,10 +803,10 @@ onBeforeUnmount(() => {
               <button
                 class="btn btn-primary btn-sm"
                 :disabled="!upInfo?.available || upApplying || upBusy"
-                :title="upInfo?.available ? '' : '当前已是最新版本（或还没检查），不支持下载'"
+                :title="upInfo?.available ? '' : '当前已是最新版本（或还没检查），不能更新'"
                 @click="applyUp"
               >
-                {{ upApplying || upBusy ? '更新中…' : '下载最新源码' }}
+                {{ upApplying || upBusy ? '更新中…' : '立即更新' }}
               </button>
             </template>
             <a
@@ -816,9 +822,9 @@ onBeforeUnmount(() => {
             >Gitee 仓库</a>
           </div>
           <p v-if="isDocker" class="text-[11px] muted">
-            自动更新只在 Docker 容器内提供：容器里没有 Go 工具链，所以只把最新源码下载到数据目录，
-            随后在宿主机项目目录 <code>git pull</code>（或同步上面的源码）并执行
-            <code>docker compose build && docker compose up -d</code> 生效（volume 数据不受影响）。
+            自动更新只在 Docker 容器内提供：点「立即更新」后自动下载最新源码、在容器内编译并替换程序，
+            随后容器自动重启生效（期间服务短暂中断），数据目录不受影响，无需登录宿主机。
+            若镜像不含 Go 工具链（旧版精简镜像），则只下载源码并给出宿主机重建镜像的步骤。
           </p>
           <p v-else class="text-[11px] muted">
             当前为<strong>直接运行</strong>模式，不支持自动更新：请到 Gitee 下载最新版（或最新源码自行编译），

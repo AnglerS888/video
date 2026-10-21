@@ -17,9 +17,13 @@ services:
         APP_VERSION: "${APP_VERSION:-}"
         GIT_COMMIT: "${GIT_COMMIT:-}"
         # 国内优先：基础镜像走 1panel（1ms.run 的大层走 CloudFront 很慢），apk 走阿里云。
-        # 海外或想用官方：GOLANG_IMAGE=golang:1.26-alpine ALPINE_IMAGE=alpine:3.20 APK_MIRROR= docker compose build
+        # 海外或想用官方：GOLANG_IMAGE=golang:1.26-alpine APK_MIRROR= docker compose build
         GOLANG_IMAGE: "${GOLANG_IMAGE:-docker.1panel.live/library/golang:1.26-alpine}"
-        ALPINE_IMAGE: "${ALPINE_IMAGE:-docker.1panel.live/library/alpine:3.20}"
+        # 运行基座（自带 Go 工具链 → 容器内一键更新），默认与构建镜像同一个。
+        # 换官方镜像时记得两个一起改：GOLANG_IMAGE=golang:1.26-alpine RUNTIME_IMAGE=golang:1.26-alpine
+        # 想要精简小镜像（在线更新退回「下载源码+宿主机重建」模式）：
+        #   RUNTIME_IMAGE=docker.1panel.live/library/alpine:3.20 docker compose build
+        RUNTIME_IMAGE: "${RUNTIME_IMAGE:-docker.1panel.live/library/golang:1.26-alpine}"
         APK_MIRROR: "${APK_MIRROR:-https://mirrors.aliyun.com/alpine}"
     image: videodl:latest
     container_name: videodl
@@ -39,20 +43,21 @@ services:
       - VDL_CONFIG=/app/videodata/config.yml
       # 想让每个 API 请求都打一行访问日志时设为 1（默认只在慢请求时打）
       - VDL_HTTP_LOG=0
-      # 在线更新：更新源固定为 Gitee（anglers/video），容器内只下载源码，
-      # 编译要在宿主机 docker compose build 完成。
-      # 更新令牌等配置都在 config.yml 的 update 段（不再用环境变量）。
+      # 在线更新：更新源固定为 Gitee（anglers/video），点「立即更新」后容器内
+      # 自动下载源码 → go build → 替换二进制 → 由 restart 策略拉起新进程，
+      # 全程不用登录宿主机。更新令牌用环境变量 VDL_UPDATE_TOKEN（可选）。
     # init: 让容器里 PID 1 有个小小的 init 负责收尸和转发信号，
     # docker stop 时 SIGTERM 才能真正送到程序里（否则只会等 10s 后 SIGKILL）
     init: true
     # 优雅退出：给正在跑的 ffmpeg 合并/分片下载留出收尾时间
     stop_grace_period: 30s
-    # 资源上限：容器总内存给 1G，进程自身 GC 软上限 768MiB（-memlimit），
-    # 两者配合可以避免容器被内核 OOM kill，也不至于把 NAS 拖死。
+    # 资源上限：容器总内存给 2G——日常运行进程自身有 GC 软上限压着用不到这么多，
+    # 多出来的主要留给「在线更新」时在容器内 go build（modernc/sqlite 编译很吃内存，
+    # 1G 容易 OOM 把容器杀掉）。内存紧张的机器可改回 1G，更新失败时再临时调大。
     deploy:
       resources:
         limits:
-          memory: 1G
+          memory: 2G
           # cpus 在部分 NAS 的 compose 实现里不生效，可留空；要限制就填 "2.0"
     # 容器日志限流：NAS 的 docker 日志默认不封顶，长期运行会吃掉系统盘
     logging:

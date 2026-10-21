@@ -247,15 +247,29 @@ git 提交哈希和构建时间一起通过 `-ldflags` 注入 `internal/version`
 下载后解压到 `<数据目录>/update/src`，并校验 `go.mod` 与 `internal/web/static/index.html`
 是否存在（防止把登录/验证网页当成源码）。
 
-容器内没有 Go 工具链，也无法替换正在运行的镜像，所以「更新」只做两件事：
-把最新源码落到数据目录（`/app/videodata/update/src`），然后由你在宿主机项目目录执行：
+运行镜像自带 Go 工具链（基座是 golang，见 Dockerfile），所以「立即更新」是全自动的：
+
+1. 下载并解压最新源码到数据目录；
+2. 容器内 `go build` 编译新二进制（模块/构建缓存在 `update/gomodcache`、`update/gocache`，
+   下次只增量编译），并用 `-version` 自检；
+3. 原子替换 `/app/videodl` 后进程退出，由 `restart: unless-stopped` 拉起新进程——
+   全程不用登录宿主机，数据目录（volume）不受影响。
+
+> 编译时内存开销比日常运行大不少（modernc/sqlite 很吃内存），compose 的内存上限
+> 因此给到 2G；编译并发压到 `-p 2`、GOGC=50。弱机上编译可能要几分钟，属正常现象。
+
+> 容器内自更新只替换**容器里**的程序文件：`docker restart` / 重启 NAS 后仍是新版本，
+> 但 `docker compose up -d --force-recreate` 或重新 `build` 镜像会回到镜像里那份旧版本。
+> 想把版本固化进镜像，仍需要在宿主机执行一次 `docker compose build && docker compose up -d`。
+
+如果运行镜像被换成了精简 alpine（`RUNTIME_IMAGE=...alpine:3.20`，容器里没有 `go` 命令），
+在线更新自动退回老模式：只把源码落到 `/app/videodata/update/src`，
+由你在宿主机项目目录执行：
 
 ```bash
 git pull                                   # 或把 update/src 同步到项目目录
 docker compose build && docker compose up -d
 ```
-
-数据目录是 volume，重建镜像不影响影片、进度、下载文件与 `config.yml`。
 
 **直接运行（非容器）**
 
@@ -287,7 +301,7 @@ videodata/
 ├── img/                    # 封面缓存，按哈希分片：img/3f/3fa2...9c.jpg
 ├── videos/                 # 下载好的 mp4
 ├── bin/                    # 按需下载的 ffmpeg（信息页点「下载」后才有，约 80MB 解压后）
-└── update/                 # 在线更新缓存：src/ 源码、编译产物、Windows 替换脚本（可随时删）
+└── update/                 # 在线更新缓存：src/ 源码、gomodcache/gocache 编译缓存、done.json（可随时删）
 ```
 
 目录名历史：`data/` → `videos_data/` → **`videodata/`**。启动时如果只找到旧目录名（且里面有库），

@@ -426,15 +426,14 @@ registry_alive() {
   [ "$code" = "200" ] || [ "$code" = "401" ] || [ "$code" = "403" ]
 }
 
-# pick_images 按仓库拼出两个基础镜像名（空/docker.io = 官方简名）
+# pick_images 按仓库拼出基础镜像名（空/docker.io = 官方简名）。
+# 运行基座默认沿用 golang 镜像（自带 Go 工具链，容器内一键更新），这里只挑构建镜像。
 pick_images() {
   local reg="$1"
   if [ -n "$reg" ] && [ "$reg" != "docker.io" ]; then
     GOLANG_IMG="${reg}/library/golang:1.26-alpine"
-    ALPINE_IMG="${reg}/library/alpine:3.20"
   else
     GOLANG_IMG="golang:1.26-alpine"
-    ALPINE_IMG="alpine:3.20"
   fi
 }
 
@@ -469,7 +468,7 @@ build_image() {
       --build-arg "APP_VERSION=$ver" \
       --build-arg "GOPROXY=$GOPROXY_ARG" \
       --build-arg "GOLANG_IMAGE=$GOLANG_IMG" \
-      --build-arg "ALPINE_IMAGE=$ALPINE_IMG" \
+      --build-arg "RUNTIME_IMAGE=$GOLANG_IMG" \
       --build-arg "APK_MIRROR=$APK_MIRROR" \
       -t "$IMAGE_NAME" "$SOURCE_DIR"; then
     if [ -n "$REGISTRY_FALLBACK" ] && [ "$REGISTRY_FALLBACK" != "$REGISTRY" ]; then
@@ -481,7 +480,7 @@ build_image() {
         --build-arg "APP_VERSION=$ver" \
         --build-arg "GOPROXY=$GOPROXY_ARG" \
         --build-arg "GOLANG_IMAGE=$GOLANG_IMG" \
-        --build-arg "ALPINE_IMAGE=$ALPINE_IMG" \
+        --build-arg "RUNTIME_IMAGE=$GOLANG_IMG" \
         --build-arg "APK_MIRROR=$APK_MIRROR" \
         -t "$IMAGE_NAME" "$SOURCE_DIR" || die "主仓库和备用仓库都构建失败，请检查网络或用 --official"
     else

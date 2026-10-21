@@ -9,8 +9,10 @@
 //
 // 更新：直接下载 Gitee 的源码包 /repository/archive/<branch>.zip。
 //
-// 只支持 Docker 容器内更新：容器里没有 Go 工具链，也不能替换正在运行的镜像，
-// 所以流程是「下载最新源码到数据目录 → 校验 → 给出在宿主机重建镜像的指令」。
+// 只支持 Docker 容器内更新。2026-10-21 起运行镜像自带 Go 工具链（golang 基座），
+// 流程是「下载源码 → 容器内 go build → 替换二进制 → 进程退出，由 docker 的
+// restart 策略拉起新进程」；旧的精简镜像（容器里找不到 go 命令）自动回退为
+// 「下载源码到数据目录 → 给出在宿主机重建镜像的指令」。
 // 直接运行（单个二进制 / NAS 裸跑）**不提供自动更新**，页面上只给 Gitee 仓库链接，
 // 由用户自己下载最新版本替换。
 package updater
@@ -25,6 +27,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -66,13 +69,13 @@ type Info struct {
 
 // Status 更新任务进度
 type Status struct {
-	Phase        string   `json:"phase"` // idle/downloading/extracting/staged/failed
+	Phase        string   `json:"phase"` // idle/downloading/extracting/building/restarting/done/staged/failed
 	Percent      int      `json:"percent"`
 	Message      string   `json:"message"`
 	Bytes        int64    `json:"bytes"`
 	Total        int64    `json:"total"`
 	SourceDir    string   `json:"source_dir,omitempty"`
-	Instructions []string `json:"instructions"` // 在宿主机重建镜像的步骤
+	Instructions []string `json:"instructions"` // 无 Go 的旧镜像：在宿主机重建镜像的步骤
 	Error        string   `json:"error,omitempty"`
 	UpdatedAt    string   `json:"updated_at"`
 }
@@ -101,7 +104,7 @@ func New(dataDir, repo, branch, token string) *Updater {
 	if branch == "" {
 		branch = version.Branch
 	}
-	return &Updater{
+	u := &Updater{
 		dataDir: dataDir,
 		repo:    repo,
 		branch:  branch,
@@ -117,6 +120,19 @@ func New(dataDir, repo, branch, token string) *Updater {
 		},
 		status: Status{Phase: "idle", Message: "尚未开始", Instructions: []string{}},
 	}
+	// 容器内自更新是「替换二进制后退出、由 docker 拉起新进程」，新进程的内存态是空的；
+	// 旧进程退出前会写 done.json，这里读出来恢复成「更新完成」状态给页面展示（只报一次）
+	if d, ok := readDoneFile(dataDir); ok {
+		u.status = Status{
+			Phase:        "done",
+			Percent:      100,
+			Message:      fmt.Sprintf("已更新到 v%s 并自动重启（原版本 v%s）", d.NewVersion, d.OldVersion),
+			Instructions: []string{},
+			UpdatedAt:    d.At,
+		}
+		_ = os.Remove(donePath(dataDir))
+	}
+	return u
 }
 
 func (u *Updater) ua() string {
@@ -434,15 +450,149 @@ func (u *Updater) run(ctx context.Context) error {
 		return errors.New("下载的源码包不完整（缺少 go.mod 或前端产物 internal/web/static）")
 	}
 
-	// 3) 容器里没有 Go，也不该替换运行中的镜像：落源码 + 让用户在宿主机重建
+	// 3) 镜像自带 Go 工具链（2026-10-21 起运行基座是 golang）就在容器内编译：
+	//    go build → 替换二进制 → 退出，由 docker 的 restart 策略拉起新进程。
+	//    旧的精简镜像（找不到 go 命令）回退为「落源码 + 提示宿主机重建」。
+	goBin, lookErr := exec.LookPath("go")
+	if lookErr != nil {
+		u.setStatus(func(s *Status) {
+			s.Phase = "staged"
+			s.Percent = 100
+			s.SourceDir = srcDir
+			s.Message = "最新源码已下载到数据目录，请在宿主机重建镜像（当前镜像不含 Go 工具链）"
+			s.Instructions = dockerInstructions(srcDir)
+		})
+		return nil
+	}
+	return u.buildAndRestart(ctx, srcDir, goBin)
+}
+
+// buildAndRestart 在容器内编译新二进制、校验、原子替换当前程序文件，
+// 然后退出进程——compose 的 restart: unless-stopped（或 deploy.sh 的 --restart）会立刻拉起新二进制。
+func (u *Updater) buildAndRestart(ctx context.Context, srcDir, goBin string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("获取当前程序路径失败: %w", err)
+	}
+	if r, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = r
+	}
+
+	// 注入版本信息：版本号以源码包里的 VERSION 为准，提交用检查更新时拿到的远端 sha
+	newVer := ""
+	if b, err := os.ReadFile(filepath.Join(srcDir, "VERSION")); err == nil {
+		newVer = strings.TrimSpace(string(b))
+	}
+	if newVer == "" {
+		newVer = u.info.LatestVersion
+	}
+	commit := u.info.LatestCommit
+	buildTime := time.Now().UTC().Format(time.RFC3339)
+
 	u.setStatus(func(s *Status) {
-		s.Phase = "staged"
-		s.Percent = 100
-		s.SourceDir = srcDir
-		s.Message = "最新源码已下载到数据目录，请在宿主机重建镜像"
-		s.Instructions = dockerInstructions(srcDir)
+		s.Phase = "building"
+		s.Percent = 85
+		s.Message = "正在容器内编译新版本（弱机上可能要几分钟）…"
 	})
-	return nil
+
+	newBin := exe + ".new"
+	_ = os.Remove(newBin)
+
+	buildCtx, cancel := context.WithTimeout(ctx, 15*time.Minute)
+	defer cancel()
+	ldflags := fmt.Sprintf("-s -w -X videoDownLoad/internal/version.Version=%s "+
+		"-X videoDownLoad/internal/version.Commit=%s "+
+		"-X videoDownLoad/internal/version.BuildTime=%s", newVer, commit, buildTime)
+	// -p 2 + GOGC=50：压低编译并发与内存，避免弱机容器被 OOM（modernc/sqlite 编译很吃内存）
+	cmd := exec.CommandContext(buildCtx, goBin, "build", "-trimpath", "-p", "2",
+		"-ldflags", ldflags, "-o", newBin, ".")
+	cmd.Dir = srcDir
+	// 模块与构建缓存放数据目录（volume）：容器重建不丢，下次更新只增量下载/编译
+	env := append(os.Environ(),
+		"CGO_ENABLED=0",
+		"GOGC=50",
+		"GOMODCACHE="+filepath.Join(u.dataDir, "update", "gomodcache"),
+		"GOCACHE="+filepath.Join(u.dataDir, "update", "gocache"),
+	)
+	if os.Getenv("GOPROXY") == "" {
+		env = append(env, "GOPROXY=https://goproxy.cn,direct")
+	}
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		_ = os.Remove(newBin)
+		return fmt.Errorf("容器内编译失败: %w（%s）", err, tailString(string(out), 1500))
+	}
+
+	// 自检：新二进制跑得起来、版本号对得上才替换
+	vout, verr := exec.CommandContext(ctx, newBin, "-version").CombinedOutput()
+	if verr != nil || !strings.Contains(string(vout), newVer) {
+		_ = os.Remove(newBin)
+		return fmt.Errorf("新二进制自检失败: %v %s", verr, tailString(string(vout), 500))
+	}
+
+	// rename 是原子替换，Linux 下覆盖正在运行的可执行文件也没问题
+	// （旧进程继续用旧 inode，新进程拿到的就是新文件）
+	if err := os.Rename(newBin, exe); err != nil {
+		_ = os.Remove(newBin)
+		return fmt.Errorf("替换程序文件失败: %w", err)
+	}
+
+	oldVer := version.Version
+	u.setStatus(func(s *Status) {
+		s.Phase = "restarting"
+		s.Percent = 100
+		s.Message = "编译完成，正在重启到新版本…"
+		s.Instructions = []string{}
+	})
+	// 落一份结果：新进程启动时在 New() 里读出来恢复「更新完成」状态
+	_ = writeDoneFile(u.dataDir, oldVer, newVer, commit)
+
+	logx.Infof("[update] 已替换二进制（v%s → v%s），请求优雅退出，等待 docker 拉起新进程", oldVer, newVer)
+	time.Sleep(2 * time.Second) // 给前端最后一轮轮询留点窗口
+	requestRestart()            // SIGTERM：走 main 的优雅退出，退出后由 restart 策略拉起新二进制
+	return nil                  // 不会执行到这里
+}
+
+// tailString 取字符串末尾 n 字节（编译报错要看的是最后几行）
+func tailString(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) > n {
+		return "…" + s[len(s)-n:]
+	}
+	return s
+}
+
+// updateDone 自更新结果：旧进程退出前写，新进程 New() 读
+type updateDone struct {
+	OldVersion string `json:"old_version"`
+	NewVersion string `json:"new_version"`
+	NewCommit  string `json:"new_commit"`
+	At         string `json:"at"`
+}
+
+func donePath(dataDir string) string {
+	return filepath.Join(dataDir, "update", "done.json")
+}
+
+func writeDoneFile(dataDir, oldVer, newVer, commit string) error {
+	b, err := json.Marshal(updateDone{
+		OldVersion: oldVer, NewVersion: newVer, NewCommit: commit,
+		At: time.Now().Format("2006-01-02 15:04:05"),
+	})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(donePath(dataDir), b, 0o644)
+}
+
+func readDoneFile(dataDir string) (updateDone, bool) {
+	var d updateDone
+	b, err := os.ReadFile(donePath(dataDir))
+	if err != nil || json.Unmarshal(b, &d) != nil || d.NewVersion == "" {
+		return updateDone{}, false
+	}
+	return d, true
 }
 
 // download 下载源码包。
@@ -472,7 +622,7 @@ func (u *Updater) download(ctx context.Context, dst string) error {
 	if lastErr == nil {
 		lastErr = errors.New("未知错误")
 	}
-	return fmt.Errorf("下载源码包失败: %w（可在启动参数加 -update-token <Gitee令牌> 走官方接口）", lastErr)
+	return fmt.Errorf("下载源码包失败: %w（可用环境变量 VDL_UPDATE_TOKEN 提供 Gitee 令牌走官方接口）", lastErr)
 }
 
 func (u *Updater) downloadOne(ctx context.Context, url, ua, dst string) error {
