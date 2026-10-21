@@ -27,7 +27,7 @@ WORKDIR /src
 #   docker build --build-arg GOPROXY=https://proxy.golang.org,direct .
 ARG GOPROXY=https://goproxy.cn,direct
 ENV GOPROXY=${GOPROXY}
-# 版本信息：默认读仓库根目录 VERSION，也可用 --build-arg APP_VERSION=1.3.1 覆盖。
+# 版本信息：默认读仓库根目录 VERSION，也可用 --build-arg APP_VERSION=1.4.0 覆盖。
 # GIT_COMMIT / BUILD_TIME 用于「信息」页展示与在线更新判断（镜像里没有 .git，
 # 所以 commit 只能外部传；不传时更新检查会退化为「提交时间 vs 镜像构建时间」）。
 ARG APP_VERSION=
@@ -87,8 +87,8 @@ WORKDIR /app
 COPY --from=builder /out/videodl /app/videodl
 VOLUME ["/app/videodata"]
 EXPOSE 5200
-# 配置全部来自 config.json（没有命令行参数）。
+# 配置全部来自 config.yml（没有命令行参数）；页面可改的项在同目录 ui.yml。
 # 默认把配置放在 volume 上：首次启动自动生成，之后改配置只需改这个文件并重启容器。
-ENV VDL_CONFIG=/app/videodata/config.json
+ENV VDL_CONFIG=/app/videodata/config.yml
 # 日志统一输出到 stdout（单行、带毫秒时间戳），由 docker 的 json-file 驱动负责轮转。
 ENTRYPOINT ["/app/videodl"]

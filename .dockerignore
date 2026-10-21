@@ -12,3 +12,5 @@ config.json
 # 前端源码与依赖不需要进镜像（只用构建好的 internal/web/static）
 web/node_modules
 web/src
+config.yml
+ui.yml

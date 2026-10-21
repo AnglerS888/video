@@ -52,3 +52,7 @@ go.work.sum
 /.workbuddy/
 # 本地配置（可能含 Gitee 令牌）
 config.json
+# 页面配置（默认在数据目录里，这里兜底一下 data_dir=. 的情况）
+ui.json
+config.yml
+ui.yml

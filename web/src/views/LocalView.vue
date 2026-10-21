@@ -78,6 +78,16 @@ const groups = computed<Group[]>(() => {
 
 const totalSize = computed(() => done.value.reduce((n, t) => n + (t.size_mb || 0), 0))
 
+// 集列表默认收起：一部剧 80~100 集时会把页面撑到几千行，手机上根本划不完。
+// 需要看集数时点该剧的「查看全部 N 集」。
+const epOpen = ref<Set<string>>(new Set())
+function toggleEps(key: string) {
+  const s = new Set(epOpen.value)
+  if (s.has(key)) s.delete(key)
+  else s.add(key)
+  epOpen.value = s
+}
+
 function epLabel(t: DownloadTask | WatchHistoryItem): string {
   return t.ep_index >= 0 ? `第${t.ep_index + 1}集` : '整条'
 }
@@ -230,13 +240,18 @@ onMounted(load)
       </div>
 
       <div v-for="g in groups" :key="g.key" class="card p-3">
-        <div class="flex items-start gap-3">
+        <div class="flex flex-wrap items-start gap-3">
           <RouterLink :to="`/v/${g.vodId}`" class="w-10 shrink-0 overflow-hidden rounded-lg">
             <CoverImg :src="g.pic" :alt="g.name" :retries="2" />
           </RouterLink>
           <div class="min-w-0 flex-1">
-            <div class="flex flex-wrap items-center gap-2">
-              <RouterLink :to="`/v/${g.vodId}`" class="inline-flex min-h-10 items-center truncate text-sm font-medium hover:text-amber-500">{{ g.name }}</RouterLink>
+            <!-- 剧名：手机独占整行、允许两行；桌面 truncate。
+                 标签行放在剧名下面，避免和「删除」按钮抢同一行的宽度。 -->
+            <RouterLink
+              :to="`/v/${g.vodId}`"
+              class="line-clamp-2 w-full min-w-0 text-sm font-medium leading-snug hover:text-amber-500 sm:truncate"
+            >{{ g.name }}</RouterLink>
+            <div class="mt-1 flex flex-wrap items-center gap-2">
               <span class="chip">{{ g.episodes.length }} 集</span>
               <span class="text-[11px] muted">{{ g.sizeMB.toFixed(1) }} MB</span>
               <span
@@ -244,11 +259,26 @@ onMounted(load)
                 class="chip border-amber-400/60 text-amber-600 dark:text-amber-400"
                 :title="'这些集来自不同源：' + srcList(g.episodes).join(' / ')"
               >多源 {{ srcList(g.episodes).length }}</span>
-              <button class="btn btn-ghost btn-sm ml-auto min-h-10 px-3 xl:min-h-0" title="删除整部的文件和记录" @click="delGroup(g)">删除</button>
             </div>
-            <!-- 集列表：手机上每集占整行、按钮 40px 高（原来 12px 图标 + py-1 只有 20px，手指点不中）；
-                 桌面端（sm 以上）仍还原成紧凑的小胶囊 -->
-            <div class="mt-1.5 grid grid-cols-1 gap-1.5 xl:flex xl:flex-wrap">
+          </div>
+          <!-- 操作按钮：手机换到右下角一行，sm 起回到剧名右侧 -->
+          <div class="ml-auto flex w-full shrink-0 items-center justify-end gap-2 sm:w-auto">
+            <button
+              class="btn btn-ghost btn-sm min-h-10 px-3 xl:min-h-0"
+              :aria-expanded="epOpen.has(g.key)"
+              @click="toggleEps(g.key)"
+            >
+              {{ epOpen.has(g.key) ? '收起集数' : `查看全部 ${g.episodes.length} 集` }}
+            </button>
+            <button class="btn btn-ghost btn-sm min-h-10 px-3 xl:min-h-0" title="删除整部的文件和记录" @click="delGroup(g)">删除</button>
+          </div>
+        </div>
+
+        <!-- 集列表：默认不展开（一部剧 80+ 集会把页面撑到几千行，2026-10-20 反馈）。
+             点上面「查看全部 N 集」才展开；手机每集占整行、按钮 44px 高，
+             桌面端（xl 以上）还原成紧凑的小胶囊。 -->
+        <div v-if="epOpen.has(g.key)" class="mt-2 border-t border-slate-100 pt-2 dark:border-white/5">
+          <div class="grid grid-cols-1 gap-1.5 xl:flex xl:flex-wrap">
               <span
                 v-for="ep in g.episodes" :key="ep.id"
                 class="flex items-stretch overflow-hidden rounded-lg border transition"
@@ -300,7 +330,6 @@ onMounted(load)
               </span>
             </div>
           </div>
-        </div>
       </div>
     </section>
   </div>

@@ -1,0 +1,160 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+import { toast } from '../toast'
+
+/**
+ * 接口文档：把站点自身的 HTTP 接口开放出来，方便脚本/第三方客户端对接。
+ *
+ * 接口都是同源的 `/api/...`，无鉴权（站点按局域网使用设计）；
+ * 统一响应：{ ok: true, data: ... } 或 { ok: false, msg: "错误原因" }。
+ */
+type ApiItem = { m: 'GET' | 'POST' | 'PUT' | 'DELETE'; p: string; d: string; q?: string }
+type ApiGroup = { title: string; desc?: string; items: ApiItem[] }
+
+const groups: ApiGroup[] = [
+  {
+    title: '影视库',
+    desc: '列表按「剧名」合并多个来源，同一部剧只出现一次。',
+    items: [
+      { m: 'GET', p: '/api/videos', d: '影片列表（分页）', q: 'wd 关键词；field=name|actor|all 搜索范围；page、size；year、area、type；filter=downloaded 只看已下载；source_id 限定来源' },
+      { m: 'GET', p: '/api/videos/{id}', d: '影片详情（含多来源、剧集与播放地址）' },
+      { m: 'GET', p: '/api/filters', d: '筛选项：年份 / 地区 / 类型' },
+      { m: 'GET', p: '/api/img?u={url}', d: '封面图代理（解决源站防盗链）' },
+    ],
+  },
+  {
+    title: '来源（采集接口）',
+    desc: '一个来源就是一个资源站接口（苹果 CMS 的 provide/vod 协议）。',
+    items: [
+      { m: 'GET', p: '/api/sources', d: '来源列表（含影片数、连通性、采集进度）' },
+      { m: 'POST', p: '/api/sources', d: '添加来源，body: {name, api_url}' },
+      { m: 'PUT', p: '/api/sources/{id}', d: '修改来源（名称 / 地址 / 启用）' },
+      { m: 'DELETE', p: '/api/sources/{id}', d: '删除来源及其采集数据（危险）' },
+      { m: 'POST', p: '/api/sources/probe', d: '检测地址是否可用（不写库），body: {api_url}' },
+      { m: 'GET', p: '/api/sources/{id}/test', d: '测试来源连通性' },
+      { m: 'POST', p: '/api/sources/{id}/auto-incr', d: '开关「定时增量」，body: {enabled}' },
+      { m: 'GET', p: '/api/sources/export', d: '导出全部来源为 JSON' },
+      { m: 'POST', p: '/api/sources/import', d: '导入来源 JSON（按 api_url 去重）' },
+    ],
+  },
+  {
+    title: '采集',
+    items: [
+      { m: 'POST', p: '/api/collect/full', d: '全量采集，body: {source_id}（不传=全部启用来源）' },
+      { m: 'POST', p: '/api/collect/incr', d: '增量采集（按更新时间拉最新几页）' },
+      { m: 'POST', p: '/api/collect/stop', d: '停止采集，可带 ?source_id=' },
+      { m: 'GET', p: '/api/progress', d: '采集进度（各来源页码 / 已入库数量）' },
+    ],
+  },
+  {
+    title: '下载与本地',
+    items: [
+      { m: 'GET', p: '/api/downloads', d: '下载任务列表' },
+      { m: 'POST', p: '/api/download', d: '新增下载，body: {vod_id, ep_index, play_url, ...}' },
+      { m: 'POST', p: '/api/downloads/{id}/pause', d: '暂停' },
+      { m: 'POST', p: '/api/downloads/{id}/resume', d: '继续' },
+      { m: 'POST', p: '/api/downloads/{id}/retry', d: '失败重试' },
+      { m: 'POST', p: '/api/downloads/{id}/priority', d: '插队优先下载' },
+      { m: 'POST', p: '/api/downloads/batch', d: '批量操作，body: {ids, action}' },
+      { m: 'DELETE', p: '/api/downloads/{id}', d: '删除任务与文件' },
+      { m: 'GET', p: '/api/local', d: '本地已完成的影片（按剧名分组）' },
+    ],
+  },
+  {
+    title: '播放与分享',
+    items: [
+      { m: 'GET', p: '/play/{id}', d: '播放文件流，?dl=1 作为附件下载' },
+      { m: 'GET', p: '/api/live?u={m3u8}', d: '在线播放代理（改写 m3u8 + 转发分片，绕过源站 CORS）' },
+      { m: 'GET', p: '/api/downloads/{id}/share', d: '生成分享链接（局域网地址）' },
+      { m: 'GET', p: '/api/share/base', d: '站点根地址（用于二维码）' },
+      { m: 'GET', p: '/api/share/{id}', d: '分享页数据（不直接暴露视频地址）' },
+    ],
+  },
+  {
+    title: '历史与收藏',
+    items: [
+      { m: 'POST', p: '/api/watch/progress', d: '上报播放进度，body: {download_id, ep_index, position, duration}' },
+      { m: 'GET', p: '/api/watch/history', d: '观看历史' },
+      { m: 'DELETE', p: '/api/watch/history/{id}', d: '删除单条历史（不动文件）' },
+      { m: 'DELETE', p: '/api/watch/history', d: '清空历史' },
+      { m: 'GET', p: '/api/favs', d: '收藏列表' },
+      { m: 'POST', p: '/api/favs', d: '添加收藏，body: {vod_name}' },
+      { m: 'DELETE', p: '/api/favs', d: '取消收藏' },
+    ],
+  },
+  {
+    title: '系统与配置',
+    items: [
+      { m: 'GET', p: '/api/sysinfo', d: '运行环境、磁盘、内存、记录数' },
+      { m: 'GET', p: '/api/version', d: '版本与更新状态' },
+      { m: 'POST', p: '/api/update/check', d: '检查 Gitee 是否有新版本' },
+      { m: 'POST', p: '/api/update/apply', d: '下载最新源码（仅 Docker 容器内可用）' },
+      { m: 'GET', p: '/api/config', d: '读取配置文件（原文 + 解析结果）' },
+      { m: 'PUT', p: '/api/config', d: '保存配置文件，body: {text}；重启后生效' },
+      { m: 'POST', p: '/api/system/vacuum', d: '整理数据库（回收空闲页）' },
+      { m: 'GET', p: '/healthz', d: '健康检查（只做一次轻量查询）' },
+    ],
+  },
+]
+
+const base = computed(() => location.origin)
+
+const color = (m: string) =>
+  m === 'GET' ? 'bg-emerald-500/12 text-emerald-600 dark:text-emerald-400'
+  : m === 'POST' ? 'bg-sky-500/12 text-sky-600 dark:text-sky-400'
+  : m === 'PUT' ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400'
+  : 'bg-rose-500/12 text-rose-600 dark:text-rose-400'
+
+async function copy(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    toast('已复制', 'ok', 1200)
+  } catch {
+    toast('复制失败，请手动选择', 'err', 1800)
+  }
+}
+
+function curlOf(it: ApiItem) {
+  const url = `${base.value}${it.p}`
+  if (it.m === 'GET') return `curl -s '${url}'`
+  return `curl -s -X ${it.m} '${url}' -H 'Content-Type: application/json' -d '{}'`
+}
+</script>
+
+<template>
+  <div class="space-y-3 sm:space-y-4">
+    <section class="card card-pad space-y-2">
+      <div class="flex flex-wrap items-center gap-2">
+        <span class="title">接口</span>
+        <span class="chip">同源 /api</span>
+        <span class="chip">无需鉴权</span>
+      </div>
+      <p class="text-xs muted">
+        站点自身的 HTTP 接口，脚本或第三方客户端可以直接调用。统一返回
+        <code>{ ok: true, data }</code> 或 <code>{ ok: false, msg }</code>。
+        站点按局域网使用设计，没有登录鉴权，请勿直接暴露到公网。
+      </p>
+      <p class="break-all text-[11px] text-slate-400">Base URL：{{ base }}</p>
+    </section>
+
+    <section v-for="g in groups" :key="g.title" class="card card-pad space-y-2">
+      <div class="flex flex-wrap items-baseline gap-2">
+        <span class="title">{{ g.title }}</span>
+        <span v-if="g.desc" class="text-[11px] muted">{{ g.desc }}</span>
+      </div>
+      <ul class="divide-y divide-slate-100 dark:divide-white/5">
+        <li v-for="it in g.items" :key="it.m + it.p" class="flex flex-wrap items-start gap-x-3 gap-y-1 py-2">
+          <span class="w-[52px] shrink-0 rounded px-1.5 py-0.5 text-center text-[10px] font-semibold" :class="color(it.m)">{{ it.m }}</span>
+          <code class="shrink-0 font-mono text-xs">{{ it.p }}</code>
+          <span class="min-w-0 flex-1 break-words text-xs muted">{{ it.d }}</span>
+          <button
+            class="btn btn-ghost btn-sm shrink-0"
+            :title="curlOf(it)"
+            @click="copy(curlOf(it))"
+          >复制 curl</button>
+          <p v-if="it.q" class="w-full pl-[64px] text-[11px] text-slate-400">{{ it.q }}</p>
+        </li>
+      </ul>
+    </section>
+  </div>
+</template>

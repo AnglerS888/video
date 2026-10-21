@@ -296,7 +296,7 @@ func (c *Collector) crawl(src Source, hours, limitPages int) {
 		}
 	}
 
-	workers := c.PageWorkers
+	workers := int(c.PageWorkers.Load())
 	if workers <= 0 {
 		workers = defaultPageWorkers
 	}

@@ -2,7 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../api'
 import { toast } from '../toast'
-import type { CoverFixStatus, FfmpegStatus, SysInfo, UpdateInfo, UpdateStatus } from '../types'
+import type { ConfigData, ConfigInfo, CoverFixStatus, FfmpegStatus, SysInfo, UpdateInfo, UpdateStatus } from '../types'
 
 const info = ref<SysInfo | null>(null)
 const loading = ref(true)
@@ -225,6 +225,180 @@ async function installFf() {
   pollFf()
 }
 
+// ---- 配置（表单，保存即生效）----
+// 只放「不用重启就能改」的三组：采集 / 下载 / 合并转码。
+// 其余项（监听地址、数据目录、日志级别、内存、封面、数据库）只能在启动时定死，
+// 保留在 config.json 里手改；前端不展示、也不提交，避免误以为已经生效。
+const cfgInfo = ref<ConfigInfo | null>(null)
+const cfgForm = ref<ConfigData | null>(null)
+const cfgOrig = ref('')
+const cfgLoading = ref(false)
+const cfgSaving = ref(false)
+// 完整快照（还原用）；cfgOrig 只存可热更三组的序列化，用于脏检查
+let cfgOrigFull: ConfigData | null = null
+
+/** 只取可热更的三组，用于脏检查与提交 */
+type HotConfig = Pick<ConfigData, 'collect' | 'download' | 'cover' | 'ffmpeg'>
+
+function clone<T>(v: T): T {
+  return JSON.parse(JSON.stringify(v)) as T
+}
+
+function hotOf(c: ConfigData): HotConfig {
+  return {
+    collect: clone(c.collect),
+    download: clone(c.download),
+    cover: clone(c.cover),
+    ffmpeg: clone(c.ffmpeg),
+  }
+}
+
+const cfgDirty = computed(() => !!cfgForm.value && JSON.stringify(hotOf(cfgForm.value)) !== cfgOrig.value)
+
+async function loadConfig() {
+  cfgLoading.value = true
+  const r = await api.configInfo()
+  cfgLoading.value = false
+  if (!r.ok || !r.data) return toast(r.msg || '读取配置失败', 'err', 3000)
+  cfgInfo.value = r.data
+  if (r.data.config) {
+    cfgForm.value = clone(r.data.config)
+    cfgOrigFull = clone(r.data.config)
+    cfgOrig.value = JSON.stringify(hotOf(r.data.config))
+  } else {
+    cfgForm.value = null
+    cfgOrigFull = null
+    cfgOrig.value = ''
+  }
+}
+
+async function saveCfg() {
+  if (!cfgForm.value || !cfgDirty.value || cfgSaving.value) return
+  if (!confirm('保存后立即生效：正在采集的接口、正在下载的这一集不受影响，下一轮采集 / 下一集开始用新值。继续？')) return
+  cfgSaving.value = true
+  const r = await api.saveConfig(hotOf(cfgForm.value))
+  cfgSaving.value = false
+  if (!r.ok || !r.data) return toast(r.msg || '保存失败', 'err', 5000)
+  // 服务端会把越界值夹到合法区间，以返回结果为准重新回填
+  if (r.data.config) {
+    cfgForm.value = clone(r.data.config)
+    cfgOrigFull = clone(r.data.config)
+    cfgOrig.value = JSON.stringify(hotOf(r.data.config))
+  }
+  toast(r.data.msg || '已保存并生效', 'ok', 4000)
+}
+
+function resetCfg() {
+  if (cfgOrigFull) cfgForm.value = clone(cfgOrigFull)
+  toast('已还原为磁盘上的内容', 'info', 1500)
+}
+
+/** 低配/标准预设：只覆盖这四组（config.json 里的其它项不动） */
+function applyPreset(kind: 'lowmem' | 'default') {
+  const f = cfgForm.value
+  const p = cfgInfo.value?.presets?.[kind]
+  if (!f || !p) return
+  f.collect = clone(p.collect)
+  f.download = clone(p.download)
+  f.cover = clone(p.cover)
+  f.ffmpeg = clone(p.ffmpeg)
+  toast(kind === 'lowmem' ? '已套用低配预设，点「保存」立即生效' : '已套用标准预设，点「保存」立即生效', 'info', 2500)
+}
+
+// ---- 表单字段描述（渲染用，免得手写几十个输入框）----
+type CfgFieldType = 'text' | 'number' | 'select' | 'bool'
+interface CfgField {
+  path: string
+  label: string
+  type: CfgFieldType
+  hint?: string
+  unit?: string
+  min?: number
+  max?: number
+  options?: { v: string; t: string }[]
+}
+interface CfgGroup {
+  title: string
+  desc?: string
+  fields: CfgField[]
+}
+
+const cfgGroups: CfgGroup[] = [
+  {
+    title: '采集',
+    desc: '全量采集的分页并发与定时增量，下一轮采集开始用新值。',
+    fields: [
+      { path: 'collect.pages', label: '每个接口的分页并发', type: 'number', unit: '页', min: 1, max: 64 },
+      { path: 'collect.sources', label: '同时采集的接口数', type: 'number', unit: '个', min: 1, max: 64 },
+      { path: 'collect.incr_every', label: '定时增量间隔', type: 'text', hint: '写成 30m / 1h / 6h；留空按 1h' },
+      { path: 'collect.incr_pages', label: '增量每次同步页数', type: 'number', unit: '页', min: 0, max: 1000, hint: '0 = 不限页数' },
+    ],
+  },
+  {
+    title: '下载',
+    desc: '分片并发与磁盘保护，下一集开始用新值。',
+    fields: [
+      { path: 'download.workers', label: '同时下载的集数', type: 'number', unit: '集', min: 1, max: 8, hint: '实际是串行下载，这个值一般保持 1' },
+      { path: 'download.seg_concurrency', label: '单个任务的分片并发', type: 'number', unit: '片', min: 1, max: 64 },
+      { path: 'download.seg_budget', label: '全局分片并发上限', type: 'number', unit: '片', min: 0, max: 512, hint: '0 = 集数 × 分片并发' },
+      { path: 'download.min_free_mb', label: '磁盘剩余保护阈值', type: 'number', unit: 'MiB', min: 0, hint: '低于该值暂停下载；0 = 关闭' },
+    ],
+  },
+  {
+    title: '封面',
+    desc: '封面预取的并发与代理，改完立即生效。',
+    fields: [
+      { path: 'cover.workers', label: '封面任务并发', type: 'number', unit: '个', min: 1, max: 8, hint: '同时处理几张封面' },
+      { path: 'cover.concurrency', label: '单站点并发', type: 'number', unit: '个', min: 1, max: 16, hint: '同一个图床同时连几个' },
+      { path: 'cover.img_proxy', label: '图片代理', type: 'text', hint: '留空 = 直连；仅在直连失败时使用' },
+    ],
+  },
+  {
+    title: '合并 / 转码（ffmpeg）',
+    desc: '下一次合并开始用新值。',
+    fields: [
+      { path: 'ffmpeg.threads', label: '编码线程数', type: 'number', min: 0, max: 64, hint: '0 = 自动' },
+      { path: 'ffmpeg.reencode', label: '需要时重新编码', type: 'bool' },
+      { path: 'ffmpeg.verify', label: '合并后校验时长', type: 'bool' },
+    ],
+  },
+]
+
+function cfgGet(path: string): any {
+  let o: any = cfgForm.value
+  for (const k of path.split('.')) {
+    if (o == null) return undefined
+    o = o[k]
+  }
+  return o
+}
+
+function cfgSet(path: string, val: any) {
+  let o: any = cfgForm.value
+  if (!o) return
+  const keys = path.split('.')
+  const last = keys.pop() as string
+  for (const k of keys) {
+    if (o[k] == null) o[k] = {}
+    o = o[k]
+  }
+  o[last] = val
+}
+
+function onCfgText(path: string, e: Event) {
+  cfgSet(path, (e.target as HTMLInputElement).value)
+}
+
+/** 数字框：空值先按 0 存，避免 NaN 把整个表单写成 null */
+function onCfgNum(path: string, e: Event) {
+  const raw = (e.target as HTMLInputElement).value
+  cfgSet(path, raw === '' ? 0 : Number(raw))
+}
+
+function onCfgBool(path: string, e: Event) {
+  cfgSet(path, (e.target as HTMLInputElement).checked)
+}
+
 // ---- 版本与在线更新 ----
 // 后端 /api/version 给当前版本 + 上次检查结果；检查/下载/编译走 /api/update/*。
 const upInfo = ref<UpdateInfo | null>(null)
@@ -322,6 +496,7 @@ function pollUp() {
 onMounted(() => {
   load()
   loadVersion()
+  loadConfig()
   loadFix().then(() => { if (fix.value?.running) pollFix() })
   // 续上「已在下载」的状态（比如刷新过页面）
   api.ffmpegStatus().then((r) => {
@@ -361,7 +536,7 @@ onBeforeUnmount(() => {
           { label: '影片记录', value: info.counts.videos },
           { label: '片名（合并后）', value: info.counts.names },
           { label: '播放地址', value: info.counts.plays },
-          { label: '采集接口', value: info.counts.sources },
+          { label: '采集来源', value: info.counts.sources },
           { label: '收藏', value: info.counts.favorites },
           { label: '下载任务', value: info.counts.downloads },
         ]" :key="c.label" class="card card-pad">
@@ -409,7 +584,7 @@ onBeforeUnmount(() => {
               <span v-if="info.data.vacuum_suggest" class="chip chip-on">已达阈值，建议整理</span>
             </div>
             <p class="mt-1 text-[11px] muted">
-              采集和删接口会在库文件里留下空闲页，SQLite 不会自动归还磁盘。
+              采集和删来源会在库文件里留下空闲页，SQLite 不会自动归还磁盘。
               <template v-if="info.data.vacuum_pct > 0">
                 空闲时占比超过 {{ info.data.vacuum_pct }}% 会自动整理；等不到自动整理可手动点下面按钮。
               </template>
@@ -651,6 +826,99 @@ onBeforeUnmount(() => {
           </p>
         </section>
 
+        <!-- 运行配置（表单，保存即生效） -->
+        <section class="card card-pad space-y-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="title">运行配置</span>
+            <span class="chip">保存即生效</span>
+            <span v-if="cfgDirty" class="chip chip-on">有未保存修改</span>
+            <div class="ml-auto flex flex-wrap items-center gap-1.5">
+              <button class="btn btn-ghost btn-sm" :disabled="!cfgForm" @click="applyPreset('default')">标准预设</button>
+              <button class="btn btn-ghost btn-sm" :disabled="!cfgForm" @click="applyPreset('lowmem')">低配预设</button>
+              <button class="btn btn-ghost btn-sm" :disabled="cfgLoading || cfgSaving" @click="loadConfig">
+                {{ cfgLoading ? '读取中…' : '重新读取' }}
+              </button>
+              <button class="btn btn-ghost btn-sm" :disabled="!cfgDirty || cfgSaving" @click="resetCfg">还原</button>
+              <button class="btn btn-primary btn-sm" :disabled="!cfgDirty || cfgSaving" @click="saveCfg">
+                {{ cfgSaving ? '保存中…' : '保存' }}
+              </button>
+            </div>
+          </div>
+
+          <template v-if="cfgForm">
+            <!-- 固定高度 + 内部滚动：四组控件全铺开太长，把页面撑得没法看 -->
+            <div class="max-h-[46vh] min-w-0 overflow-y-auto overscroll-contain pr-1 sm:max-h-[420px]">
+              <div
+                v-for="g in cfgGroups"
+                :key="g.title"
+                class="border-t border-slate-100 pt-3 first:border-t-0 first:pt-0 dark:border-white/5"
+              >
+                <div class="mb-2 flex flex-wrap items-baseline gap-2">
+                  <span class="text-xs font-semibold text-slate-700 dark:text-slate-200">{{ g.title }}</span>
+                  <span v-if="g.desc" class="text-[11px] muted">{{ g.desc }}</span>
+                </div>
+                <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div v-for="f in g.fields" :key="f.path">
+                    <label class="mb-1 block text-[11px] muted" :for="'cfg-' + f.path">{{ f.label }}</label>
+
+                    <select
+                      v-if="f.type === 'select'"
+                      :id="'cfg-' + f.path"
+                      class="select"
+                      :value="cfgGet(f.path)"
+                      @change="onCfgText(f.path, $event)"
+                    >
+                      <option v-for="o in f.options" :key="o.v" :value="o.v">{{ o.t }}</option>
+                    </select>
+
+                    <label
+                      v-else-if="f.type === 'bool'"
+                      class="flex min-h-9 cursor-pointer items-center gap-2 text-xs"
+                      :for="'cfg-' + f.path"
+                    >
+                      <input
+                        :id="'cfg-' + f.path"
+                        type="checkbox"
+                        class="h-5 w-5 rounded accent-amber-500"
+                        :checked="cfgGet(f.path)"
+                        @change="onCfgBool(f.path, $event)"
+                      />
+                      <span>{{ cfgGet(f.path) ? '开启' : '关闭' }}</span>
+                    </label>
+
+                    <div v-else class="flex items-center gap-1.5">
+                      <input
+                        :id="'cfg-' + f.path"
+                        :type="f.type === 'number' ? 'number' : 'text'"
+                        class="input min-w-0 flex-1"
+                        :min="f.min"
+                        :max="f.max"
+                        :value="cfgGet(f.path)"
+                        @input="f.type === 'number' ? onCfgNum(f.path, $event) : onCfgText(f.path, $event)"
+                      />
+                      <span v-if="f.unit" class="shrink-0 text-[11px] muted">{{ f.unit }}</span>
+                    </div>
+
+                    <p v-if="f.hint" class="mt-1 text-[11px] text-slate-400">{{ f.hint }}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </template>
+
+          <p v-else-if="cfgInfo" class="rounded-lg bg-rose-500/10 px-2.5 py-2 text-[11px] text-rose-500">
+            配置文件无法解析，无法用表单编辑：{{ cfgInfo.path }}
+          </p>
+
+          <p class="break-all text-[11px] muted">
+            这里只有<strong>不用重启</strong>的四组：点保存后立即生效，正在跑的那一轮采集、
+            正在下的那一集不受影响，下一轮 / 下一集开始用新值。这些值单独存在数据目录的
+            <code class="break-all">{{ cfgInfo?.ui_path || 'ui.yml' }}</code>（旧文件备份为 <code>.bak</code>），
+            不碰 <code>config.json</code>。监听地址、数据目录、日志级别、内存限制、数据库等
+            <strong>需要重启</strong>的项留在 <code class="break-all">{{ cfgInfo?.path || 'config.yml' }}</code>，页面不涉及。
+          </p>
+        </section>
+
         <!-- 封面 / 备份 -->
         <section class="card card-pad space-y-3">
           <div>
@@ -685,7 +953,7 @@ onBeforeUnmount(() => {
               </button>
             </div>
             <p class="mt-1 text-[11px] muted">
-              检查全库封面缓存；同一部剧在多个接口源都有记录时，某个源的封面拉不到就自动用其它源的封面补上。
+              检查全库封面缓存；同一部剧在多个来源都有记录时，某个源的封面拉不到就自动用其它源的封面补上。
               直连都失败时再走图片代理（wsrv.nl，每次间隔 2~3 秒）。
             </p>
 

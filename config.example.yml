@@ -1,0 +1,31 @@
+# config.yml —— 需要重启才生效的配置，只有下面这几项。
+#
+# 采集 / 下载 / 封面 / ffmpeg 的并发不在这里：它们在数据目录的 ui.yml，
+# 由「信息」页 →「运行配置」维护，改完点保存立即生效（不用重启）。
+#
+# 没写的项一律用程序内置默认值；「标准预设 / 低配预设」也写死在代码里，
+# 页面上一键套用即可，不需要在配置文件里维护。
+
+advanced:
+  # HTTP 监听地址（改端口后要用新地址访问）
+  server:
+    addr: ":5200"
+
+  # 数据目录：数据库、封面、下载的视频、ui.yml 都在这里
+  data_dir: "./videodata"
+
+  # debug / info / warn / error
+  log_level: "info"
+
+  # 低配模式（NAS / 4G 内存）：内存软上限 768MiB，并发/线程按低配预设下调
+  lowmem: false
+
+  # 以下都是可选项，不写就是默认值，一般不用动：
+  # mem_limit_mb: 0      # Go GC 软上限（MiB），0=不限；lowmem 时默认 768
+  # max_procs: 0         # GOMAXPROCS，0=自动；lowmem 时默认 min(核数,3)
+  # db:
+  #   cache_mb: 64       # SQLite 每连接页缓存（MiB）
+  #   mmap_mb: 1024      # 内存映射大小（MiB，0=关闭；网络盘建议 0）
+  #   conns: 4           # 最大连接数（WAL 一写多读）
+  #   page_size: 0       # 页大小字节数（如 8192），0=不改
+  #   vacuum_pct: 15     # 空闲页占比超过该值时自动整理，0=关闭

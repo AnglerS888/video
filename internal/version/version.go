@@ -3,9 +3,9 @@
 // 版本号只有一个来源：仓库根目录的 VERSION 文件。构建脚本（Makefile / Dockerfile）
 // 读取它并通过 -ldflags 注入下面的变量，所以二进制里带的是构建时那份 VERSION。
 //
-//	go build -ldflags "-X videoDownLoad/internal/version.Version=1.3.1 \
-//	                   -X videoDownLoad/internal/version.Commit=d943a63 \
-//	                   -X videoDownLoad/internal/version.BuildTime=2026-10-20T03:00:00Z"
+//	go build -ldflags "-X videoDownLoad/internal/version.Version=1.4.0 \
+//	                   -X videoDownLoad/internal/version.Commit=11d5782 \
+//	                   -X videoDownLoad/internal/version.BuildTime=2026-10-21T00:10:00Z"
 //
 // 不带 ldflags 直接 go build 也能跑：Version 保持默认值，Commit 为空，
 // BuildTime 为空时用可执行文件修改时间兜底（用于判断「远端提交比本机新」）。
@@ -19,7 +19,7 @@ import (
 
 var (
 	// Version 语义化版本号（与仓库根目录 VERSION 一致），构建时由 ldflags 覆盖
-	Version = "1.3.1"
+	Version = "1.4.0"
 	// Commit 构建时的 git 提交短哈希（可能为空：直接 go build 时没有）
 	Commit = ""
 	// BuildTime 构建时间，RFC3339（UTC），可能为空
@@ -40,7 +40,7 @@ func RepoURL(repo string) string {
 	return SiteBase + "/" + repo
 }
 
-// Short 用于界面上展示的版本串，如 v1.3.1 (d943a63)
+// Short 用于界面上展示的版本串，如 v1.4.0 (11d5782)
 func Short() string {
 	v := Version
 	if v == "" {

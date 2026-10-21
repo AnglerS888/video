@@ -55,9 +55,9 @@ docker-multi:
 run:
 	go run .
 
-# 低配模式本地试跑：加载仓库里的 config.lowmem.json（等同 NAS 默认参数）
+# 低配模式本地试跑：套用代码里的低配预设（等同 NAS 默认参数，不需要额外配置文件）
 run-lowmem:
-	VDL_CONFIG=./config.lowmem.json go run .
+	VDL_LOWMEM=1 go run .
 
 # 只清构建产物。数据目录 videodata/ 是唯一的库与下载文件，绝不在这里删
 # （要清数据请自己手动操作，确认已备份）

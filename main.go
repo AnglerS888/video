@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,16 +30,16 @@ import (
 )
 
 func main() {
-	// 唯一保留的命令行开关：打印版本。所有配置都写在 config.json 里
+	// 唯一保留的命令行开关：打印版本。所有配置都写在 config.yml 里
 	// （路径可用环境变量 VDL_CONFIG 指定），不再有 -addr / -data 这类参数。
-	// 旧版本用 -addr / -data / -lowmem 等参数，现在全部搬进 config.json：
+	// 旧版本用 -addr / -data / -lowmem 等参数，现在全部搬进 config.yml：
 	// 传了旧参数就给出明确提示，而不是甩一句 "flag provided but not defined"。
 	for _, a := range os.Args[1:] {
 		if a == "-version" || a == "--version" || a == "-h" || a == "--help" {
 			continue
 		}
 		if len(a) > 0 && a[0] == '-' {
-			fmt.Fprintf(os.Stderr, "命令行参数已废弃：全部配置都在 config.json（可用 VDL_CONFIG 指定路径）。\n未知参数：%s\n", a)
+			fmt.Fprintf(os.Stderr, "命令行参数已废弃：全部配置都在 config.yml（可用 VDL_CONFIG 指定路径）。\n未知参数：%s\n", a)
 			os.Exit(2)
 		}
 	}
@@ -55,7 +56,7 @@ func main() {
 		return
 	}
 
-	// 读取配置：找不到会自动生成一份默认 config.json
+	// 读取配置：找不到会自动生成一份默认 config.yml
 	cfg, cfgPath, cfgErr := config.Load()
 	if cfgErr != nil {
 		logx.Warnf("[config] %v（已回退为默认配置）", cfgErr)
@@ -101,6 +102,41 @@ func main() {
 		logx.Fatalf("[startup] 创建视频目录失败: %v", err)
 	}
 
+	// 页面可改的配置（采集 / 下载 / 封面 / ffmpeg）单独放在数据目录的 ui.yml：
+	// 跟着数据走（换机器/换容器只要带上数据目录），config.yml 只剩需要重启的项。
+	// 第一次运行没有 ui.yml 时按当前生效值生成一份；旧版 ui.json 会自动迁移。
+	uiPath := config.UIFilePath(dataDir)
+	switch err := config.LoadUI(uiPath, cfg); {
+	case err == nil:
+		logx.Infof("[config] 页面配置 %s", uiPath)
+	case errors.Is(err, os.ErrNotExist):
+		legacy := config.LegacyUIFilePath(dataDir)
+		if e := config.LoadUI(legacy, cfg); e == nil {
+			if e2 := config.SaveUI(uiPath, cfg); e2 != nil {
+				logx.Warnf("[config] 从 %s 迁移失败: %v", legacy, e2)
+			} else {
+				logx.Infof("[config] 页面配置已从 %s 迁移到 %s", legacy, uiPath)
+			}
+		} else if e2 := config.SaveUI(uiPath, cfg); e2 != nil {
+			logx.Warnf("[config] 生成页面配置 %s 失败: %v", uiPath, e2)
+		} else {
+			logx.Infof("[config] 页面配置已生成 %s", uiPath)
+		}
+	default:
+		logx.Warnf("[config] 读取页面配置 %s 失败（用默认值）: %v", uiPath, err)
+	}
+
+	// 老版本的 config.yml 里可能还留着 collect/download/cover/ffmpeg 或 ui 段，
+	// 现在这些只认 ui.yml：这里把它们从 config.yml 里摘掉（旧文件备份 .bak）。
+	if cfgPath != "" {
+		switch changed, err := config.CleanUIFromConfig(cfgPath, cfg); {
+		case err != nil:
+			logx.Warnf("[config] 清理 %s 里的页面配置失败: %v", cfgPath, err)
+		case changed:
+			logx.Infof("[config] 已从 %s 移除页面配置（只保留 advanced 段），页面项以 %s 为准", cfgPath, uiPath)
+		}
+	}
+
 	logx.Infof("[runtime] GOMAXPROCS=%d 内存软上限=%dMiB 低配模式=%v",
 		runtime.GOMAXPROCS(0), cfg.MemLimitMB, cfg.LowMem)
 	if cfg.MemLimitMB == 0 {
@@ -137,8 +173,7 @@ func main() {
 	logx.Infof("[db] 每连接页缓存 %d MiB × %d 连接，mmap %d MiB，自动整理阈值 空闲页>%d%%",
 		cfg.DB.CacheMB, cfg.DB.Conns, cfg.DB.MmapMB, cfg.DB.VacuumPct)
 	col := collector.New(database)
-	col.PageWorkers = cfg.Collect.Pages
-	col.SourceWorkers = cfg.Collect.Sources
+	col.SetWorkers(cfg.Collect.Pages, cfg.Collect.Sources)
 	// 封面压缩图目录：同步时预取到 data/img，页面访问直接读本地
 	imgDir := filepath.Join(dataDir, "img")
 	col.CoverDir = imgDir
@@ -151,7 +186,7 @@ func main() {
 	if err := os.MkdirAll(imgDir, 0o755); err != nil {
 		logx.Fatalf("[collect] 创建封面目录失败: %v", err)
 	}
-	logx.Infof("[collect] 并发配置：每接口 %d 个分页线程，最多同时采集 %d 个接口", col.PageWorkers, col.SourceWorkers)
+	logx.Infof("[collect] 并发配置：每接口 %d 个分页线程，最多同时采集 %d 个接口", col.PageWorkersCount(), col.SourceWorkersCount())
 	// 下载任务并发，文件保存到 data/videos
 	collector.SetDownloadConcurrency(cfg.Download.SegConcurrency)
 	collector.SetMinFreeBytes(int64(cfg.Download.MinFreeMB) << 20)
@@ -165,17 +200,50 @@ func main() {
 	// 定时增量采集：默认每 1 小时一次，只同步各接口前 5 页（最新数据）。
 	// 只在「启用 + 自动增量」都打开的接口上跑；单个接口可以在接口页关掉自动增量。
 	logx.Infof("[scheduler] 定时增量：每 %v 一次，每次同步前 %d 页（0=不限）", incrEvery, cfg.Collect.IncrPages)
+	// 增量页数支持热更新：调度协程每次触发时读原子量，信息页保存后立即生效
+	var incrPages atomic.Int32
+	incrPages.Store(int32(cfg.Collect.IncrPages))
 	sch := scheduler.New(incrEvery, func() {
 		srcs := col.AutoIncrSources()
 		if len(srcs) == 0 {
 			return // 所有接口都关了自动增量：不发请求，也不刷日志
 		}
-		started, skipped := col.RunIncremental(srcs, cfg.Collect.IncrPages)
+		started, skipped := col.RunIncremental(srcs, int(incrPages.Load()))
 		if started > 0 || len(skipped) > 0 {
 			logx.Infof("[scheduler] 定时增量：启动 %d 个接口，跳过 %d 个", started, len(skipped))
 		}
 	})
 	sch.Start()
+
+	// 信息页「保存即生效」：把不用重启就能改的项直接套到运行中的组件上
+	// （采集 / 下载 / 合并转码）。server、data_dir、log_level、lowmem、封面、数据库
+	// 这些只能在启动时一次定死，仍然需要改配置文件后重启。
+	hotApply := func(c *config.Config) []string {
+		col.SetWorkers(c.Collect.Pages, c.Collect.Sources)
+		incrPages.Store(int32(c.Collect.IncrPages))
+		sch.SetInterval(c.IncrEveryDuration())
+
+		collector.SetDownloadConcurrency(c.Download.SegConcurrency)
+		collector.SetMinFreeBytes(int64(c.Download.MinFreeMB) << 20)
+		budget := c.Download.SegBudget
+		if budget <= 0 {
+			budget = c.Download.Workers * c.Download.SegConcurrency
+		}
+		downloader.SetSegmentBudget(budget)
+		downloader.SetTranscodeOptions(c.FFmpeg.Threads, c.FFmpeg.Reencode, c.FFmpeg.Verify)
+
+		// 封面：并发张数 / 单站点并发 / 代理都是运行时变量，改完立即生效
+		collector.SetCoverWorkers(c.Cover.Workers)
+		collector.SetCoverConcurrency(c.Cover.Concurrency)
+		collector.SetImageProxy(c.Cover.ImgProxy)
+
+		logx.Infof("[config] 已热更新：采集 %d 分页 × %d 接口 / 增量每 %v 前 %d 页 | 下载分片并发 %d，全局上限 %d，磁盘保护 %d MiB | 封面 %d 任务 × %d 并发（代理=%s）| ffmpeg 线程 %d（全量重编码=%v，校验=%v）",
+			c.Collect.Pages, c.Collect.Sources, c.IncrEveryDuration(), c.Collect.IncrPages,
+			c.Download.SegConcurrency, budget, c.Download.MinFreeMB,
+			c.Cover.Workers, c.Cover.Concurrency, orNo(c.Cover.ImgProxy),
+			c.FFmpeg.Threads, c.FFmpeg.Reencode, c.FFmpeg.Verify)
+		return []string{"collect", "download", "cover", "ffmpeg"}
+	}
 
 	// 数据库整理：删接口、采集重插播放地址都会不断产生空闲页（SQLite 不会主动还回去），
 	// 实测 915MB 的库里能有一半是空的。超阈值且服务空闲时自动 VACUUM 回收。
@@ -192,11 +260,11 @@ func main() {
 	// 预热播放地址计数（226 万行的 COUNT 要走 1s+），别让第一个访问者撞上
 	db.WarmupCounts(database)
 
-	// 在线更新器：数据目录下 update/ 里放下载的源码与编译产物。
-	// 更新源固定为 Gitee（anglers/video），仓库/分支/令牌都在配置文件的 update 段。
-	up := updater.New(dataDir, cfg.Update.Repo, cfg.Update.Branch, cfg.Update.Token)
+	// 在线更新器：更新源固定为 Gitee（anglers/video@master），配置里不再保留 update 段。
+	// 匿名下载偶尔被 Gitee 要求验证，可用环境变量 VDL_UPDATE_TOKEN 提供私人令牌。
+	up := updater.New(dataDir, version.Repo, version.Branch, os.Getenv("VDL_UPDATE_TOKEN"))
 	logx.Infof("[update] 在线更新：gitee // %s（分支 %s），运行方式 %s",
-		orDash(cfg.Update.Repo), orNo(cfg.Update.Branch), version.ModeText())
+		version.Repo, version.Branch, version.ModeText())
 
 	// 容器里 docker stop / 重启会先发 SIGTERM：优雅退出，避免 SQLite 留下 -wal 尾巴、
 	// 下载中的分片文件被硬切断（下次启动会按"已暂停"恢复）。
@@ -209,6 +277,7 @@ func main() {
 		Version: version.Version, StartedAt: time.Now(), ConfigPath: cfgPath,
 		VacuumPct: cfg.DB.VacuumPct,
 		Up:        up,
+		HotApply:  hotApply,
 	}
 	// 显式设置超时：不带超时的裸 ListenAndServe 会让半开连接一直占着 goroutine 和内存
 	// （NAS 上被扫描/移动端切网时很常见）。写超时不设，避免中断大文件播放/下载。

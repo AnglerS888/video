@@ -15,7 +15,7 @@
 #   ./deploy.sh --dry-run                # 只打印将要执行的命令，不安装、不构建
 #   ./deploy.sh --help
 #
-# 说明：容器内配置在 <数据目录>/config.json，首次启动自动生成；
+# 说明：容器内配置在 <数据目录>/config.yml，首次启动自动生成；
 #       更新只会重建镜像和容器，数据目录（含视频、数据库、配置）不受影响。
 # ============================================================
 set -Eeuo pipefail
@@ -69,7 +69,7 @@ usage() {
 
 参数：
   --port N              宿主机端口（容器内固定 5200）
-  --data PATH           数据存储路径（数据库、视频、config.json 都在这里）
+  --data PATH           数据存储路径（数据库、视频、config.yml 都在这里）
   --source-dir PATH     源码目录（默认脚本目录；没有源码则放 ~/videodl-src）
   --registry HOST       基础镜像仓库（默认 docker.1panel.live；传空用官方）
   --registry-fallback H 备用仓库（默认 docker.1ms.run，主仓库不可达/构建失败时自动切换）
@@ -122,9 +122,12 @@ else
   PIPED=0
 fi
 
+# 端口/数据目录必须由用户输入：管道执行时没有终端，直接拒绝（除非显式 --yes 全默认）
 if [ "$PIPED" = "1" ] && [ "$ASSUME_YES" != "1" ]; then
-  warn "检测到从管道执行（curl ... | bash）：stdin 不是终端，端口/数据目录将使用默认值。"
-  warn "想交互选择请先下载脚本：curl -fsSL https://gitee.com/${GITEE_REPO}/raw/${GITEE_BRANCH}/deploy.sh -o deploy.sh && chmod +x deploy.sh && ./deploy.sh"
+  die "从管道执行时无法交互输入端口和数据目录。请先下载脚本再执行：
+  curl -fsSL https://gitee.com/${GITEE_REPO}/raw/${GITEE_BRANCH}/deploy.sh -o deploy.sh
+  chmod +x deploy.sh && sudo ./deploy.sh
+或者显式指定：sudo bash -s -- --yes --port 5200 --data /opt/videodata"
 fi
 
 
@@ -298,7 +301,7 @@ ask() {
     REPLY_VALUE="$def"; return 0
   fi
   if [ -n "$def" ]; then
-    read -r -p "$prompt [$def]: " ans || true
+    read -r -p "$prompt（直接回车用默认）[$def]: " ans || true
     REPLY_VALUE="${ans:-$def}"
   else
     read -r -p "$prompt: " ans || true
@@ -344,7 +347,7 @@ resolve_settings() {
   if [ -z "$DATA_DIR" ]; then
     ask "数据存储路径（数据库/视频/配置都在这里）" "$ddata"; DATA_DIR="$REPLY_VALUE"
   fi
-  [ -n "$DATA_DIR" ] || die "数据目录不能为空"
+  [ -n "$DATA_DIR" ] || die "数据目录不能为空，请重新执行并输入一个路径"
   case "$DATA_DIR" in
     /*) : ;;
     *) DATA_DIR="$SCRIPT_DIR/$DATA_DIR" ;;
@@ -497,7 +500,7 @@ start_container() {
     -p "${PORT}:5200" \
     -v "${DATA_DIR}:/app/videodata" \
     -e "TZ=${TZ:-Asia/Shanghai}" \
-    -e "VDL_CONFIG=/app/videodata/config.json" \
+    -e "VDL_CONFIG=/app/videodata/config.yml" \
     --init \
     --stop-timeout 30 \
     "$image"
@@ -560,7 +563,7 @@ summary() {
   printf '\n%s部署完成%s\n' "$C_GRN" "$C_OFF"
   printf '  访问地址：http://%s:%s\n' "${ip:-服务器IP}" "$PORT"
   printf '  数据目录：%s\n' "$DATA_DIR"
-  printf '  配置文件：%s/config.json（首次启动自动生成，改完重启容器生效）\n' "$DATA_DIR"
+  printf '  配置文件：%s/config.yml（首次启动自动生成，改完重启容器生效）\n' "$DATA_DIR"
   printf '  容器名称：%s    镜像：%s\n' "$CONTAINER_NAME" "$IMAGE_NAME"
   printf '  基础镜像：%s（golang:1.26-alpine / alpine:3.20）\n' "${REGISTRY:-官方 Docker Hub}"
   printf '\n常用命令：\n'

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"videoDownLoad/internal/collector"
+	"videoDownLoad/internal/config"
 	"videoDownLoad/internal/logx"
 	"videoDownLoad/internal/updater"
 )
@@ -33,6 +34,9 @@ type Server struct {
 	VacuumPct int
 	// ConfigPath 当前使用的配置文件路径（信息页展示）
 	ConfigPath string
+	// HotApply 把配置里「不用重启就生效」的项应用到运行组件（由 main 注入，
+	// 返回实际生效的分组名）。没注入时所有改动都按「需要重启」处理。
+	HotApply func(cfg *config.Config) []string
 	// Up 在线更新器（检查/下载/编译/重启）
 	Up *updater.Updater
 

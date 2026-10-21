@@ -1,98 +1,99 @@
-// Package config 集中管理程序配置：所有可调项都在配置文件中，不再用命令行参数。
+// Package config 集中管理程序配置：所有可调项都在配置文件里，不再用命令行参数。
 //
-// 文件格式是 JSON，但允许 // 行注释与 /* */ 块注释（读取前会先剥掉），方便手改。
-// 首次运行会在当前目录（不可写则程序目录、数据目录）生成一份带默认值的 config.json。
+// 文件格式是 YAML（原生支持 # 注释）；旧版的 JSON（允许 // 与 /* */ 注释）仍然能读，
+// 因为 YAML 是 JSON 的超集，读取时按 YAML 解析即可。
 //
-// 配置文件查找顺序：
+// 配置分两个文件：
+//   - config.yml：需要重启生效的项（端口、数据目录、日志、内存、数据库）
+//   - <数据目录>/ui.yml：页面可改、保存即生效的项（采集 / 下载 / 封面 / ffmpeg）
+//
+// 配置文件查找顺序（config.yml）：
 //  1. 环境变量 VDL_CONFIG 指定的路径；
-//  2. 当前目录 ./config.json；
-//  3. 程序所在目录/config.json；
-//  4. 当前目录/videodata/config.json（容器里通常用 VDL_CONFIG 指到这里）。
+//  2. 当前目录 ./config.yml（兼容 ./config.json）；
+//  3. 程序所在目录/config.yml（兼容 config.json）；
+//  4. 当前目录/videodata/config.yml（容器里通常用 VDL_CONFIG 指到这里）。
 //
 // lowmem 模式的处理：先按 lowmem 取一套低配默认值，再把配置文件里**实际写了**的字段覆盖上去，
 // 这样既保留「一键低配」，又允许逐项覆盖（等价于以前「-lowmem 只改没显式指定的参数」）。
 package config
 
 import (
-	"encoding/json"
+	"bytes"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
-// FileName 配置文件名
-const FileName = "config.json"
+// FileName 配置文件名（需要重启生效的项）
+const FileName = "config.yml"
+
+// LegacyFileName 旧版 JSON 配置名：仍然能读，保存时会写成 YAML
+const LegacyFileName = "config.json"
 
 // Config 全部配置。字段含义见 README「配置参数」。
 type Config struct {
-	Server     Server   `json:"server"`
-	DataDir    string   `json:"data_dir"`
-	LogLevel   string   `json:"log_level"`
-	LowMem     bool     `json:"lowmem"`
-	MemLimitMB int      `json:"mem_limit_mb"`
-	MaxProcs   int      `json:"max_procs"`
-	Collect    Collect  `json:"collect"`
-	Download   Download `json:"download"`
-	Cover      Cover    `json:"cover"`
-	FFmpeg     FFmpeg   `json:"ffmpeg"`
-	DB         DB       `json:"db"`
-	Update     Update   `json:"update"`
+	Server     Server   `json:"server" yaml:"server"`
+	DataDir    string   `json:"data_dir" yaml:"data_dir"`
+	LogLevel   string   `json:"log_level" yaml:"log_level"`
+	LowMem     bool     `json:"lowmem" yaml:"lowmem"`
+	MemLimitMB int      `json:"mem_limit_mb" yaml:"mem_limit_mb"`
+	MaxProcs   int      `json:"max_procs" yaml:"max_procs"`
+	Collect    Collect  `json:"collect" yaml:"collect"`
+	Download   Download `json:"download" yaml:"download"`
+	Cover      Cover    `json:"cover" yaml:"cover"`
+	FFmpeg     FFmpeg   `json:"ffmpeg" yaml:"ffmpeg"`
+	DB         DB       `json:"db" yaml:"db"`
 	dataDirSet bool     // 配置文件里是否显式写了 data_dir
 	path       string   // 实际加载的文件路径
 }
 
 // Server HTTP 服务
 type Server struct {
-	Addr string `json:"addr"`
+	Addr string `json:"addr" yaml:"addr"`
 }
 
 // Collect 采集
 type Collect struct {
-	Pages     int    `json:"pages"`      // 每个接口的分页并发
-	Sources   int    `json:"sources"`    // 同时采集的接口数
-	IncrEvery string `json:"incr_every"` // 定时增量间隔，Go duration 语法：1h / 30m
-	IncrPages int    `json:"incr_pages"` // 定时增量每次同步前 N 页，0=不限
+	Pages     int    `json:"pages" yaml:"pages"`           // 每个接口的分页并发
+	Sources   int    `json:"sources" yaml:"sources"`       // 同时采集的接口数
+	IncrEvery string `json:"incr_every" yaml:"incr_every"` // 定时增量间隔，Go duration 语法：1h / 30m
+	IncrPages int    `json:"incr_pages" yaml:"incr_pages"` // 定时增量每次同步前 N 页，0=不限
 }
 
 // Download 下载与磁盘保护
 type Download struct {
-	Workers        int `json:"workers"`         // 同时下载的集数（实际固定串行）
-	SegConcurrency int `json:"seg_concurrency"` // 单任务分片并发
-	SegBudget      int `json:"seg_budget"`      // 全局分片并发上限，0=workers×seg_concurrency
-	MinFreeMB      int `json:"min_free_mb"`     // 磁盘剩余空间保护阈值（MiB），0=关闭
+	Workers        int `json:"workers" yaml:"workers"`                 // 同时下载的集数（实际固定串行）
+	SegConcurrency int `json:"seg_concurrency" yaml:"seg_concurrency"` // 单任务分片并发
+	SegBudget      int `json:"seg_budget" yaml:"seg_budget"`           // 全局分片并发上限，0=workers×seg_concurrency
+	MinFreeMB      int `json:"min_free_mb" yaml:"min_free_mb"`         // 磁盘剩余空间保护阈值（MiB），0=关闭
 }
 
 // Cover 封面
 type Cover struct {
-	Workers     int    `json:"workers"`
-	Concurrency int    `json:"concurrency"`
-	ImgProxy    string `json:"img_proxy"`
+	Workers     int    `json:"workers" yaml:"workers"`
+	Concurrency int    `json:"concurrency" yaml:"concurrency"`
+	ImgProxy    string `json:"img_proxy" yaml:"img_proxy"`
 }
 
 // FFmpeg 合并/转码
 type FFmpeg struct {
-	Threads  int  `json:"threads"`
-	Reencode bool `json:"reencode"`
-	Verify   bool `json:"verify"`
+	Threads  int  `json:"threads" yaml:"threads"`
+	Reencode bool `json:"reencode" yaml:"reencode"`
+	Verify   bool `json:"verify" yaml:"verify"`
 }
 
 // DB SQLite
 type DB struct {
-	CacheMB   int `json:"cache_mb"`
-	MmapMB    int `json:"mmap_mb"`
-	Conns     int `json:"conns"`
-	PageSize  int `json:"page_size"`
-	VacuumPct int `json:"vacuum_pct"`
-}
-
-// Update 在线更新（Gitee）
-type Update struct {
-	Repo   string `json:"repo"`
-	Branch string `json:"branch"`
-	Token  string `json:"token"`
+	CacheMB   int `json:"cache_mb" yaml:"cache_mb"`
+	MmapMB    int `json:"mmap_mb" yaml:"mmap_mb"`
+	Conns     int `json:"conns" yaml:"conns"`
+	PageSize  int `json:"page_size" yaml:"page_size"`
+	VacuumPct int `json:"vacuum_pct" yaml:"vacuum_pct"`
 }
 
 // Defaults 常规默认值（与旧命令行参数默认值保持一致）
@@ -109,7 +110,6 @@ func Defaults() *Config {
 		Cover:      Cover{Workers: 2, Concurrency: 4},
 		FFmpeg:     FFmpeg{Threads: 0, Reencode: true, Verify: true},
 		DB:         DB{CacheMB: 64, MmapMB: 1024, Conns: 4, PageSize: 0, VacuumPct: 15},
-		Update:     Update{},
 	}
 }
 
@@ -144,8 +144,9 @@ func Load() (*Config, string, error) {
 	if p := strings.TrimSpace(os.Getenv("VDL_CONFIG")); p != "" {
 		if !fileExists(p) {
 			if err := os.MkdirAll(filepath.Dir(p), 0o755); err == nil {
-				if err := Save(p, Defaults()); err == nil {
-					cfg := Defaults()
+				def := baseDefaults()
+				if err := Save(p, def); err == nil {
+					cfg := def
 					cfg.path = p
 					return cfg, p, nil
 				}
@@ -160,9 +161,9 @@ func Load() (*Config, string, error) {
 		// 没有任何配置文件：生成一份默认的
 		p, err := writeDefault()
 		if err != nil {
-			return Defaults(), "", fmt.Errorf("未找到配置文件，且生成默认配置失败: %w", err)
+			return baseDefaults(), "", fmt.Errorf("未找到配置文件，且生成默认配置失败: %w", err)
 		}
-		cfg := Defaults()
+		cfg := baseDefaults()
 		cfg.path = p
 		return cfg, p, nil
 	}
@@ -170,30 +171,43 @@ func Load() (*Config, string, error) {
 	return loadFile(path)
 }
 
-// loadFile 读取并解析指定配置文件
+// lowMemFromEnv VDL_LOWMEM=1/true 时强制套用低配预设。
+// 预设值写死在代码里（LowMemDefaults），所以不需要额外的「低配配置文件」。
+func lowMemFromEnv() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("VDL_LOWMEM"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
+// baseDefaults 没有配置文件 / 生成默认配置时用的基准值
+func baseDefaults() *Config {
+	if lowMemFromEnv() {
+		return LowMemDefaults()
+	}
+	return Defaults()
+}
+
+// loadFile 读取并解析指定配置文件（YAML；旧版 JSON 也能解析）
 func loadFile(path string) (*Config, string, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return Defaults(), path, fmt.Errorf("读取 %s 失败: %w", path, err)
 	}
-	cleaned := stripComments(string(raw))
+	text := normalizeInput(string(raw))
 
-	// 先看 lowmem，决定基础默认值用哪一套
-	var probe struct {
-		LowMem *bool `json:"lowmem"`
-	}
-	_ = json.Unmarshal([]byte(cleaned), &probe)
-
+	// 先看 lowmem（文件里写了 true，或 VDL_LOWMEM 强制），决定基础默认值用哪一套
 	base := Defaults()
-	if probe.LowMem != nil && *probe.LowMem {
+	if probeLowMem(text) || lowMemFromEnv() {
 		base = LowMemDefaults()
 	}
 	// 再用文件里实际写了的字段覆盖（嵌套结构逐字段合并，没写的保留基础默认值）
-	if err := json.Unmarshal([]byte(cleaned), base); err != nil {
+	if err := applyDoc(text, base); err != nil {
 		return Defaults(), path, fmt.Errorf("解析 %s 失败: %w", path, err)
 	}
 	base.path = path
-	base.dataDirSet = hasTopLevelKey(cleaned, "data_dir")
+	base.dataDirSet = hasDataDirKey(text)
 	base.normalize()
 	return base, path, nil
 }
@@ -216,6 +230,36 @@ func (c *Config) IncrEveryDuration() time.Duration {
 		return time.Hour
 	}
 	return d
+}
+
+// Normalize 导出给「信息」页表单保存用：把越界/空值修正成合法值，
+// 前端不该因为填了个 0 就把服务写坏。
+func (c *Config) Normalize() { c.normalize() }
+
+// Check 校验无法自动修正的项（日志级别、定时增量间隔、监听地址）。
+// 返回的错误文案直接展示给用户，所以写成人话并带上字段名。
+func (c *Config) Check() error {
+	switch strings.ToLower(strings.TrimSpace(c.LogLevel)) {
+	case "debug", "info", "warn", "warning", "error":
+	default:
+		return fmt.Errorf("日志级别只能是 debug / info / warn / error")
+	}
+	if s := strings.TrimSpace(c.Collect.IncrEvery); s != "" {
+		d, err := time.ParseDuration(s)
+		if err != nil {
+			return fmt.Errorf("定时增量间隔格式不对，应写成 30m / 1h / 6h 这种")
+		}
+		if d <= 0 {
+			return fmt.Errorf("定时增量间隔必须大于 0")
+		}
+	}
+	if strings.TrimSpace(c.Server.Addr) == "" {
+		return fmt.Errorf("监听地址不能为空，例如 :5200")
+	}
+	if strings.TrimSpace(c.DataDir) == "" {
+		return fmt.Errorf("数据目录不能为空，例如 ./videodata")
+	}
+	return nil
 }
 
 // normalize 兜底修正非法值，避免配置文件写错导致启动失败或行为异常
@@ -271,15 +315,50 @@ func (c *Config) normalize() {
 	if c.MaxProcs < 0 {
 		c.MaxProcs = 0
 	}
+	// 上限兜底：表单里手输 999 也不至于把机器拖死（正常用法碰不到这些数）
+	c.Collect.Pages = clampInt(c.Collect.Pages, 1, 64)
+	c.Collect.Sources = clampInt(c.Collect.Sources, 1, 64)
+	c.Collect.IncrPages = clampInt(c.Collect.IncrPages, 0, 1000)
+	c.Download.Workers = clampInt(c.Download.Workers, 1, 8)
+	c.Download.SegConcurrency = clampInt(c.Download.SegConcurrency, 1, 64)
+	c.Download.SegBudget = clampInt(c.Download.SegBudget, 0, 512)
+	c.Download.MinFreeMB = clampInt(c.Download.MinFreeMB, 0, 1<<20)
+	c.Cover.Workers = clampInt(c.Cover.Workers, 1, 8)
+	c.Cover.Concurrency = clampInt(c.Cover.Concurrency, 1, 16)
+	c.FFmpeg.Threads = clampInt(c.FFmpeg.Threads, 0, 64)
+	c.DB.CacheMB = clampInt(c.DB.CacheMB, 0, 4096)
+	c.DB.MmapMB = clampInt(c.DB.MmapMB, 0, 65536)
+	c.DB.Conns = clampInt(c.DB.Conns, 1, 32)
+	c.DB.VacuumPct = clampInt(c.DB.VacuumPct, 0, 100)
+	c.MemLimitMB = clampInt(c.MemLimitMB, 0, 1<<20)
+	c.MaxProcs = clampInt(c.MaxProcs, 0, 256)
+	if c.DB.PageSize != 0 {
+		c.DB.PageSize = clampInt(c.DB.PageSize, 512, 65536)
+	}
 }
 
-// findConfig 按顺序找配置文件，找不到返回空串
+// clampInt 把 v 限制在 [lo, hi] 区间
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// findConfig 按顺序找配置文件（新名 config.yml 优先，其次旧名 config.json），找不到返回空串
 func findConfig() string {
-	cands := []string{FileName, filepath.Join("videodata", FileName)}
+	var cands []string
 	if exe, err := os.Executable(); err == nil {
 		dir := filepath.Dir(exe)
-		cands = append([]string{filepath.Join(dir, FileName)}, cands...)
+		cands = append(cands, filepath.Join(dir, FileName), filepath.Join(dir, LegacyFileName))
 	}
+	cands = append(cands,
+		FileName, LegacyFileName,
+		filepath.Join("videodata", FileName), filepath.Join("videodata", LegacyFileName),
+	)
 	for _, p := range cands {
 		if fileExists(p) {
 			return p
@@ -288,7 +367,7 @@ func findConfig() string {
 	return ""
 }
 
-// writeDefault 依次尝试 当前目录 → 程序目录 → videodata 目录，写一份默认配置
+// writeDefault 依次尝试 当前目录 → 程序目录 → videodata 目录，写一份默认配置（config.yml）
 func writeDefault() (string, error) {
 	var dirs []string
 	dirs = append(dirs, ".")
@@ -307,7 +386,7 @@ func writeDefault() (string, error) {
 		if fileExists(p) {
 			return p, nil
 		}
-		if err := Save(p, Defaults()); err != nil {
+		if err := Save(p, baseDefaults()); err != nil {
 			lastErr = err
 			continue
 		}
@@ -319,13 +398,103 @@ func writeDefault() (string, error) {
 	return "", lastErr
 }
 
-// Save 把配置写成带缩进的 JSON（原子写：先写临时文件再改名）
-func Save(path string, c *Config) error {
-	b, err := json.MarshalIndent(c, "", "  ")
+// Parse 校验并解析一段配置文本（允许 // 与 /* */ 注释），用于在线编辑。
+// 两段式（ui / advanced）和旧版扁平结构都认，返回值是合并后的完整配置。
+func Parse(text string) (*Config, error) {
+	body := normalizeInput(text)
+	cfg := Defaults()
+	if probeLowMem(body) || lowMemFromEnv() {
+		cfg = LowMemDefaults()
+	}
+	if err := applyDoc(body, cfg); err != nil {
+		return nil, err
+	}
+	cfg.normalize()
+	return cfg, nil
+}
+
+// UIFileName 页面配置文件名：放在数据目录，跟着数据走（换机器/换容器只要带上数据目录即可）
+const UIFileName = "ui.yml"
+
+// LegacyUIFileName 旧版页面配置名（JSON），启动时若存在会自动迁移成 ui.yml
+const LegacyUIFileName = "ui.json"
+
+// UIFilePath 页面配置文件在数据目录下的路径
+func UIFilePath(dataDir string) string { return filepath.Join(dataDir, UIFileName) }
+
+// LegacyUIFilePath 旧版 ui.json 的路径
+func LegacyUIFilePath(dataDir string) string { return filepath.Join(dataDir, LegacyUIFileName) }
+
+const uiHeader = `# 页面可改的配置（保存即生效），由「信息」页 →「运行配置」维护。
+# 采集 / 下载 / 封面 / ffmpeg 四段；改完点保存立即生效，不用重启。
+`
+
+const configHeader = `# 需要重启才生效的配置：端口 / 数据目录 / 日志 / 内存 / 数据库。
+# 页面可改的项（采集 / 下载 / 封面 / ffmpeg）在数据目录的 ui.yml，这里不重复。
+`
+
+// Marshal 生成 config.yml 的内容：只保留 advanced 段（需要重启的项）。
+func Marshal(c *Config) ([]byte, error) {
+	doc := struct {
+		Advanced AdvancedSection `json:"advanced" yaml:"advanced"`
+	}{Advanced: c.Advanced()}
+	return marshalYAML(configHeader, doc)
+}
+
+// MarshalUI 生成 ui.yml 的内容（collect / download / cover / ffmpeg 四段）
+func MarshalUI(c *Config) ([]byte, error) {
+	return marshalYAML(uiHeader, c.UI())
+}
+
+// marshalYAML 输出 2 空格缩进的 YAML，并在前面带上说明注释
+func marshalYAML(header string, v any) ([]byte, error) {
+	var buf bytes.Buffer
+	buf.WriteString(header)
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// LoadUI 把数据目录里的 ui.yml 合进 cfg（只覆盖文件里出现了的段）。
+// 文件不存在时返回 os.ErrNotExist，调用方可以据此生成一份。
+func LoadUI(path string, c *Config) error {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	b = append(b, '\n')
+	return mergeUISections(normalizeInput(string(b)), c)
+}
+
+// mergeUISections 解析 ui 文件（顶层就是 collect/download/cover/ffmpeg）
+func mergeUISections(text string, c *Config) error {
+	var p uiPatch
+	if err := yaml.Unmarshal([]byte(text), &p); err != nil {
+		return err
+	}
+	p.Collect.apply(c)
+	p.Download.apply(c)
+	p.Cover.apply(c)
+	p.FFmpeg.apply(c)
+	return nil
+}
+
+// SaveUI 原子写入 ui.yml
+func SaveUI(path string, c *Config) error {
+	b, err := MarshalUI(c)
+	if err != nil {
+		return err
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
 		return err
@@ -333,19 +502,388 @@ func Save(path string, c *Config) error {
 	return os.Rename(tmp, path)
 }
 
+// Save 把 advanced 段写成 YAML（原子写：先写临时文件再改名）
+func Save(path string, c *Config) error {
+	b, err := Marshal(c)
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// normalizeInput 统一输入文本：旧版 JSON（以 { 开头）先剥掉 // 与 /* */ 注释；
+// YAML 原样返回（它的注释是 #，别去动，否则会误伤 https:// 这类值）。
+func normalizeInput(s string) string {
+	if strings.HasPrefix(strings.TrimSpace(s), "{") {
+		return stripComments(s)
+	}
+	return s
+}
+
 func fileExists(p string) bool {
 	fi, err := os.Stat(p)
 	return err == nil && !fi.IsDir()
 }
 
-// hasTopLevelKey 判断 JSON 顶层是否出现某个字段（用于区分「写了默认值」和「没写」）
-func hasTopLevelKey(s, key string) bool {
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(s), &m); err != nil {
+// ---------- 配置文件的两段式结构 ----------
+//
+// 从 1.4.0 起配置文件分成两段，职责分开：
+//
+//	"ui"       页面（信息页 → 运行配置）可改的项，保存后立即生效
+//	"advanced" 只能在启动时定死的项，改了要重启；页面不展示
+//
+// 旧版扁平结构（server/data_dir/collect 全部平铺在顶层）仍然能读，
+// 第一次从页面保存时会自动写成两段式。
+
+// UISection 页面可改、保存即生效的项（存在 <数据目录>/ui.yml）
+type UISection struct {
+	Collect  Collect  `json:"collect" yaml:"collect"`
+	Download Download `json:"download" yaml:"download"`
+	Cover    Cover    `json:"cover" yaml:"cover"`
+	FFmpeg   FFmpeg   `json:"ffmpeg" yaml:"ffmpeg"`
+}
+
+// AdvancedSection 需要重启才生效的项（存在 config.yml 的 advanced 段）
+type AdvancedSection struct {
+	Server     Server `json:"server" yaml:"server"`
+	DataDir    string `json:"data_dir" yaml:"data_dir"`
+	LogLevel   string `json:"log_level" yaml:"log_level"`
+	LowMem     bool   `json:"lowmem" yaml:"lowmem"`
+	MemLimitMB int    `json:"mem_limit_mb" yaml:"mem_limit_mb"`
+	MaxProcs   int    `json:"max_procs" yaml:"max_procs"`
+	DB         DB     `json:"db" yaml:"db"`
+}
+
+// UI 取出页面段
+func (c *Config) UI() UISection {
+	return UISection{Collect: c.Collect, Download: c.Download, Cover: c.Cover, FFmpeg: c.FFmpeg}
+}
+
+// ApplyUI 写回页面段
+func (c *Config) ApplyUI(u UISection) {
+	c.Collect, c.Download, c.Cover, c.FFmpeg = u.Collect, u.Download, u.Cover, u.FFmpeg
+}
+
+// Advanced 取出高级段
+func (c *Config) Advanced() AdvancedSection {
+	return AdvancedSection{
+		Server: c.Server, DataDir: c.DataDir, LogLevel: c.LogLevel,
+		LowMem: c.LowMem, MemLimitMB: c.MemLimitMB, MaxProcs: c.MaxProcs,
+		DB: c.DB,
+	}
+}
+
+// ApplyAdvanced 写回高级段
+func (c *Config) ApplyAdvanced(a AdvancedSection) {
+	c.Server, c.DataDir, c.LogLevel = a.Server, a.DataDir, a.LogLevel
+	c.LowMem, c.MemLimitMB, c.MaxProcs = a.LowMem, a.MemLimitMB, a.MaxProcs
+	c.DB = a.DB
+}
+
+// 各段的「补丁」：用指针才能区分「没写」和「写了 0」，
+// 否则只写一个 db.conns 会把 cache_mb/mmap_mb 一起清零。
+type serverPatch struct {
+	Addr *string `json:"addr" yaml:"addr"`
+}
+
+type collectPatch struct {
+	Pages     *int    `json:"pages" yaml:"pages"`
+	Sources   *int    `json:"sources" yaml:"sources"`
+	IncrEvery *string `json:"incr_every" yaml:"incr_every"`
+	IncrPages *int    `json:"incr_pages" yaml:"incr_pages"`
+}
+
+type downloadPatch struct {
+	Workers        *int `json:"workers" yaml:"workers"`
+	SegConcurrency *int `json:"seg_concurrency" yaml:"seg_concurrency"`
+	SegBudget      *int `json:"seg_budget" yaml:"seg_budget"`
+	MinFreeMB      *int `json:"min_free_mb" yaml:"min_free_mb"`
+}
+
+type coverPatch struct {
+	Workers     *int    `json:"workers" yaml:"workers"`
+	Concurrency *int    `json:"concurrency" yaml:"concurrency"`
+	ImgProxy    *string `json:"img_proxy" yaml:"img_proxy"`
+}
+
+type ffmpegPatch struct {
+	Threads  *int  `json:"threads" yaml:"threads"`
+	Reencode *bool `json:"reencode" yaml:"reencode"`
+	Verify   *bool `json:"verify" yaml:"verify"`
+}
+
+type dbPatch struct {
+	CacheMB   *int `json:"cache_mb" yaml:"cache_mb"`
+	MmapMB    *int `json:"mmap_mb" yaml:"mmap_mb"`
+	Conns     *int `json:"conns" yaml:"conns"`
+	PageSize  *int `json:"page_size" yaml:"page_size"`
+	VacuumPct *int `json:"vacuum_pct" yaml:"vacuum_pct"`
+}
+
+// docPatch 配置文件 / 接口 payload 里可能出现的一切字段（新旧结构都收在一个结构里）
+type docPatch struct {
+	// 新结构：config.yml 的 advanced 段
+	Advanced *advPatch `json:"advanced" yaml:"advanced"`
+	// 兼容旧结构：ui 段
+	UI *uiPatch `json:"ui" yaml:"ui"`
+	// 兼容旧结构 / 接口 payload：全部平铺在顶层
+	Server     *serverPatch   `json:"server" yaml:"server"`
+	DataDir    *string        `json:"data_dir" yaml:"data_dir"`
+	LogLevel   *string        `json:"log_level" yaml:"log_level"`
+	LowMem     *bool          `json:"lowmem" yaml:"lowmem"`
+	MemLimitMB *int           `json:"mem_limit_mb" yaml:"mem_limit_mb"`
+	MaxProcs   *int           `json:"max_procs" yaml:"max_procs"`
+	Collect    *collectPatch  `json:"collect" yaml:"collect"`
+	Download   *downloadPatch `json:"download" yaml:"download"`
+	Cover      *coverPatch    `json:"cover" yaml:"cover"`
+	FFmpeg     *ffmpegPatch   `json:"ffmpeg" yaml:"ffmpeg"`
+	DB         *dbPatch       `json:"db" yaml:"db"`
+}
+
+// uiPatch 旧版 ui 段（现在 ui 段的字段直接写在 ui.yml 顶层）
+type uiPatch struct {
+	Collect  *collectPatch  `json:"collect" yaml:"collect"`
+	Download *downloadPatch `json:"download" yaml:"download"`
+	Cover    *coverPatch    `json:"cover" yaml:"cover"`
+	FFmpeg   *ffmpegPatch   `json:"ffmpeg" yaml:"ffmpeg"`
+}
+
+type advPatch struct {
+	Server     *serverPatch `json:"server" yaml:"server"`
+	DataDir    *string      `json:"data_dir" yaml:"data_dir"`
+	LogLevel   *string      `json:"log_level" yaml:"log_level"`
+	LowMem     *bool        `json:"lowmem" yaml:"lowmem"`
+	MemLimitMB *int         `json:"mem_limit_mb" yaml:"mem_limit_mb"`
+	MaxProcs   *int         `json:"max_procs" yaml:"max_procs"`
+	DB         *dbPatch     `json:"db" yaml:"db"`
+	// Cover 旧版把 cover 写在 advanced 段，1.4.0 起归到 ui，这里保留兼容
+	Cover *coverPatch `json:"cover" yaml:"cover"`
+}
+
+func (p *serverPatch) apply(c *Config) {
+	if p != nil && p.Addr != nil {
+		c.Server.Addr = *p.Addr
+	}
+}
+
+func (p *collectPatch) apply(c *Config) {
+	if p == nil {
+		return
+	}
+	if p.Pages != nil {
+		c.Collect.Pages = *p.Pages
+	}
+	if p.Sources != nil {
+		c.Collect.Sources = *p.Sources
+	}
+	if p.IncrEvery != nil {
+		c.Collect.IncrEvery = *p.IncrEvery
+	}
+	if p.IncrPages != nil {
+		c.Collect.IncrPages = *p.IncrPages
+	}
+}
+
+func (p *downloadPatch) apply(c *Config) {
+	if p == nil {
+		return
+	}
+	if p.Workers != nil {
+		c.Download.Workers = *p.Workers
+	}
+	if p.SegConcurrency != nil {
+		c.Download.SegConcurrency = *p.SegConcurrency
+	}
+	if p.SegBudget != nil {
+		c.Download.SegBudget = *p.SegBudget
+	}
+	if p.MinFreeMB != nil {
+		c.Download.MinFreeMB = *p.MinFreeMB
+	}
+}
+
+func (p *coverPatch) apply(c *Config) {
+	if p == nil {
+		return
+	}
+	if p.Workers != nil {
+		c.Cover.Workers = *p.Workers
+	}
+	if p.Concurrency != nil {
+		c.Cover.Concurrency = *p.Concurrency
+	}
+	if p.ImgProxy != nil {
+		c.Cover.ImgProxy = *p.ImgProxy
+	}
+}
+
+func (p *ffmpegPatch) apply(c *Config) {
+	if p == nil {
+		return
+	}
+	if p.Threads != nil {
+		c.FFmpeg.Threads = *p.Threads
+	}
+	if p.Reencode != nil {
+		c.FFmpeg.Reencode = *p.Reencode
+	}
+	if p.Verify != nil {
+		c.FFmpeg.Verify = *p.Verify
+	}
+}
+
+func (p *dbPatch) apply(c *Config) {
+	if p == nil {
+		return
+	}
+	if p.CacheMB != nil {
+		c.DB.CacheMB = *p.CacheMB
+	}
+	if p.MmapMB != nil {
+		c.DB.MmapMB = *p.MmapMB
+	}
+	if p.Conns != nil {
+		c.DB.Conns = *p.Conns
+	}
+	if p.PageSize != nil {
+		c.DB.PageSize = *p.PageSize
+	}
+	if p.VacuumPct != nil {
+		c.DB.VacuumPct = *p.VacuumPct
+	}
+}
+
+// apply 把补丁合并到 c（只覆盖补丁里出现过的字段）
+func (p *docPatch) apply(c *Config) {
+	if p == nil {
+		return
+	}
+	if u := p.UI; u != nil {
+		u.Collect.apply(c)
+		u.Download.apply(c)
+		u.Cover.apply(c)
+		u.FFmpeg.apply(c)
+	}
+	if a := p.Advanced; a != nil {
+		a.Server.apply(c)
+		if a.DataDir != nil {
+			c.DataDir = *a.DataDir
+		}
+		if a.LogLevel != nil {
+			c.LogLevel = *a.LogLevel
+		}
+		if a.LowMem != nil {
+			c.LowMem = *a.LowMem
+		}
+		if a.MemLimitMB != nil {
+			c.MemLimitMB = *a.MemLimitMB
+		}
+		if a.MaxProcs != nil {
+			c.MaxProcs = *a.MaxProcs
+		}
+		a.DB.apply(c)
+		// 旧版两段式把 cover 写在 advanced 里：只有 ui 段没给 cover 时才用它
+		if a.Cover != nil && (p.UI == nil || p.UI.Cover == nil) {
+			a.Cover.apply(c)
+		}
+	}
+	// 旧扁平结构 / 接口 payload：顶层直接写 server / collect / …
+	p.Server.apply(c)
+	if p.DataDir != nil {
+		c.DataDir = *p.DataDir
+	}
+	if p.LogLevel != nil {
+		c.LogLevel = *p.LogLevel
+	}
+	if p.LowMem != nil {
+		c.LowMem = *p.LowMem
+	}
+	if p.MemLimitMB != nil {
+		c.MemLimitMB = *p.MemLimitMB
+	}
+	if p.MaxProcs != nil {
+		c.MaxProcs = *p.MaxProcs
+	}
+	p.Collect.apply(c)
+	p.Download.apply(c)
+	p.Cover.apply(c)
+	p.FFmpeg.apply(c)
+	p.DB.apply(c)
+}
+
+// ApplyPatch 把一段配置补丁（YAML 或 JSON 都行）合并到 cfg 上，只覆盖出现过的字段。
+// 给 web 层保存接口用：前端漏传 / 只传一个子字段时，同段其它字段不会被清零。
+func ApplyPatch(cfg *Config, data []byte) error {
+	var p docPatch
+	if err := yaml.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	p.apply(cfg)
+	return nil
+}
+
+// applyDoc 把文件内容解析进 base（只覆盖文件里出现了的字段，没写的保留 base 的值）。
+// YAML / 旧版 JSON / 旧扁平结构都能解（YAML 是 JSON 的超集）。
+func applyDoc(text string, base *Config) error {
+	return ApplyPatch(base, []byte(text))
+}
+
+// probeLowMem 判断文件里 lowmem 是否为 true（两段式看 advanced.lowmem，旧结构看顶层 lowmem）
+func probeLowMem(text string) bool {
+	var p docPatch
+	if err := yaml.Unmarshal([]byte(text), &p); err != nil {
 		return false
 	}
-	_, ok := m[key]
-	return ok
+	if p.LowMem != nil {
+		return *p.LowMem
+	}
+	return p.Advanced != nil && p.Advanced.LowMem != nil && *p.Advanced.LowMem
+}
+
+// hasDataDirKey 文件里是否显式写了 data_dir（两段式在 advanced 段里，旧结构在顶层）
+func hasDataDirKey(text string) bool {
+	var p docPatch
+	if err := yaml.Unmarshal([]byte(text), &p); err != nil {
+		return false
+	}
+	if p.DataDir != nil {
+		return true
+	}
+	return p.Advanced != nil && p.Advanced.DataDir != nil
+}
+
+// HasUISections 配置文件里是否还残留页面项（ui 段，或平铺的 collect/download/cover/ffmpeg）。
+// 新版本这些项只在 <数据目录>/ui.yml 里，config.yml 出现它们就是老版本留下的。
+func HasUISections(text string) bool {
+	var p docPatch
+	if err := yaml.Unmarshal([]byte(normalizeInput(text)), &p); err != nil {
+		return false
+	}
+	return p.UI != nil || p.Collect != nil || p.Download != nil || p.Cover != nil || p.FFmpeg != nil
+}
+
+// CleanUIFromConfig 去掉 config.yml 里残留的页面项，只留 advanced 段。
+// 只有确实存在页面项时才写盘，旧文件备份为 .bak；返回是否改动。
+// 调用前请确保 ui 段的值已经落到 ui.yml，否则会丢配置。
+func CleanUIFromConfig(path string, c *Config) (bool, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	if !HasUISections(string(b)) {
+		return false, nil
+	}
+	if old, e := os.ReadFile(path); e == nil {
+		_ = os.WriteFile(path+".bak", old, 0o644)
+	}
+	if err := Save(path, c); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // stripComments 去掉 JSON 里的 // 行注释和 /* */ 块注释（字符串内的不动），

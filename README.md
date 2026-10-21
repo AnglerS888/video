@@ -19,6 +19,9 @@
 - **收藏** —— 按剧名收藏，显示源站更新时间是否变化
 - **分享** —— 生成局域网「分享页」链接与二维码；对方打开的是页面，可自行播放/下载，不会直接拿到视频文件地址
 - **封面本地化** —— 抓取并压缩封面存到本地，页面只读本地文件，不出现破图
+- 搜索可按**片名 / 演员**切换范围（默认全部）
+- 「接口」页把站点自身的 HTTP 接口列出来，可复制 curl
+
 
 ## 技术栈
 
@@ -38,17 +41,17 @@
 
 ```bash
 make build                    # 产出 bin/videodl.exe（当前平台）
-./bin/videodl                 # 首次运行会在当前目录生成 config.json
+./bin/videodl                 # 首次运行会在当前目录生成 config.yml
 ```
 
-打开 <http://localhost:5200>。端口、数据目录、并发、低配模式等**全部在 `config.json`**：
+打开 <http://localhost:5200>。端口、数据目录、数据库等在 `config.yml`，采集/下载/封面/ffmpeg 在「信息」页改（存到数据目录的 `ui.yml`）：
 
 ```bash
-cp config.example.json config.json   # 全字段带注释的模板
-cp config.lowmem.json  config.json   # NAS / 4G 内存：低配预设
+cp config.example.yml config.yml   # 精简模板：默认值与低配/标准预设都在代码里
 ```
 
-配置文件允许写 `//` 注释；容器里用 `VDL_CONFIG` 指向 volume 上的 `config.json`（compose 已配好）。
+两份配置都是 **YAML**（用 `#` 写注释）；旧版 JSON 配置（含 `//` 注释的）仍然能读。
+容器里用 `VDL_CONFIG` 指向 volume 上的 `config.yml`（compose 已配好）。
 
 ### Docker
 
@@ -73,7 +76,7 @@ sudo ./deploy.sh --yes           # 不交互；已有容器则沿用它的端口
 3. **构建镜像**：`docker build --build-arg APP_VERSION=<VERSION>`，旧镜像自动标记为
    `videodl:previous`（回滚用）；
 4. **启动容器**：`--restart unless-stopped`、`-p <端口>:5200`、`-v <数据目录>:/app/videodata`、
-   `VDL_CONFIG=/app/videodata/config.json`，并等 `/healthz` 通过；
+   `VDL_CONFIG=/app/videodata/config.yml`，并等 `/healthz` 通过；
 5. **再次执行 = 更新**：自动读取现有容器的端口与数据目录，重建镜像后替换容器；
    新镜像启动失败会自动回滚到 `videodl:previous`。
 
@@ -214,9 +217,9 @@ git 提交哈希和构建时间一起通过 `-ldflags` 注入 `internal/version`
 
 ```bash
 ./videodl -version
-# videodl v1.3.1 (d943a63)
-#   commit: d943a63
-#   build : 2026-10-20 03:40:34
+# videodl v1.4.0 (11d5782)
+#   commit: 11d5782
+#   build : 2026-10-21 00:10:00
 #   go     : go1.26.0 linux/amd64
 #   mode   : Docker 容器
 ```
@@ -224,7 +227,7 @@ git 提交哈希和构建时间一起通过 `-ldflags` 注入 `internal/version`
 「信息」页有**版本与更新**卡片：显示当前版本/提交/构建时间，可一键检查是否有新版本。
 
 **自动更新只在 Docker 容器内提供**；直接运行（单个二进制 / NAS 裸跑）只显示 Gitee 仓库链接，
-由用户自己下载最新版本手动替换（数据目录和 `config.json` 都不受影响）。
+由用户自己下载最新版本手动替换（数据目录和 `config.yml` 都不受影响）。
 
 ### 怎么判断有没有更新
 
@@ -252,7 +255,7 @@ git pull                                   # 或把 update/src 同步到项目�
 docker compose build && docker compose up -d
 ```
 
-数据目录是 volume，重建镜像不影响影片、进度、下载文件与 `config.json`。
+数据目录是 volume，重建镜像不影响影片、进度、下载文件与 `config.yml`。
 
 **直接运行（非容器）**
 
@@ -260,15 +263,16 @@ docker compose build && docker compose up -d
 
 1. 到 <https://gitee.com/anglers/video> 下载最新版二进制（自己编译也行）；
 2. 停掉旧进程，用新文件替换原程序；
-3. 重新启动（配置和数据目录都在 `config.json`/`videodata`，不用动）。
+3. 重新启动（配置和数据目录都在 `config.yml`/`videodata`，不用动）。
 
 > 想升级发行包/自己发布的二进制：在 Gitee 上传 Release 后把下载地址告诉我，可以再加一条
 > 「直接下载二进制替换」的路径；目前仓库只有源码包。
 
 > 匿名下载源码包时 Gitee 可能要求登录/验证（返回网页而不是 zip）。
-> 遇到这种情况在配置文件的 `update.token` 填 Gitee 私人令牌即可改走官方 `zipball` 接口。
+> 遇到这种情况可以用环境变量 `VDL_UPDATE_TOKEN` 提供 Gitee 私人令牌，程序会改走官方 `zipball` 接口
+> （更新源固定为 `anglers/video@master`，配置里不再保留 update 段）。
 
-> 更新只跟随 `master` 分支；想换源（fork）改配置里的 `update.repo`。
+> 更新源固定为 Gitee 的 `anglers/video@master`（不再放在配置里）；想换 fork 需要改代码里的 `version.Repo`。
 
 > 「下载最新源码」按钮**只有检测到新版本时才可点**；进信息页会自动检查一次（30 分钟内不重复查）。
 
@@ -291,56 +295,90 @@ videodata/
 
 ## 配置文件
 
-**所有配置都在 `config.json` 里，没有命令行参数**（只保留 `./videodl -version` 打印版本后退出）。
-改完重启生效。
+**没有命令行参数**（只保留 `./videodl -version` 打印版本后退出）。配置拆成两个文件：
 
-### 文件位置
+| 文件 | 位置 | 内容 | 生效方式 |
+|---|---|---|---|
+| `config.yml` | 见下方查找顺序 | `advanced` 段：端口、数据目录、日志、内存、数据库 | 改完**重启** |
+| `ui.yml` | **数据目录**（`<data_dir>/ui.yml`） | 采集 / 下载 / 封面 / ffmpeg | 「信息」页改，**保存即生效** |
 
-按顺序查找，都找不到就在第一个可写位置生成一份带默认值的 `config.json`：
+`ui.yml` 跟着数据走：换机器、换容器只要带上数据目录，并发设置就跟过去了；
+第一次运行没有它会按当前生效值自动生成一份。
+
+### 文件位置（config.yml）
+
+按顺序查找，都找不到就在第一个可写位置生成一份带默认值的 `config.yml`：
 
 1. 环境变量 `VDL_CONFIG` 指定的路径（不存在会在该处生成；**容器里推荐指向 volume**，见 compose）
-2. 当前目录 `./config.json`
-3. 程序所在目录 `config.json`
-4. 当前目录 `videodata/config.json`
+2. 当前目录 `./config.yml`
+3. 程序所在目录 `config.yml`
+4. 当前目录 `videodata/config.yml`
 
 文件是 JSON，但**允许 `//` 行注释和 `/* */` 块注释**（读取前会剥掉），可以放心加说明。
-仓库里附了 `config.example.json`（全字段带注释）与 `config.lowmem.json`（低配示例）。
+仓库里只附了一份 `config.example.yml`（精简模板）。
+`ui.yml` 由程序首次启动时自动生成，之后由页面维护，不需要模板。
+**默认值、标准预设、低配预设都写死在代码里**（`internal/config`），配置文件里不重复这些数值。
 
 ### 示例
 
-```json
-{
-  "server": { "addr": ":5200" },
+`config.yml`（只放需要重启的项）：
 
-  // 数据目录：SQLite、封面、下载的视频、ffmpeg 缓存都在这里
-  "data_dir": "./videodata",
-  "log_level": "info",          // debug / info / warn / error
+```yaml
+advanced:
+  server:
+    addr: ":5200"
 
-  // 低配模式：先套一套 NAS 友好的默认值，本文件里显式写了的字段仍可覆盖它
-  "lowmem": false,
-  "mem_limit_mb": 0,            // Go GC 软上限（MiB），0=不限；lowmem 时默认 768
-  "max_procs": 0,               // GOMAXPROCS，0=自动；lowmem 时默认 min(核数,3)
+  # 数据目录：SQLite、封面、下载的视频、ui.yml、ffmpeg 缓存都在这里
+  data_dir: "./videodata"
+  log_level: "info"          # debug / info / warn / error
 
-  "collect": { "pages": 6, "sources": 8, "incr_every": "1h", "incr_pages": 5 },
+  # 低配模式：先套一套 NAS 友好的默认值（主要影响 ui.yml 里那几项的初值）
+  lowmem: false
+  mem_limit_mb: 0            # Go GC 软上限（MiB），0=不限；lowmem 时默认 768
+  max_procs: 0               # GOMAXPROCS，0=自动；lowmem 时默认 min(核数,3)
 
-  "download": {
-    "workers": 1,               // 同时下载的集数（实际固定串行）
-    "seg_concurrency": 16,      // 单任务分片并发
-    "seg_budget": 0,            // 全局分片并发，0=workers × seg_concurrency
-    "min_free_mb": 2048         // 磁盘剩余空间保护阈值，0=关闭
-  },
-
-  "cover": { "workers": 2, "concurrency": 4, "img_proxy": "" },
-
-  "ffmpeg": { "threads": 0, "reencode": true, "verify": true },
-
-  "db": { "cache_mb": 64, "mmap_mb": 1024, "conns": 4, "page_size": 0, "vacuum_pct": 15 },
-
-  "update": { "repo": "", "branch": "", "token": "" }
-}
+  db:
+    cache_mb: 64
+    mmap_mb: 1024
+    conns: 4
+    page_size: 0
+    vacuum_pct: 15
 ```
 
+`<数据目录>/ui.yml`（页面维护，保存即生效）：
+
+```yaml
+collect:
+  pages: 6
+  sources: 8
+  incr_every: "1h"     # 1h / 30m / 1h30m
+  incr_pages: 5        # 0=不限
+
+download:
+  workers: 1             # 同时下载的集数（实际固定串行）
+  seg_concurrency: 16    # 单任务分片并发
+  seg_budget: 0          # 全局分片并发，0=workers × seg_concurrency
+  min_free_mb: 2048      # 磁盘剩余空间保护阈值，0=关闭
+
+cover:
+  workers: 2
+  concurrency: 4
+  img_proxy: ""          # 图片代理前缀，如 https://wsrv.nl/?url=
+
+ffmpeg:
+  threads: 0             # 0=默认；NAS 建议 1~2
+  reencode: true
+  verify: true
+```
+
+> 旧版结构（全部平铺在一个 `config.yml` 里，或 `ui`/`advanced` 两段写在同一个文件）
+> **仍然能读**；从「信息」页保存一次后，页面项会自动落到 `ui.yml`。
+
 ### 字段说明
+
+下表里 `collect.*` / `download.*` / `cover.*` / `ffmpeg.*` 在 **`ui.yml`**（页面可改、保存即生效），
+其余（`server.*` / `data_dir` / `log_level` / `lowmem` / `mem_limit_mb` / `max_procs` / `db.*`）
+在 **`config.yml` 的 `advanced` 段**（改完重启）。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
@@ -369,16 +407,38 @@ videodata/
 | `db.conns` | `4` | SQLite 最大连接数（WAL 一写多读） |
 | `db.page_size` | `0` | 页大小（如 `8192`）；0=不改。改已有库会先 VACUUM 重写一次 |
 | `db.vacuum_pct` | `15` | 空闲页占比超过该值自动整理，0 关闭 |
-| `update.repo` | `anglers/video` | 更新源仓库（Gitee） |
-| `update.branch` | `master` | 更新跟踪分支 |
-| `update.token` | 空 | 可选 Gitee 私人令牌，配了走官方 zipball 接口 |
+
+### 在线调整（表单，保存即生效）
+
+「信息」页的**运行配置**卡片只放**不用重启**的四组：
+
+| 分组 | 项 | 生效时机 |
+|---|---|---|
+| 采集 | `collect.pages` / `sources` / `incr_every` / `incr_pages` | 下一轮采集、下一次定时增量（间隔立即重排） |
+| 下载 | `download.workers` / `seg_concurrency` / `seg_budget` / `min_free_mb` | 下一集开始下载 |
+| 封面 | `cover.workers` / `concurrency` / `img_proxy` | 立即 |
+| 合并转码 | `ffmpeg.threads` / `reencode` / `verify` | 下一次合并 |
+
+都是输入框 / 开关，不用写 JSON；顶部还有「标准预设」「低配预设」一键套用。点保存后
+**立即热应用到运行中的组件**（正在跑的采集轮次、正在下的那一集不受影响），
+同时写进 `<数据目录>/ui.yml`（旧文件备份为 `ui.yml.bak`），**不会动 config.yml**；
+越界值会被夹到安全范围。
+
+**需要重启的项**（`server.addr`、`data_dir`、`log_level`、`lowmem`、`mem_limit_mb`、
+`max_procs`、`db.*`）在 `config.yml` 的 `advanced` 段，页面上不展示。
+
+也可以走接口：`GET /api/config` 读取（合并 config.yml + ui.yml，返回 `config`、`path`、`ui_path`
+与两套 `presets`）、`PUT /api/config` 保存 —— body 传 `{"config":{...}}`（缺省字段保持原值；
+只含上面四组时写 `ui.yml` 并返回 `restart_required:false`，带上其它分组则同时写 `config.yml` 并返回 `true`）；
+`{"text":"..."}` 仍然支持，用于整段原文写入（一律按需重启处理）。
 
 ### 低配模式怎么生效
 
 `"lowmem": true` 时先取一套低配默认值（`pages=3`、`sources=2`、`cover.workers=1`、
 `cover.concurrency=2`、`download.seg_concurrency=6`、`ffmpeg.threads=1`、`ffmpeg.reencode=false`、
 `mem_limit_mb=768`、`max_procs=min(核数,3)`、`db.cache_mb=24`、`db.mmap_mb=256`、`db.conns=2`），
-**再用配置文件里显式写过的字段覆盖**。所以可以 `"lowmem": true` 同时单独写 `"pages": 8`。
+**再用文件里显式写过的字段覆盖**。注意 ui.yml 里那四组一旦存在就是显式值，
+所以低配主要影响首次生成；之后想切换/微调用页面上的「标准预设 / 低配预设」更直接。
 
 ### 环境变量
 
@@ -386,7 +446,8 @@ videodata/
 
 | 变量 | 说明 |
 |---|---|
-| `VDL_CONFIG` | 指定配置文件路径（容器里指向 volume 上的 `config.json`） |
+| `VDL_CONFIG` | 指定配置文件路径（容器里指向 volume 上的 `config.yml`） |
+| `VDL_LOWMEM=1` | 强制套用代码里的低配预设（等同页面的「低配预设」，不需要额外配置文件） |
 | `VDL_HTTP_LOG=1` | 打印每个 API 请求的访问日志（默认只记慢请求） |
 | `VDL_COLLECT_RETRY_DELAY` | 采集失败后的等待秒数，默认 `180` |
 | `VDL_COLLECT_PAGE_DELAY` | 全量采集每页间隔，`3-5`（默认）/ `2` / `0` |
@@ -398,7 +459,7 @@ videodata/
 以 4G 内存、J4125 这类弱 CPU 的机型为例：
 
 ```bash
-VDL_CONFIG=/vol1/videodata/config.json ./videodl-linux-amd64
+VDL_CONFIG=/vol1/videodata/config.yml ./videodl-linux-amd64
 ```
 
 首次启动若系统没装 ffmpeg，进「信息」页点一次「下载 ffmpeg」即可（约 29MB，落在 `videodata/bin/`，
@@ -406,7 +467,7 @@ VDL_CONFIG=/vol1/videodata/config.json ./videodl-linux-amd64
 
 或直接用仓库里的 `docker-compose.yml`，已经配好：
 
-- `lowmem: true`（配置见 `config.lowmem.json`）
+- `lowmem: true`（或启动前设 `VDL_LOWMEM=1`，`make run-lowmem` 就是这么跑的）
 - 容器内存上限 1G，数据卷 `./videodata:/app/videodata`
 - `init: true` + `stop_grace_period: 30s`，`docker stop` 时能让合并中的 ffmpeg 收尾
 - 日志按 10MB × 3 份滚动，避免长期运行吃掉系统盘

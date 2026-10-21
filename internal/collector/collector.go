@@ -420,10 +420,11 @@ type Collector struct {
 	HTTP *http.Client
 	// CoverDir 封面压缩图的存储目录（data/img），同步时预取，页面访问直接读本地
 	CoverDir string
-	// PageWorkers 每个接口的分页并发数（默认 6）
-	PageWorkers int
+	// PageWorkers 每个接口的分页并发数（默认 6）。
+	// 信息页保存配置后会热更新，所以用原子量：采集协程可能在读的同时被改。
+	PageWorkers atomic.Int32
 	// SourceWorkers 同时采集的接口数（默认 4）
-	SourceWorkers int
+	SourceWorkers atomic.Int32
 
 	// 播放地址主机字典缓存：源站就那么几个域名，不必每行都去查一次 play_host。
 	// 分页采集是多线程的，所以带锁。
@@ -432,11 +433,9 @@ type Collector struct {
 }
 
 func New(db *sql.DB) *Collector {
-	return &Collector{
-		DB:            db,
-		PageWorkers:   defaultPageWorkers,
-		SourceWorkers: defaultSourceWorkers,
-		hostIDs:       map[string]int64{},
+	c := &Collector{
+		DB:      db,
+		hostIDs: map[string]int64{},
 		HTTP: &http.Client{
 			Timeout: 40 * time.Second,
 			Transport: &http.Transport{
@@ -449,7 +448,31 @@ func New(db *sql.DB) *Collector {
 			},
 		},
 	}
+	c.SetWorkers(defaultPageWorkers, defaultSourceWorkers)
+	return c
 }
+
+// SetWorkers 更新采集并发（信息页保存配置后热调用）。
+// 正在跑的那一轮分页数不会变，下一轮采集才用新值。
+func (c *Collector) SetWorkers(pages, sources int) {
+	if pages < 1 {
+		pages = defaultPageWorkers
+	}
+	if sources < 1 {
+		sources = defaultSourceWorkers
+	}
+	if sources > maxConcurrentSources {
+		sources = maxConcurrentSources
+	}
+	c.PageWorkers.Store(int32(pages))
+	c.SourceWorkers.Store(int32(sources))
+}
+
+// PageWorkersCount 当前分页并发（日志/页面展示用）
+func (c *Collector) PageWorkersCount() int { return int(c.PageWorkers.Load()) }
+
+// SourceWorkersCount 当前接口并发（日志/页面展示用）
+func (c *Collector) SourceWorkersCount() int { return int(c.SourceWorkers.Load()) }
 
 // buildURL 拼接标准接口地址；scheme 非空时替换源站协议（https 不通时回落 http）
 func buildURL(apiURL string, query url.Values, scheme string) string {
@@ -986,7 +1009,7 @@ const maxConcurrentSources = 16
 
 // sourceLimit 同时采集的接口数上限（可由 -sources 调整）
 func (c *Collector) sourceLimit() int {
-	n := c.SourceWorkers
+	n := int(c.SourceWorkers.Load())
 	if n <= 0 {
 		n = defaultSourceWorkers
 	}
@@ -1478,23 +1501,59 @@ func SetCoverConcurrency(n int) {
 	coverSem = make(chan struct{}, n)
 }
 
+// coverMaxWorkers 封面预取协程上限：协程起满这么多，实际同时处理几张由
+// cover.workers 通过 coverGate 控制，所以页面上调大调小都不用重启。
+const coverMaxWorkers = 8
+
+// slotGate 可伸缩的并发闸门：名额数可以在运行时换（正在跑的任务用完自己的名额再归还）
+type slotGate struct {
+	mu sync.Mutex
+	ch chan struct{}
+}
+
+func (g *slotGate) set(n int) {
+	if n < 1 {
+		n = 1
+	}
+	if n > coverMaxWorkers {
+		n = coverMaxWorkers
+	}
+	g.mu.Lock()
+	g.ch = make(chan struct{}, n)
+	g.mu.Unlock()
+}
+
+func (g *slotGate) acquire() (release func()) {
+	g.mu.Lock()
+	ch := g.ch
+	g.mu.Unlock()
+	if ch == nil {
+		return func() {}
+	}
+	ch <- struct{}{}
+	return func() { <-ch }
+}
+
+var coverGate = &slotGate{}
+
+// SetCoverWorkers 调整封面预取并发（页面保存后热调用，不用重启）
+func SetCoverWorkers(n int) { coverGate.set(n) }
+
 // StartCoverWorkers 启动封面下载压缩协程（独立于采集 worker，不阻塞主流程）
 func (c *Collector) StartCoverWorkers(n int) {
 	if c.CoverDir == "" {
 		return
 	}
 	os.MkdirAll(c.CoverDir, 0o755)
-	if n < 1 {
-		n = 2
-	}
-	if n > 8 {
-		n = 8
-	}
+	// 协程常驻 coverMaxWorkers 个，真正同时处理几张由闸门决定（cover.workers 热改）
+	coverGate.set(n)
 	coverQueue = make(chan string, coverQueueLen)
-	for i := 0; i < n; i++ {
+	for i := 0; i < coverMaxWorkers; i++ {
 		go func() {
 			for u := range coverQueue {
+				release := coverGate.acquire()
 				c.fetchAndStoreCover(u)
+				release()
 			}
 		}()
 	}

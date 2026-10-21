@@ -5,7 +5,7 @@ import { toast } from '../toast'
 import type { Source, SourceProgress, SourceTest } from '../types'
 
 /**
- * 接口管理：添加（只填域名）+ 列表（数据量 / 连通性 / 采集进度）。
+ * 来源管理：添加（只填域名）+ 列表（数据量 / 连通性 / 采集进度）。
  * 列表默认只读展示，点「编辑」才进编辑态 —— 避免在输入框里误改后忘记保存。
  */
 const list = ref<Source[]>([])
@@ -31,7 +31,7 @@ const phaseText: Record<string, string> = {
 const anyRunning = computed(() => Object.values(progress.value).some((p) => p.running))
 const enabledCount = computed(() => list.value.filter((s) => s.enabled === 1).length)
 const totalVideos = computed(() => list.value.reduce((n, s) => n + (s.videos || 0), 0))
-// 会参与定时增量任务的接口数（启用 + 自动增量都打开）
+// 会参与定时增量任务的来源数（启用 + 自动增量都打开）
 const autoIncrCount = computed(() => list.value.filter((s) => s.enabled === 1 && s.auto_incr === 1).length)
 
 const filtered = computed(() => {
@@ -77,8 +77,8 @@ async function loadProgress() {
 async function add() {
   const name = draft.name.trim()
   const url = draft.url.trim()
-  if (!name) return toast('请填写接口名称', 'err', 1600)
-  if (!url) return toast('请填写接口地址，例如 https://www.baidu.com', 'err', 2200)
+  if (!name) return toast('请填写来源名称', 'err', 1600)
+  if (!url) return toast('请填写来源地址，例如 https://www.baidu.com', 'err', 2200)
   busy.value = true
   // 测试过就用探测出来的可用地址（可能是补上 .php 或换成 at/xml 的写法）
   const r = await api.addSource(name, probeURL.value || url)
@@ -99,7 +99,7 @@ async function add() {
  */
 async function probeDraft() {
   const url = draft.url.trim()
-  if (!url) return toast('先填接口地址（填域名即可，如 www.baidu.com）', 'err', 2200)
+  if (!url) return toast('先填来源地址（填域名即可，如 www.baidu.com）', 'err', 2200)
   probing.value = true
   probe.value = null
   probeURL.value = ''
@@ -129,7 +129,7 @@ async function save(s: Source) {
   const e = editing[s.id]
   if (!e) return
   if (!e.name.trim()) return toast('名称不能为空', 'err', 1600)
-  if (!e.url.trim()) return toast('接口地址不能为空', 'err', 1600)
+  if (!e.url.trim()) return toast('来源地址不能为空', 'err', 1600)
   const r = await api.updateSource(s.id, { name: e.name.trim(), api_url: e.url.trim(), enabled: s.enabled })
   if (!r.ok) return toast(r.msg || '保存失败', 'err', 2400)
   toast('已保存', 'ok', 1500)
@@ -146,7 +146,7 @@ async function toggleEnabled(s: Source) {
   toast(next ? '已启用' : '已停用（不再参与采集）', 'ok', 1500)
 }
 
-// 自动增量：只决定「定时任务」采不采这个接口；手动点增量/全量不受影响
+// 自动增量：只决定「定时任务」采不采这个来源；手动点增量/全量不受影响
 function autoOn(s: Source) {
   return s.auto_incr === 1
 }
@@ -156,13 +156,13 @@ async function toggleAutoIncr(s: Source) {
   const r = await api.setAutoIncr(s.id, next)
   if (!r.ok) return toast(r.msg || '操作失败', 'err', 2400)
   s.auto_incr = next ? 1 : 0
-  toast(next ? '已开启自动增量：定时任务会采这个接口' : '已关闭自动增量：仍可手动点「增量采集」', 'ok', 2400)
+  toast(next ? '已开启自动增量：定时任务会采这个来源' : '已关闭自动增量：仍可手动点「增量采集」', 'ok', 2400)
 }
 
 async function remove(s: Source) {
-  const detail = s.videos ? `该接口现有 ${num(s.videos)} 部影片、${num(s.plays)} 条播放地址，` : '该接口还没有采集数据，'
+  const detail = s.videos ? `该来源现有 ${num(s.videos)} 部影片、${num(s.plays)} 条播放地址，` : '该来源还没有采集数据，'
   const okc = confirm(
-    `删除接口「${s.name}」？\n\n${detail}删除后会一并清空：\n` +
+    `删除来源「${s.name}」？\n\n${detail}删除后会一并清空：\n` +
     `· 影片记录、播放地址\n· 下载记录与已下载文件\n· 封面缓存\n· 采集断点\n\n该操作不可恢复。`,
   )
   if (!okc) return
@@ -185,7 +185,7 @@ async function test(s: Source) {
   tests[s.id] = r.ok ? r.data : { ok: false, msg: r.msg || '测试失败' }
 }
 
-// 导入接口列表：读取本系统导出的 JSON，后端按 api_url 去重
+// 导入来源列表：读取本系统导出的 JSON，后端按 api_url 去重
 const importing = ref(false)
 const importInput = ref<HTMLInputElement | null>(null)
 
@@ -198,11 +198,11 @@ async function onImportFile(e: Event) {
   try {
     parsed = JSON.parse(await file.text())
   } catch {
-    return toast('文件不是有效的 JSON，请选择本系统导出的接口文件', 'err', 3000)
+    return toast('文件不是有效的 JSON，请选择本系统导出的来源文件', 'err', 3000)
   }
   const sources = Array.isArray(parsed) ? parsed : (parsed as { sources?: unknown[] })?.sources
   if (!Array.isArray(sources) || !sources.length) {
-    return toast('文件里没有可导入的接口', 'err', 2600)
+    return toast('文件里没有可导入的来源', 'err', 2600)
   }
   importing.value = true
   const r = await api.importSources(sources)
@@ -221,7 +221,7 @@ async function testAll() {
   testingAll.value = false
   const bad = list.value.filter((s) => tests[s.id] && !tests[s.id]?.ok).length
   toast(
-    bad ? `${list.value.length} 个接口已测试，${bad} 个异常` : `${list.value.length} 个接口全部正常`,
+    bad ? `${list.value.length} 个来源已测试，${bad} 个异常` : `${list.value.length} 个来源全部正常`,
     bad ? 'err' : 'ok',
     2600,
   )
@@ -235,7 +235,7 @@ async function collect(s: Source, full: boolean) {
 }
 
 async function collectAll(full: boolean) {
-  if (full && !confirm('对全部启用接口重新全量采集，耗时较长，确认继续？')) return
+  if (full && !confirm('对全部启用来源重新全量采集，耗时较长，确认继续？')) return
   const r = await api.collect(full, undefined, full)
   if (!r.ok) return toast(r.msg || '启动失败', 'err', 2600)
   toast(r.data || '已开始', 'ok', 2600)
@@ -270,21 +270,21 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="space-y-4">
-    <!-- 添加接口 -->
+    <!-- 添加来源 -->
     <section class="card card-pad">
       <div class="mb-1 flex flex-wrap items-center gap-2">
-        <span class="title">添加采集接口</span>
+        <span class="title">添加采集来源</span>
         <span class="chip">苹果CMS v10</span>
       </div>
       <p class="mb-3 text-xs muted">
         只填域名即可（如 <code class="text-amber-600 dark:text-amber-400">www.baidu.com</code>），
         会自动识别 <b class="font-medium">.php / 无 .php</b> 两种路径与 <b class="font-medium">JSON / XML</b> 两种格式，
-        完整的接口地址也能直接粘贴。建议先点「测试」确认能同步，再添加。
+        完整的来源地址也能直接粘贴。建议先点「测试」确认能同步，再添加。
       </p>
       <div class="flex flex-col gap-2 sm:flex-row">
-        <input v-model="draft.name" class="input sm:w-52" placeholder="接口名称" />
+        <input v-model="draft.name" class="input sm:w-52" placeholder="来源名称" />
         <input
-          v-model="draft.url" class="input flex-1" placeholder="接口地址 例如https://www.baidu.com"
+          v-model="draft.url" class="input flex-1" placeholder="来源地址 例如https://www.baidu.com"
           inputmode="url" enterkeyhint="done" @keyup.enter="add"
         />
         <button class="btn btn-ghost sm:w-24" :disabled="probing || busy" @click="probeDraft">
@@ -315,7 +315,7 @@ onBeforeUnmount(() => {
           将使用 <code class="text-amber-600 dark:text-amber-400">{{ probe.api_url }}</code>
         </p>
         <p v-if="probe.ok && probe.parsed === 0" class="mt-1 text-amber-600 dark:text-amber-400">
-          接口能连通，但首页没解析到影片（源站可能暂时为空）
+          来源能连通，但首页没解析到影片（源站可能暂时为空）
         </p>
         <p v-if="probe.detail_sample" class="mt-1 truncate text-[11px] text-slate-400" :title="probe.detail_sample">
           样例：{{ probe.detail_sample }}
@@ -329,14 +329,14 @@ onBeforeUnmount(() => {
     <!-- 工具栏 -->
     <section class="card card-pad space-y-3">
       <div class="flex flex-wrap items-center gap-2">
-        <span class="title">接口列表</span>
+        <span class="title">来源列表</span>
         <span class="chip">{{ list.length }} 个 · 启用 {{ enabledCount }}</span>
         <span class="chip">共 {{ num(totalVideos) }} 部影片</span>
         <span
           v-if="enabledCount > 0"
           class="chip"
           :class="autoIncrCount < enabledCount ? 'chip-on' : ''"
-          :title="`定时增量任务会采集 ${autoIncrCount} 个接口（启用 ${enabledCount} 个）`"
+          :title="`定时增量任务会采集 ${autoIncrCount} 个来源（启用 ${enabledCount} 个）`"
         >自动增量 {{ autoIncrCount }}/{{ enabledCount }}</span>
         <span v-if="anyRunning" class="chip chip-on">采集进行中…</span>
 
@@ -344,7 +344,7 @@ onBeforeUnmount(() => {
           <svg viewBox="0 0 24 24" class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" />
           </svg>
-          <input v-model="q" class="input py-1.5 pl-9 text-sm" type="search" placeholder="搜索接口名 / 域名" />
+          <input v-model="q" class="input py-1.5 pl-9 text-sm" type="search" placeholder="搜索来源名 / 域名" />
         </div>
       </div>
 
@@ -365,11 +365,11 @@ onBeforeUnmount(() => {
       </div>
     </section>
 
-    <!-- 接口卡片 -->
+    <!-- 来源卡片 -->
     <section class="space-y-3">
       <div v-if="filtered.length === 0" class="card grid place-items-center gap-2 py-16 text-center">
         <div class="text-3xl">{{ q ? '🔍' : '🔌' }}</div>
-        <div class="title">{{ q ? '没有匹配的接口' : '还没有采集接口' }}</div>
+        <div class="title">{{ q ? '没有匹配的来源' : '还没有采集来源' }}</div>
         <p class="text-sm muted">{{ q ? '换个关键词试试' : '在上方填站点域名添加一个' }}</p>
       </div>
 
@@ -436,7 +436,7 @@ onBeforeUnmount(() => {
             class="btn btn-ghost btn-sm"
             :class="autoOn(s) ? '' : 'text-slate-400 dark:text-slate-500'"
             :title="autoOn(s)
-              ? '定时任务会自动采集这个接口，点击关闭'
+              ? '定时任务会自动采集这个来源，点击关闭'
               : '已关闭自动增量：定时任务跳过它，仍可手动点「增量采集」'"
             :aria-pressed="autoOn(s)"
             @click="toggleAutoIncr(s)"
@@ -465,8 +465,8 @@ onBeforeUnmount(() => {
 
         <!-- 编辑态 -->
         <div v-if="editing[s.id]" class="mt-2 flex flex-col gap-2 rounded-xl bg-slate-50 p-2.5 sm:flex-row dark:bg-white/5">
-          <input v-model="editing[s.id].name" class="input h-9 py-1 sm:w-52" placeholder="接口名称" />
-          <input v-model="editing[s.id].url" class="input h-9 min-w-0 flex-1 py-1 text-xs" placeholder="接口地址 例如https://www.baidu.com" />
+          <input v-model="editing[s.id].name" class="input h-9 py-1 sm:w-52" placeholder="来源名称" />
+          <input v-model="editing[s.id].url" class="input h-9 min-w-0 flex-1 py-1 text-xs" placeholder="来源地址 例如https://www.baidu.com" />
         </div>
 
         <!-- 测试结果 -->
@@ -493,7 +493,7 @@ onBeforeUnmount(() => {
             ⚠ 源站忽略分页参数，全量只能采到第 1 页
           </p>
           <p v-if="tests[s.id]?.detail_ok === false" class="mt-1 text-amber-600 dark:text-amber-400">
-            ⚠ detail 接口拿不到播放地址，采到的影片无法下载
+            ⚠ detail 来源拿不到播放地址，采到的影片无法下载
           </p>
           <p v-if="tests[s.id]?.detail_sample" class="mt-1 truncate text-[11px] text-slate-400" :title="tests[s.id]?.detail_sample">
             样例：{{ tests[s.id]?.detail_sample }}

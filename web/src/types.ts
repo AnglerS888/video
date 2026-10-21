@@ -129,7 +129,17 @@ export interface VideoDetail {
   sources: VideoSource[]
 }
 
-export interface Filters { years: string[]; areas: string[]; types: string[] }
+// 一个筛选取值 + 它覆盖的影片数（后端只返回片量最多的前 20 个）
+export interface FilterItem { v: string; c: number }
+
+// 每个维度最多返回 20 个取值，其余全部归入「其他」。
+// other 里是三个维度各自的「其他」桶影片数，为 0 时前端不显示「其他」胶囊。
+export interface Filters {
+  years: FilterItem[]
+  areas: FilterItem[]
+  types: FilterItem[]
+  other: { year: number; area: number; type: number }
+}
 
 export interface FavItem {
   vod_name: string
@@ -305,6 +315,32 @@ export interface UpdateStatus {
   instructions?: string[]
   error?: string
   updated_at: string
+}
+
+/** 配置文件（在线编辑） */
+/** 配置文件的结构（与 internal/config.Config 的 json 标签一一对应） */
+export interface ConfigData {
+  server: { addr: string }
+  data_dir: string
+  log_level: string
+  lowmem: boolean
+  mem_limit_mb: number
+  max_procs: number
+  collect: { pages: number; sources: number; incr_every: string; incr_pages: number }
+  download: { workers: number; seg_concurrency: number; seg_budget: number; min_free_mb: number }
+  cover: { workers: number; concurrency: number; img_proxy: string }
+  ffmpeg: { threads: number; reencode: boolean; verify: boolean }
+  db: { cache_mb: number; mmap_mb: number; conns: number; page_size: number; vacuum_pct: number }
+}
+
+export interface ConfigInfo {
+  path: string
+  /** 页面配置（ui.yml）在数据目录下的路径 */
+  ui_path?: string
+  text: string
+  config?: ConfigData | null
+  editable: boolean
+  presets?: { default: ConfigData; lowmem: ConfigData }
 }
 
 export interface VersionResp {

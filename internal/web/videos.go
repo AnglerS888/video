@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,43 +17,135 @@ import (
 )
 
 // ---- 筛选项（年份 / 国家地区 / 类型）----
-// 直接取聚合表的存量值（结果集小、可走索引），并缓存 5 分钟。
-func (s *Server) listFilters(w http.ResponseWriter, r *http.Request) {
-	// 不做缓存：这三条查询走索引只需几毫秒，缓存反而会让刚采集到的新年份/地区延迟可见
+//
+// 只返回片量最多的前 filterTopN 个取值，剩下的全部收进「其他」桶。
+//
+// 为什么：来源站点的取值极其分散。实测 15 万部影片里
+//   - 地区有 1808 种写法，其中 1403 种是 "英国,美国"、"美国,英国" 这种逗号合成值
+//     （同一组合顺序颠倒就算另一个值），还有 "中国大陆"/"大陆"/"内地"/"中国" 四种同义写法；
+//   - 年份有 290 种，混着 "22025"（脏数据）、"1988~"、"1990~1995" 这类区间值；
+//   - 类型有 72 种。
+// 全列出来筛选行会长到几千像素（2026-10-20 用户反馈）。
+// 前 20 名已能覆盖绝大多数影片，剩下的用「其他」兜底：
+// 点它 = 「该列的值不在前 20 名里」，所以规范的取值一个都不会被漏掉。
+const (
+	filterTopN = 20
+	// 「其他」在 URL 里的哨兵值。不能直接用"其他"两个字：
+	// 库里真的有叫"其它"/"其他"的地区取值，会和正常取值撞车。
+	filterOtherSentinel = "__other__"
+)
 
-	// 全部取值都来自数据库，不做任何硬编码。
-	// 优先查预聚合表 vod_name_agg（行数少、有索引）；若聚合表还没建好（老库刚升级），
-	// 退回到 vod_info 实时 DISTINCT，保证下拉框不会空着。
-	distinct := func(col string, orderBy string, limit int) []string {
-		q := `SELECT TRIM(` + col + `) AS v, COUNT(*) AS c FROM %s
-			WHERE TRIM(` + col + `) <> '' GROUP BY v ORDER BY ` + orderBy + ` LIMIT ` + strconv.Itoa(limit)
-		for _, table := range []string{"vod_name_agg", "vod_info"} {
-			rows, err := s.DB.Query(fmt.Sprintf(q, table))
-			if err != nil {
-				continue
-			}
-			out := []string{}
-			for rows.Next() {
-				var v string
-				var c int64
-				if rows.Scan(&v, &c) == nil && v != "" {
-					out = append(out, v)
-				}
-			}
-			rows.Close() // 单连接库：必须关闭后再查下一张，否则死锁
-			if len(out) > 0 {
-				return out
+// filterItem 是一个筛选取值 + 它覆盖的影片数。
+type filterItem struct {
+	Value string `json:"v"`
+	Count int64  `json:"c"`
+}
+
+// filterTable 选出用于筛选统计的表：优先聚合表 vod_name_agg（行数少、有索引），
+// 老库还没建好聚合表时退回明细表 vod_info。
+// 统计和取值必须用同一张表，否则「其他」的条数会和实际筛选结果对不上。
+func (s *Server) filterTable() string {
+	var n int64
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM vod_name_agg`).Scan(&n); err == nil && n > 0 {
+		return "vod_name_agg"
+	}
+	return "vod_info"
+}
+
+// filterTopValues 取某列片量最多的前 N 个取值。
+// 排序「片量倒序 + 名称升序」保证结果稳定（否则同样的数据每次刷新顺序可能不同）。
+func (s *Server) filterTopValues(col string) []filterItem {
+	q := `SELECT TRIM(` + col + `) AS v, COUNT(*) AS c FROM %s
+		WHERE TRIM(` + col + `) <> '' GROUP BY v ORDER BY c DESC, v ASC LIMIT ?`
+	for _, table := range []string{"vod_name_agg", "vod_info"} {
+		rows, err := s.DB.Query(fmt.Sprintf(q, table), filterTopN)
+		if err != nil {
+			continue
+		}
+		out := make([]filterItem, 0, filterTopN)
+		for rows.Next() {
+			var it filterItem
+			if rows.Scan(&it.Value, &it.Count) == nil && it.Value != "" {
+				out = append(out, it)
 			}
 		}
-		return []string{}
+		rows.Close() // 单连接库：必须关闭后再查下一张，否则死锁
+		if len(out) > 0 {
+			return out
+		}
 	}
+	return []filterItem{}
+}
+
+// filterOtherCount = 该表总行数 - 前 N 名覆盖的影片数 = 「其他」桶的大小。
+//
+// 注意用的是「全表行数」而不是「非空行数」：空值（比如没填地区的影片）
+// 同样不在前 20 名里，查询侧用的是 NOT IN(...)，空值天然会被算进来 ——
+// 两边口径必须一致，否则前端显示的条数和实际筛选结果对不上。
+// total 由调用方传入：三个维度共用同一次 COUNT(*)，不用每维都扫一遍表。
+// 结果 ≤ 0 说明取值本来就不超过 20 个，不该出现「其他」。
+func filterOtherCount(top []filterItem, total int64) int64 {
+	var sum int64
+	for _, it := range top {
+		sum += it.Count
+	}
+	if rest := total - sum; rest > 0 {
+		return rest
+	}
+	return 0
+}
+
+// sortYearsDesc 把年份按数值倒序（2026 → 2025 → …），让用户找新片更顺手。
+// "1988~"、"1990~1995" 这类区间值取前 4 位数字参与比较；
+// 完全取不到数字的排最后，避免脏数据（如 "22025"）混在最前面。
+func sortYearsDesc(in []filterItem) []filterItem {
+	out := make([]filterItem, len(in))
+	copy(out, in)
+	yearOf := func(v string) int {
+		n := 0
+		for i := 0; i < len(v) && i < 4; i++ {
+			c := v[i]
+			if c < '0' || c > '9' {
+				break
+			}
+			n = n*10 + int(c-'0')
+		}
+		return n
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := yearOf(out[i].Value), yearOf(out[j].Value)
+		if a != b {
+			return a > b
+		}
+		return out[i].Value > out[j].Value
+	})
+	return out
+}
+
+func (s *Server) listFilters(w http.ResponseWriter, r *http.Request) {
+	// 不做缓存：这几条查询走索引只需几毫秒，缓存反而会让刚采集到的新年份/地区延迟可见。
+	// 全部取值都来自数据库，不做任何硬编码。
+	years := s.filterTopValues("vod_year")
+	areas := s.filterTopValues("vod_area")
+	types := s.filterTopValues("type_name")
+
+	// 三个维度共用同一次 COUNT(*)：COUNT(*) 在没有覆盖索引时是全表扫描，
+	// 分三次跑等于白扫三遍 15 万行。
+	var total int64
+	_ = s.DB.QueryRow(`SELECT COUNT(*) FROM ` + s.filterTable()).Scan(&total)
 
 	data := map[string]any{
-		// 年份：按数值倒序（2026 → 2025 → …），不按出现次数排
-		"years": distinct("vod_year", "CAST(v AS INTEGER) DESC, v DESC", 200),
-		// 地区 / 类型：按片量从多到少，数量相同按名称排序
-		"areas": distinct("vod_area", "c DESC, v ASC", 300),
-		"types": distinct("type_name", "c DESC, v ASC", 300),
+		// 年份：按片量取前 20 名后，再按数值倒序展示
+		"years": sortYearsDesc(years),
+		// 地区 / 类型：按片量从多到少（后端已排好，前端直接渲染）
+		"areas": areas,
+		"types": types,
+		// 「其他」桶的影片数：点它 = 该列的值不在前 20 名里
+		"other": map[string]int64{
+			"year": filterOtherCount(years, total),
+			"area": filterOtherCount(areas, total),
+			"type": filterOtherCount(types, total),
+		},
 	}
 	b, _ := json.Marshal(map[string]any{"ok": true, "data": data})
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -75,14 +168,19 @@ func (s *Server) listVideos(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	wd := strings.TrimSpace(q.Get("wd"))
+	// 搜索范围：name=只搜片名 / actor=只搜演员 / all=片名+演员+类型（默认）
+	searchField := q.Get("field")
+	if searchField != "name" && searchField != "actor" {
+		searchField = "all"
+	}
 	srcID := q.Get("source_id")
 	onlyDone := q.Get("filter") == "downloaded"
 	fYear := strings.TrimSpace(q.Get("year"))
 	fArea := strings.TrimSpace(q.Get("area"))
 	fType := strings.TrimSpace(q.Get("type"))
 
-	cacheKey := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%d|%d",
-		wd, srcID, q.Get("filter"), fYear, fArea, fType, page, size)
+	cacheKey := fmt.Sprintf("%s|%s|%s|%s|%s|%s|%s|%d|%d",
+		searchField, wd, srcID, q.Get("filter"), fYear, fArea, fType, page, size)
 	if b, hit := s.cacheGet(cacheKey); hit {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		w.Write(b)
@@ -94,9 +192,18 @@ func (s *Server) listVideos(w http.ResponseWriter, r *http.Request) {
 	where := " WHERE 1=1 "
 	var args []any
 	if wd != "" {
-		where += " AND (vod_name LIKE ? OR vod_actor LIKE ? OR type_name LIKE ?) "
 		like := "%" + wd + "%"
-		args = append(args, like, like, like)
+		switch searchField {
+		case "name":
+			where += " AND vod_name LIKE ? "
+			args = append(args, like)
+		case "actor":
+			where += " AND vod_actor LIKE ? "
+			args = append(args, like)
+		default:
+			where += " AND (vod_name LIKE ? OR vod_actor LIKE ? OR type_name LIKE ?) "
+			args = append(args, like, like, like)
+		}
 	}
 	if srcID != "" {
 		if id, err := strconv.ParseInt(srcID, 10, 64); err == nil && id > 0 {
@@ -109,18 +216,31 @@ func (s *Server) listVideos(w http.ResponseWriter, r *http.Request) {
 			JOIN vod_info y ON y.id = d.vod_id WHERE d.status='done') `
 	}
 	// 筛选：年份 / 国家地区 / 类型（值来自 /api/filters，直接精确匹配走索引）
-	if fYear != "" {
-		where += " AND vod_year = ? "
-		args = append(args, fYear)
+	//
+	// 值为 filterOtherSentinel（"__other__"）时表示「不在前 20 名里」：
+	// 展开成 NOT IN (前 20 个取值)。这是「其他」桶唯一需要特殊处理的地方 ——
+	// 普通取值仍走精确匹配，索引照常命中。
+	applyFilter := func(col, val string) {
+		if val == "" {
+			return
+		}
+		if val == filterOtherSentinel {
+			top := s.filterTopValues(col)
+			if len(top) == 0 {
+				return
+			}
+			where += " AND " + col + " NOT IN (" + strings.TrimSuffix(strings.Repeat("?,", len(top)), ",") + ") "
+			for _, it := range top {
+				args = append(args, it.Value)
+			}
+			return
+		}
+		where += " AND " + col + " = ? "
+		args = append(args, val)
 	}
-	if fArea != "" {
-		where += " AND vod_area = ? "
-		args = append(args, fArea)
-	}
-	if fType != "" {
-		where += " AND type_name = ? "
-		args = append(args, fType)
-	}
+	applyFilter("vod_year", fYear)
+	applyFilter("vod_area", fArea)
+	applyFilter("type_name", fType)
 
 	var total int
 	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM vod_name_agg`+where, args...).Scan(&total); err != nil {

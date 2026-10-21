@@ -1,6 +1,6 @@
 import type {
   ApiResp, CoverFixStatus, Downloads, FavItem, FfmpegStatus, Filters, Progress, ShareInfo, SharePage, Source, SourceTest,
-  SysInfo, UpdateInfo, UpdateStatus, VersionResp, VideoDetail, VideoList, WatchHistoryItem,
+  ConfigData, ConfigInfo, SysInfo, UpdateInfo, UpdateStatus, VersionResp, VideoDetail, VideoList, WatchHistoryItem,
 } from './types'
 
 async function req<T>(path: string, init?: RequestInit): Promise<ApiResp<T>> {
@@ -191,6 +191,25 @@ export const api = {
   // 触发下载：接口立即返回，进度靠 ffmpegStatus() 轮询
   installFfmpeg() {
     return req<FfmpegStatus>('/api/ffmpeg/install', { method: 'POST' })
+  },
+
+  /* ---- 配置文件 ---- */
+  /** 读取配置（原文 + 解析结果 + 低配/标准预设） */
+  configInfo() {
+    return req<ConfigInfo>('/api/config')
+  },
+  /** 保存配置（只传可热更的分组；保存后立即生效） */
+  saveConfig(config: Partial<ConfigData>) {
+    return req<{
+      msg: string
+      restart_required: boolean
+      applied?: string[]
+      saved_at: string
+      config: ConfigData
+    }>('/api/config', {
+      method: 'PUT',
+      body: JSON.stringify({ config }),
+    })
   },
 
   /* ---- 版本与在线更新 ---- */

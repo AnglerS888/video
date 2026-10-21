@@ -288,17 +288,22 @@ onBeforeUnmount(() => {
       </div>
 
       <div v-for="g in groups" :key="g.key" class="card overflow-hidden">
-        <!-- 剧集分组头 -->
-        <div class="flex items-center gap-3 p-3">
-          <input type="checkbox" class="h-5 w-5 shrink-0" :checked="groupPicked(g)" @change="toggleGroupPick(g)" />
+        <!-- 剧集分组头：手机上「标题 / 标签 / 操作」分三行，
+             否则固定宽度的封面 + 复选框 + 收起/删除 按钮会把剧名挤成两三个字（2026-10-20 反馈）。
+             做法：标题独占一行 w-full，标签行可换行，操作按钮挪到右下角；
+             sm 起标题与按钮回到同一行，桌面观感不变。 -->
+        <div class="flex flex-wrap items-start gap-3 p-3">
+          <input type="checkbox" class="mt-2 h-5 w-5 shrink-0" :checked="groupPicked(g)" @change="toggleGroupPick(g)" />
 
           <button class="w-9 shrink-0 overflow-hidden rounded-lg" title="展开/收起" @click="toggleGroup(g)">
             <CoverImg :src="g.pic" :alt="g.name" :retries="2" />
           </button>
 
           <div class="min-w-0 flex-1 cursor-pointer" @click="toggleGroup(g)">
-            <div class="flex items-center gap-2">
-              <span class="truncate text-sm font-medium">{{ g.name }}</span>
+            <!-- 剧名：手机独占整行并允许两行，桌面 truncate -->
+            <div class="line-clamp-2 w-full min-w-0 text-sm font-medium leading-snug sm:truncate">{{ g.name }}</div>
+
+            <div class="mt-1 flex flex-wrap items-center gap-2">
               <span class="chip shrink-0">{{ g.tasks.length }} 集</span>
               <span
                 v-if="srcList(g.tasks).length > 1"
@@ -309,7 +314,7 @@ onBeforeUnmount(() => {
               <span v-if="g.failed" class="shrink-0 text-[11px] text-rose-500">失败 {{ g.failed }}</span>
             </div>
 
-            <div class="mt-1 flex items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
+            <div class="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-slate-500 dark:text-slate-400">
               <template v-if="g.running">
                 <span class="shrink-0">{{ statusText[g.running.status] }} {{ epLabel(g.running) }}</span>
                 <span class="shrink-0 text-amber-500">{{ g.running.percent }}%</span>
@@ -319,7 +324,7 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <div class="flex shrink-0 items-center gap-1.5">
+          <div class="ml-auto flex w-full shrink-0 items-center justify-end gap-1.5 sm:w-auto">
             <button class="btn btn-ghost btn-sm" @click="toggleGroup(g)">
               {{ isOpen(g) ? '收起' : '展开' }}
             </button>
@@ -337,12 +342,21 @@ onBeforeUnmount(() => {
           </div>
         </div>
 
-        <!-- 展开后的每一集 -->
+        <!-- 展开后的每一集。
+             手机端按钮点不到的原因：这一行原来用「一行 flex 塞完」，
+             而失败原因（如「上次运行被中断，点『继续』」）很长，
+             grid 子项默认 min-width:auto 不肯收缩，整行被撑得比卡片还宽，
+             右边的 优先/继续/重试/删 被顶到屏幕外（2026-10-20 用户反馈）。
+             现在的做法（两端都兼顾）：
+             1. 行内 grid 子项和长文本都补 min-w-0，长文案才真的会省略号截断；
+             2. 整行改 flex-wrap —— 宽度不够时按钮组自动换到下一行，
+                手机端按钮容器 w-full + 按钮 flex-1，一行铺满、点区 ≥40px；
+             3. sm 起容器收回 w-auto、按钮 flex-none，桌面仍是原来的一行紧凑排版。 -->
         <div v-if="isOpen(g)" class="border-t border-slate-100 bg-slate-50/60 px-3 py-2 dark:border-white/5 dark:bg-white/[0.02]">
           <div class="grid gap-1.5 sm:grid-cols-2 xl:grid-cols-3">
             <div
               v-for="t in g.tasks" :key="t.id"
-              class="flex items-center gap-2 rounded-lg bg-white px-2 py-1.5 text-xs dark:bg-white/5"
+              class="flex min-w-0 flex-wrap items-center gap-2 rounded-lg bg-white px-2 py-1.5 text-xs dark:bg-white/5"
             >
               <input type="checkbox" class="h-5 w-5 shrink-0" :checked="picked.has(t.id)" @change="toggle(t.id)" />
 
@@ -360,7 +374,7 @@ onBeforeUnmount(() => {
                 <div class="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
                   <span v-if="t.size_mb > 0" class="shrink-0">{{ t.size_mb.toFixed(1) }} MB</span>
                   <span v-if="['downloading', 'queued', 'merging', 'paused'].includes(t.status)" class="shrink-0">{{ t.percent }}%</span>
-                  <span v-if="t.error" class="truncate text-rose-500">{{ t.error }}</span>
+                  <span v-if="t.error" class="min-w-0 truncate text-rose-500" :title="t.error">{{ t.error }}</span>
                 </div>
                 <div v-if="['downloading', 'queued', 'merging', 'paused'].includes(t.status)" class="mt-1">
                   <div class="bar h-1" :class="t.status === 'merging' ? '[&>i]:bg-sky-500' : ''">
@@ -369,18 +383,35 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <div class="flex shrink-0 items-center gap-1">
+              <!-- 操作按钮组：宽度不够就整组换到下一行，永远不会被长文案顶出卡片 -->
+              <div class="ml-auto flex w-full shrink-0 items-center gap-1.5 sm:w-auto">
                 <span v-if="t.priority === 1" class="chip shrink-0 text-amber-600 dark:text-amber-400">优先</span>
                 <button
                   v-if="['queued', 'paused', 'failed'].includes(t.status) && t.priority !== 1"
-                  class="btn btn-ghost btn-sm px-2! py-1!"
+                  class="btn btn-ghost btn-sm min-h-10 min-w-11 flex-1 px-2! sm:flex-none xl:min-h-0 xl:py-1!"
                   title="插队：当前这一集下完后先下这个"
                   @click="act(t, 'priority')"
                 >优先</button>
-                <button v-if="t.status === 'downloading' || t.status === 'queued'" class="btn btn-ghost btn-sm px-2! py-1!" @click="act(t, 'pause')">暂停</button>
-                <button v-else-if="t.status === 'paused'" class="btn btn-ghost btn-sm px-2! py-1!" @click="act(t, 'resume')">继续</button>
-                <button v-else-if="t.status === 'failed'" class="btn btn-ghost btn-sm px-2! py-1!" title="重新排队下载（已下好的分片会复用）" @click="act(t, 'retry')">重试</button>
-                <button class="btn btn-danger btn-sm px-2! py-1!" @click="act(t, 'delete')">删</button>
+                <button
+                  v-if="t.status === 'downloading' || t.status === 'queued'"
+                  class="btn btn-ghost btn-sm min-h-10 min-w-11 flex-1 px-2! sm:flex-none xl:min-h-0 xl:py-1!"
+                  @click="act(t, 'pause')"
+                >暂停</button>
+                <button
+                  v-else-if="t.status === 'paused'"
+                  class="btn btn-ghost btn-sm min-h-10 min-w-11 flex-1 px-2! sm:flex-none xl:min-h-0 xl:py-1!"
+                  @click="act(t, 'resume')"
+                >继续</button>
+                <button
+                  v-else-if="t.status === 'failed'"
+                  class="btn btn-ghost btn-sm min-h-10 min-w-11 flex-1 px-2! sm:flex-none xl:min-h-0 xl:py-1!"
+                  title="重新排队下载（已下好的分片会复用）"
+                  @click="act(t, 'retry')"
+                >重试</button>
+                <button
+                  class="btn btn-danger btn-sm min-h-10 min-w-11 flex-1 px-2! sm:flex-none xl:min-h-0 xl:py-1!"
+                  @click="act(t, 'delete')"
+                >删</button>
               </div>
             </div>
           </div>

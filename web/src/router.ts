@@ -11,7 +11,8 @@ const routes = [
   // 分享页：给收到链接的人打开，隐藏站点导航（meta.bare）
   { path: '/s/:id', name: 'share', component: () => import('./views/ShareView.vue'), meta: { title: '分享', bare: true } },
   { path: '/favorites', name: 'favorites', component: () => import('./views/FavoritesView.vue'), meta: { title: '收藏' } },
-  { path: '/sources', name: 'sources', component: () => import('./views/SourcesView.vue'), meta: { title: '接口' } },
+  { path: '/sources', name: 'sources', component: () => import('./views/SourcesView.vue'), meta: { title: '来源' } },
+  { path: '/api-docs', name: 'apiDocs', component: () => import('./views/ApiDocsView.vue'), meta: { title: '接口' } },
   { path: '/info', name: 'info', component: () => import('./views/InfoView.vue'), meta: { title: '网站信息' } },
   { path: '/:pathMatch(.*)*', redirect: '/' },
 ]

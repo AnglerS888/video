@@ -21,6 +21,9 @@
     background: rgb(148 163 184 / 0.35);
     border-radius: 999px;
   }
+  /* 横向滚动条隐藏但仍可滑（筛选胶囊行用），滚动时给个淡提示 */
+  .no-scrollbar { scrollbar-width: none; -ms-overflow-style: none; }
+  .no-scrollbar::-webkit-scrollbar { width: 0; height: 0; }
 }
 
 /* ---------- 组件层 ---------- */
