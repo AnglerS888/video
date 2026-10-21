@@ -16,6 +16,12 @@
 # 海外或想用官方可覆盖：
 # 例：docker build --build-arg GOLANG_IMAGE=golang:1.26-alpine .
 ARG GOLANG_IMAGE=docker.1panel.live/library/golang:1.26-alpine
+# 运行阶段基座（带 Go 工具链）。⚠️ 必须声明在**第一个 FROM 之前**：
+# 写在两个 FROM 之间的 ARG 只属于上一个阶段，后面的 FROM 看不到，会报
+# "base name (${RUNTIME_IMAGE}) should not be blank"。
+# 想换回精简小镜像（在线更新退回「下载源码+宿主机重建」）：
+#   docker build --build-arg RUNTIME_IMAGE=docker.1panel.live/library/alpine:3.20 .
+ARG RUNTIME_IMAGE=docker.1panel.live/library/golang:1.26-alpine
 
 FROM --platform=$BUILDPLATFORM ${GOLANG_IMAGE} AS builder
 ARG TARGETOS=linux
@@ -64,10 +70,13 @@ RUN set -eux; \
 # 编译用的模块/构建缓存放在数据目录（volume），容器重建不丢，下次更新只增量编译。
 # 介意体积可以切回精简镜像，在线更新会自动退回「下载源码 + 宿主机重建」的老模式：
 #   docker build --build-arg RUNTIME_IMAGE=docker.1panel.live/library/alpine:3.20 .
-# 注意：不要写成 ${GOLANG_IMAGE} 这种「引用另一个 ARG」的默认值——部分 Docker 版本不展开，
-# 会拼出空的 FROM 直接失败。compose / deploy.sh 都会显式传这个同名参数。
-ARG RUNTIME_IMAGE=docker.1panel.live/library/golang:1.26-alpine
+# RUNTIME_IMAGE 已在文件顶部（第一个 FROM 之前）声明，这里直接用；重复声明在这里无效。
 FROM ${RUNTIME_IMAGE}
+# 容器内在线更新时 go build 用的代理：跟随构建参数 GOPROXY（--official 时是 proxy.golang.org），
+# 不传就用国内镜像；运行时也能用 `-e GOPROXY=...` 覆盖。
+ARG GOPROXY=https://goproxy.cn,direct
+ENV GOPROXY=${GOPROXY} \
+    GOTOOLCHAIN=local
 # Alpine 软件源：国内 dl-cdn.alpinelinux.org 很慢（apk add 能跑几分钟），默认用阿里云。
 # 想用官方源：--build-arg APK_MIRROR=
 ARG APK_MIRROR=https://mirrors.aliyun.com/alpine
@@ -98,9 +107,5 @@ EXPOSE 5200
 # 配置全部来自 config.yml（没有命令行参数）；页面可改的项在同目录 ui.yml。
 # 默认把配置放在 volume 上：首次启动自动生成，之后改配置只需改这个文件并重启容器。
 ENV VDL_CONFIG=/app/videodata/config.yml
-# 容器内在线更新要跑 go build：模块走国内代理（海外用 docker run -e GOPROXY=... 覆盖）、
-# 禁止联网换工具链（go.mod 声明 1.26，golang:1.26-alpine 自带的工具链正好够）。
-ENV GOPROXY=https://goproxy.cn,direct \
-    GOTOOLCHAIN=local
 # 日志统一输出到 stdout（单行、带毫秒时间戳），由 docker 的 json-file 驱动负责轮转。
 ENTRYPOINT ["/app/videodl"]

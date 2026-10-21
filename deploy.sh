@@ -449,7 +449,7 @@ build_image() {
     run docker tag "$IMAGE_NAME" "$IMAGE_PREV"
   fi
 
-  info "版本：$ver（构建阶段会拉取 golang / alpine 基础镜像，首次较慢）"
+  info "版本：$ver（构建与运行都基于 golang 镜像，首次拉取较慢；运行镜像自带 Go 工具链）"
   # 仓库探活：主仓库不可达就直接换备用，免得 build 卡在拉取阶段
   if [ -n "$REGISTRY" ] && ! registry_alive "$REGISTRY"; then
     warn "镜像仓库 $REGISTRY 不可达"
