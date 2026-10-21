@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import VideoPlayer from '../components/VideoPlayer.vue'
 import ShareDialog from '../components/ShareDialog.vue'
-import { api } from '../api'
+import { api, playURL } from '../api'
 import { toast } from '../toast'
 import type { DownloadTask } from '../types'
 
@@ -22,6 +22,17 @@ const posMap = ref(new Map<number, number>()) // download_id -> 上次看到第�
 const showShare = ref(false)
 
 const current = computed(() => tasks.value.find((t) => t.id === curID.value) || null)
+
+// 本地播放地址：/play/{id} 需要 ?t=播放令牌（否则 id 可被枚举，整个库都能拖走）。
+// 令牌异步取，取不到时退回不带令牌（服务端会 403，页面会提示）。
+const playAddr = ref('')
+watch(
+  () => current.value?.id,
+  async (id) => {
+    playAddr.value = id ? await playURL(id) : ''
+  },
+  { immediate: true },
+)
 
 // 同名（同一部剧）里已下载的集：按集号排序，同集多份时保留体积最大的那份
 const episodes = computed<DownloadTask[]>(() => {
@@ -138,7 +149,7 @@ watch(tasks, () => {
         <button v-if="current" class="btn btn-primary btn-sm" @click="showShare = true">分享</button>
         <a
           v-if="current"
-          :href="`/play/${current.id}`"
+          :href="playAddr || `/play/${current.id}`"
           target="_blank"
           rel="noopener"
           class="btn btn-ghost btn-sm"
@@ -150,7 +161,7 @@ watch(tasks, () => {
 
     <!-- 播放器 -->
     <section v-if="current && !notFound" class="card overflow-hidden">
-      <VideoPlayer :url="`/play/${current.id}`" :start-at="startAt" @time="onTime" @ended="go(nextEp)" />
+      <VideoPlayer :url="playAddr || `/play/${current.id}`" :start-at="startAt" @time="onTime" @ended="go(nextEp)" />
     </section>
 
     <section v-else-if="!loading" class="card grid place-items-center gap-2 py-16 text-center">

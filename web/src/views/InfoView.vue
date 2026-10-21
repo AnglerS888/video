@@ -45,6 +45,7 @@ const dataParts = computed(() => {
     { label: '封面缓存', value: d.img_bytes, color: 'bg-emerald-500' },
     { label: '视频文件', value: d.video_bytes, color: 'bg-violet-500' },
     { label: 'ffmpeg', value: d.bin_bytes, color: 'bg-slate-400' },
+    { label: '其他文件', value: d.other_bytes, color: 'bg-amber-500' },
   ].filter((x) => x.value > 0)
 })
 
@@ -65,6 +66,15 @@ async function load(fresh = false) {
 // 空闲页占比与可回收空间
 const freelistPct = computed(() => info.value?.data.freelist_pct ?? 0)
 const reclaimable = computed(() => info.value?.data.reclaimable_bytes ?? 0)
+
+// Go 版本提示：编译期版本与运行环境版本不同（容器内自更新后重新编译）时说明差异
+const goVersionTip = computed(() => {
+  const app = info.value?.app
+  if (!app) return ''
+  return app.go_compile && app.go !== app.go_compile
+    ? `编译期 ${app.go_compile}，当前运行环境工具链 ${app.go}`
+    : ''
+})
 
 // 整理数据库：VACUUM 需要独占写锁，服务在整理期间不响应任何请求，
 // 所以先确认、再给出"整理中"状态，轮询也暂停，避免堆一串挂住的请求。
@@ -677,7 +687,10 @@ onBeforeUnmount(() => {
           <div class="title mb-3">运行环境</div>
           <dl class="grid grid-cols-1 gap-x-4 gap-y-2 text-xs sm:grid-cols-2">
             <div class="flex justify-between gap-3"><dt class="muted">程序版本</dt><dd class="font-medium">{{ info.app.version }}</dd></div>
-            <div class="flex justify-between gap-3"><dt class="muted">Go 版本</dt><dd>{{ info.app.go }}</dd></div>
+            <div class="flex justify-between gap-3">
+              <dt class="muted">Go 版本</dt>
+              <dd class="min-w-0 truncate font-medium" :title="goVersionTip">{{ info.app.go }}</dd>
+            </div>
             <div class="flex justify-between gap-3"><dt class="muted">系统 / 架构</dt><dd>{{ info.app.os }} / {{ info.app.arch }}</dd></div>
             <div class="flex justify-between gap-3"><dt class="muted">进程 PID</dt><dd class="tabular-nums">{{ info.app.pid }}</dd></div>
             <div class="flex justify-between gap-3"><dt class="muted">启动时间</dt><dd>{{ info.app.started_at }}</dd></div>

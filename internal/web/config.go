@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -18,6 +20,9 @@ func (s *Server) uiPath() string { return config.UIFilePath(s.DataDir) }
 
 // configInfo 读取当前配置（给「信息」页的表单用）。
 // 页面可改的项来自 <数据目录>/ui.yml，其余项来自 config.yml，这里合并成一份返回。
+//
+// 路径脱敏：只返回文件名与所在目录的最后一段，绝对路径不外泄
+// （服务一旦暴露到公网，路径会暴露用户名与部署结构）。
 func (s *Server) configInfo(w http.ResponseWriter, r *http.Request) {
 	if s.ConfigPath == "" {
 		fail(w, "当前没有可编辑的配置文件（可能是启动参数/默认值）")
@@ -25,14 +30,16 @@ func (s *Server) configInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	raw, err := os.ReadFile(s.ConfigPath)
 	if err != nil {
-		fail(w, "读取配置文件失败："+err.Error())
+		fail(w, "读取配置文件失败："+publicErr(err))
 		return
 	}
 	ok(w, map[string]any{
-		"path":    s.ConfigPath,
-		"ui_path": s.uiPath(),
-		"text":    string(raw),
-		"config":  s.liveConfig(),
+		"path":    maskPath(s.ConfigPath),
+		"ui_path": maskPath(s.uiPath()),
+		// 原文给前端做「贴文本编辑」用：里面可能含 data_dir 的绝对路径，
+		// 这里把它遮掉（前端表单改的是分段字段，不依赖这个绝对路径）。
+		"text":   maskConfigText(string(raw)),
+		"config": s.liveConfig(),
 		// 预设：低配/标准一键套用（表单顶部两个按钮）
 		"presets": map[string]any{
 			"default": config.Defaults(),
@@ -40,6 +47,48 @@ func (s *Server) configInfo(w http.ResponseWriter, r *http.Request) {
 		},
 		"editable": true,
 	})
+}
+
+// maskConfigText 把配置原文里的 data_dir 绝对路径遮掉（只留末两段）。
+// 其余内容原样返回：data_dir 是唯一会暴露部署结构的字段。
+func maskConfigText(text string) string {
+	lines := strings.Split(text, "\n")
+	for i, ln := range lines {
+		trimmed := strings.TrimSpace(ln)
+		if !strings.HasPrefix(trimmed, "data_dir:") {
+			continue
+		}
+		val := strings.TrimSpace(strings.TrimPrefix(trimmed, "data_dir:"))
+		val = strings.Trim(val, `"'`)
+		if val == "" {
+			continue
+		}
+		masked := maskPath(val)
+		prefix := ln[:strings.Index(ln, "data_dir:")+len("data_dir:")]
+		quote := ""
+		if strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(trimmed, "data_dir:")), `"`) {
+			quote = `"`
+		} else if strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(trimmed, "data_dir:")), `'`) {
+			quote = `'`
+		}
+		lines[i] = prefix + " " + quote + masked + quote
+	}
+	return strings.Join(lines, "\n")
+}
+
+// maskPath 把绝对路径压成「…/父目录/文件名」，保留可辨识度但不暴露完整路径。
+func maskPath(p string) string {
+	p = filepath.Clean(p)
+	dir, file := filepath.Split(p)
+	dir = filepath.ToSlash(filepath.Clean(dir))
+	if dir == "" || dir == "." {
+		return file
+	}
+	parts := strings.Split(strings.Trim(dir, "/"), "/")
+	if len(parts) <= 1 {
+		return file
+	}
+	return "…/" + parts[len(parts)-2] + "/" + file
 }
 
 // configBody PUT /api/config 的请求体。
@@ -75,56 +124,60 @@ func (s *Server) saveConfig(w http.ResponseWriter, r *http.Request) {
 	var (
 		cfg       *config.Config
 		needStart bool // 提交里是否包含只能重启生效的项
-		rawText   []byte
 	)
 	if len(req.Config) > 0 {
 		// 表单路径：以「磁盘上的完整配置」为底（含 ui.yml），把提交上来的字段覆盖上去。
-		// 用 config.ApplyPatch 逐字段合并：只传了 db.conns 也不会把 cache_mb 清零。
+		// 用 config.ApplyUIPatch 逐字段合并：只传了 db.conns 也不会把 cache_mb 清零；
+		// 同时拒绝 advanced/data_dir/server/db 这些不该由页面改的字段。
 		cfg = s.liveConfig()
-		if err := config.ApplyPatch(cfg, req.Config); err != nil {
+		if err := config.ApplyUIPatch(cfg, req.Config); err != nil {
 			fail(w, "配置取值有误："+err.Error())
 			return
 		}
 		cfg.Normalize()
 		if err := cfg.Check(); err != nil {
-			fail(w, err.Error())
+			fail(w, publicErr(err))
 			return
 		}
 		needStart = hasRestartOnlyKey(req.Config)
 	} else {
-		// 兼容路径：整段原文，允许注释，解析失败直接拒绝
+		// 兼容路径：整段原文，允许注释，解析失败直接拒绝。
+		// 关键：以「当前磁盘上生效的配置」为基线合并，而不是出厂默认值 ——
+		// 否则用户没在文本里提到的字段会被静默重置回默认（曾经的真 bug）。
 		if strings.TrimSpace(req.Text) == "" {
 			fail(w, "配置内容为空")
 			return
 		}
-		c, err := config.Parse(req.Text)
+		c, err := config.ParseInto(s.liveConfig(), req.Text)
 		if err != nil {
 			fail(w, "配置格式有误："+err.Error())
 			return
 		}
 		cfg = c
-		rawText = []byte(req.Text)
+		cfg.Normalize()
+		if err := cfg.Check(); err != nil {
+			fail(w, publicErr(err))
+			return
+		}
 		needStart = true // 整段原文无从判断改了什么，一律按需要重启处理
 	}
 
 	// 页面可改的项：写数据目录的 ui.yml（带 .bak 备份）
 	if err := s.writeUIFile(cfg); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
-	// 需要重启的项：只有确实带上了才动 config.yml，避免页面每次保存都重写它
+	// 需要重启的项：只有确实带上了才动 config.yml，避免页面每次保存都重写它。
+	// 注意：一律用 config.Marshal(合并后的完整配置) 写，绝不写用户原文 ——
+	// 原文里没出现的 server/data_dir/log_level/db 会整段消失（重启后数据目录跑偏）。
 	if needStart {
-		text := rawText
-		if text == nil {
-			b, err := config.Marshal(cfg)
-			if err != nil {
-				fail(w, "生成配置失败："+err.Error())
-				return
-			}
-			text = b
+		text, err := config.Marshal(cfg)
+		if err != nil {
+			fail(w, "生成配置失败："+err.Error())
+			return
 		}
 		if err := s.writeConfig(text); err != nil {
-			fail(w, err.Error())
+			fail(w, publicErr(err))
 			return
 		}
 	}
@@ -203,13 +256,34 @@ func (s *Server) writeConfig(b []byte) error {
 	if old, e := os.ReadFile(s.ConfigPath); e == nil {
 		_ = os.WriteFile(s.ConfigPath+".bak", old, 0o644)
 	}
-	tmp := s.ConfigPath + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	// 唯一临时名 + fsync + 改名：并发保存不会互相截断，掉电也不会得到半截/0 字节配置
+	tmp, err := os.CreateTemp(filepath.Dir(s.ConfigPath), filepath.Base(s.ConfigPath)+".tmp-*")
+	if err != nil {
 		return fmt.Errorf("写入临时文件失败：%w", err)
 	}
-	if err := os.Rename(tmp, s.ConfigPath); err != nil {
-		_ = os.Remove(tmp)
+	name := tmp.Name()
+	defer func() { _ = os.Remove(name) }()
+	if _, err := tmp.Write(b); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("写入临时文件失败：%w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("刷盘失败：%w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("关闭临时文件失败：%w", err)
+	}
+	// Windows 上目标存在时 Rename 会失败，先删旧的
+	if _, err := os.Stat(s.ConfigPath); err == nil && runtime.GOOS == "windows" {
+		_ = os.Remove(s.ConfigPath)
+	}
+	if err := os.Rename(name, s.ConfigPath); err != nil {
 		return fmt.Errorf("保存配置失败：%w", err)
+	}
+	if d, err := os.Open(filepath.Dir(s.ConfigPath)); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }

@@ -103,10 +103,10 @@ func RefreshNameAgg(d *sql.DB, names []string) {
 		return
 	}
 	// 1) 清掉已不存在的剧名（源站删除条目时）
-	delArgs := append([]any{}, args...)
-	delArgs = append(delArgs, args...)
+	// 旧实现给这条语句传了 2N 个参数而 SQL 里只有 N 个占位符，
+	// 多余参数被驱动悄悄忽略（行为依赖驱动实现），这里只传一份。
 	if _, err := tx.Exec(`DELETE FROM vod_name_agg WHERE vod_name IN (`+ph+`)
-		AND NOT EXISTS (SELECT 1 FROM vod_info v WHERE v.vod_name = vod_name_agg.vod_name)`, delArgs...); err != nil {
+		AND NOT EXISTS (SELECT 1 FROM vod_info v WHERE v.vod_name = vod_name_agg.vod_name)`, args...); err != nil {
 		tx.Rollback()
 		logx.Printf("[db] 刷新聚合表失败(delete): %v", err)
 		return
@@ -125,5 +125,7 @@ func RefreshNameAgg(d *sql.DB, names []string) {
 	}
 	if err := tx.Commit(); err != nil {
 		logx.Printf("[db] 刷新聚合表提交失败: %v", err)
+		// 提交失败不回滚的话，连接会带着未结束事务回到池里，后续写持续 SQLITE_BUSY
+		_ = tx.Rollback()
 	}
 }

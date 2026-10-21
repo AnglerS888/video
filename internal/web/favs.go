@@ -15,7 +15,7 @@ func (s *Server) listFavs(w http.ResponseWriter, r *http.Request) {
 		FROM vod_fav f LEFT JOIN vod_name_agg a ON a.vod_name = f.vod_name
 		ORDER BY f.created_at DESC`)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	defer rows.Close()
@@ -54,16 +54,26 @@ func (s *Server) addFav(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name := strings.TrimSpace(in.VodName)
-	var remarks, updated string
-	s.DB.QueryRow(`SELECT COALESCE(vod_remarks,''), COALESCE(updated_at,'') FROM vod_name_agg WHERE vod_name=?`, name).
-		Scan(&remarks, &updated)
+	remarks, updated := s.favSnapshot(name)
 	if _, err := s.DB.Exec(`INSERT INTO vod_fav(vod_name, seen_remarks, seen_updated_at) VALUES(?,?,?)
 		ON CONFLICT(vod_name) DO UPDATE SET seen_remarks=excluded.seen_remarks, seen_updated_at=excluded.seen_updated_at`,
 		name, remarks, updated); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, "已收藏")
+}
+
+// favSnapshot 取某剧的当前更新状态（用于「有更新」提示的快照）。
+// 查不到（剧被删/聚合表还没建）时返回空串 —— 注意必须检查错误：
+// 旧实现忽略 Scan 的错误，查不到时快照为空 → 收藏列表永远显示「有更新」红点。
+func (s *Server) favSnapshot(name string) (remarks, updated string) {
+	err := s.DB.QueryRow(`SELECT COALESCE(vod_remarks,''), COALESCE(updated_at,'') FROM vod_name_agg WHERE vod_name=?`, name).
+		Scan(&remarks, &updated)
+	if err != nil {
+		return "", ""
+	}
+	return remarks, updated
 }
 
 func (s *Server) delFav(w http.ResponseWriter, r *http.Request) {
@@ -73,7 +83,7 @@ func (s *Server) delFav(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := s.DB.Exec(`DELETE FROM vod_fav WHERE vod_name=?`, name); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, "已取消收藏")
@@ -86,12 +96,10 @@ func (s *Server) seenFav(w http.ResponseWriter, r *http.Request) {
 		fail(w, "缺少 name")
 		return
 	}
-	var remarks, updated string
-	s.DB.QueryRow(`SELECT COALESCE(vod_remarks,''), COALESCE(updated_at,'') FROM vod_name_agg WHERE vod_name=?`, name).
-		Scan(&remarks, &updated)
+	remarks, updated := s.favSnapshot(name)
 	if _, err := s.DB.Exec(`UPDATE vod_fav SET seen_remarks=?, seen_updated_at=? WHERE vod_name=?`,
 		remarks, updated, name); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, nil)

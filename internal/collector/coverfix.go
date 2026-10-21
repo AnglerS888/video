@@ -167,38 +167,52 @@ func (c *Collector) runCoverSupplement(stop <-chan struct{}) {
 		coverProxyBase(), coverProxyGapMin, coverProxyGapMax)
 
 	// ---- 1. 扫描全库封面地址 ----
-	// DB 只有 1 个连接：必须把结果集读完并关闭，之后才能做别的查询/耗时操作
-	rows, err := c.DB.Query(`SELECT vod_name, vod_pic FROM vod_info WHERE vod_pic<>''`)
-	if err != nil {
-		coverFixUpdate(func(st *CoverFixStatus) {
-			st.Phase = "failed"
-			st.LastError = "读取影片表失败: " + err.Error()
-			st.Message = "读取影片表失败"
-		})
-		return
-	}
+	// 分批扫（keyset 分页，按 id 递增），不要一次把整表结果集攥在手里：
+	//   - 长读事务会阻止 WAL checkpoint → WAL 文件一直涨（磁盘被吃满）
+	//   - 扫描期间占着 1/4 的连接池（默认 4 个连接），采集/下载的写会被挤住
 	byName := map[string][]string{} // 同剧（同名）→ 所有封面地址
 	urlName := map[string]string{}  // 封面地址 → 剧名（去重）
 	videos := 0
-	for rows.Next() {
-		var name, pic string
-		if err := rows.Scan(&name, &pic); err != nil {
-			continue
+	lastID := int64(0)
+	for {
+		rows, err := c.DB.Query(`SELECT id, vod_name, vod_pic FROM vod_info
+			WHERE vod_pic<>'' AND id>? ORDER BY id LIMIT 5000`, lastID)
+		if err != nil {
+			coverFixUpdate(func(st *CoverFixStatus) {
+				st.Phase = "failed"
+				st.LastError = "读取影片表失败: " + err.Error()
+				st.Message = "读取影片表失败"
+			})
+			return
 		}
-		videos++
-		pic = strings.TrimSpace(pic)
-		if pic == "" || (!strings.HasPrefix(pic, "http://") && !strings.HasPrefix(pic, "https://")) {
-			continue
+		batch := 0
+		for rows.Next() {
+			var id int64
+			var name, pic string
+			if err := rows.Scan(&id, &name, &pic); err != nil {
+				continue
+			}
+			lastID = id
+			batch++
+			videos++
+			pic = strings.TrimSpace(pic)
+			if pic == "" || (!strings.HasPrefix(pic, "http://") && !strings.HasPrefix(pic, "https://")) {
+				continue
+			}
+			if _, dup := urlName[pic]; dup {
+				continue
+			}
+			urlName[pic] = name
+			byName[name] = append(byName[name], pic)
 		}
-		if _, dup := urlName[pic]; dup {
-			continue
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			logx.Warnf("[coverfix] 扫描影片表出错: %v", err)
+			break
 		}
-		urlName[pic] = name
-		byName[name] = append(byName[name], pic)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		logx.Warnf("[coverfix] 扫描影片表出错: %v", err)
+		if batch < 5000 {
+			break // 扫完了
+		}
 	}
 
 	coverFixUpdate(func(st *CoverFixStatus) {

@@ -33,7 +33,7 @@ func (s *Server) saveWatchProgress(w http.ResponseWriter, r *http.Request) {
 			finished=excluded.finished, updated_at=CURRENT_TIMESTAMP`,
 		in.DownloadID, in.Position, in.Duration, finished)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, map[string]any{"finished": finished})
@@ -49,7 +49,7 @@ func (s *Server) watchHistory(w http.ResponseWriter, r *http.Request) {
 		WHERE d.status='done'
 		ORDER BY h.updated_at DESC LIMIT 200`)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	defer rows.Close()
@@ -79,7 +79,7 @@ func (s *Server) delWatchHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.DB.Exec(`DELETE FROM vod_watch_history WHERE download_id=?`, id)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
@@ -93,7 +93,7 @@ func (s *Server) delWatchHistory(w http.ResponseWriter, r *http.Request) {
 func (s *Server) clearWatchHistory(w http.ResponseWriter, r *http.Request) {
 	res, err := s.DB.Exec(`DELETE FROM vod_watch_history`)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	n, _ := res.RowsAffected()

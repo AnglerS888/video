@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -12,9 +13,13 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	// 把 IANA 时区库编进二进制（约 450KB）：运行镜像不再需要 apk 装 tzdata，
+	// TZ=Asia/Shanghai 在精简/无 tzdata 的容器里也能正确解析（2026-10-21 起）
+	_ "time/tzdata"
 
 	"videoDownLoad/internal/collector"
 	"videoDownLoad/internal/config"
@@ -163,6 +168,28 @@ func main() {
 	downloader.SetTranscodeOptions(cfg.FFmpeg.Threads, cfg.FFmpeg.Reencode, cfg.FFmpeg.Verify)
 	downloader.SetSegmentBudget(segBudget)
 
+	// 容器里 docker stop / 重启会先发 SIGTERM：优雅退出，避免 SQLite 留下 -wal 尾巴、
+	// 下载中的分片文件被硬切断（下次启动会按"已暂停"恢复）。
+	// 提前创建（在起 worker 之前）：信号注册晚于 worker 启动的话，
+	// 启动阶段收到 Ctrl-C 就没有退路，只能被硬杀。
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	// 后台 goroutine 的停止信号：关库之前先让它们停下来（否则它们会访问已关闭的连接池）
+	bgStop := make(chan struct{})
+	var bgStopOnce sync.Once
+	stopBG := func() { bgStopOnce.Do(func() { close(bgStop) }) }
+	defer stopBG()
+
+	// 端口预检：先探一下端口能不能 bind。
+	// 原来直接 ListenAndServe，端口被占时是走到最后一步才 Fatalf，
+	// 那时库已经建好、迁移也跑过（可能触发全库 VACUUM），白跑一遍还留下 -wal/-shm。
+	ln, lerr := net.Listen("tcp", cfg.Server.Addr)
+	if lerr != nil {
+		logx.Fatalf("[startup] 监听 %s 失败: %v（端口可能已被占用）", cfg.Server.Addr, lerr)
+	}
+	defer func() { _ = ln.Close() }()
+
 	dbPath := filepath.Join(dataDir, "videodl.db")
 	database := db.InitDB(dbPath, db.Options{
 		CacheMB:  cfg.DB.CacheMB,
@@ -170,12 +197,24 @@ func main() {
 		MmapMB:   cfg.DB.MmapMB,
 		Conns:    cfg.DB.Conns,
 	})
+	// 关库兜底：后面任何一步 Fatalf 退出，defer 也能把 SQLite 正常关掉（不留 -wal/-shm）
+	defer func() {
+		if err := database.Close(); err != nil {
+			logx.Warnf("[shutdown] 关闭数据库失败: %v", err)
+		} else {
+			logx.Infof("[shutdown] 数据库已关闭")
+		}
+	}()
 	logx.Infof("[db] 每连接页缓存 %d MiB × %d 连接，mmap %d MiB，自动整理阈值 空闲页>%d%%",
 		cfg.DB.CacheMB, cfg.DB.Conns, cfg.DB.MmapMB, cfg.DB.VacuumPct)
 	col := collector.New(database)
 	col.SetWorkers(cfg.Collect.Pages, cfg.Collect.Sources)
 	// 封面压缩图目录：同步时预取到 data/img，页面访问直接读本地
 	imgDir := filepath.Join(dataDir, "img")
+	// 目录要在起封面 worker 之前建好（worker 一启动就可能往里写）
+	if err := os.MkdirAll(imgDir, 0o755); err != nil {
+		logx.Fatalf("[collect] 创建封面目录失败: %v", err)
+	}
 	col.CoverDir = imgDir
 	collector.SetCoverConcurrency(cfg.Cover.Concurrency)
 	if cfg.Cover.ImgProxy != "" {
@@ -183,9 +222,6 @@ func main() {
 	}
 	logx.Infof("[cover] 封面缓存目录 %s（并发 %d，代理=%s）", imgDir, cfg.Cover.Concurrency, orNo(cfg.Cover.ImgProxy))
 	col.StartCoverWorkers(cfg.Cover.Workers)
-	if err := os.MkdirAll(imgDir, 0o755); err != nil {
-		logx.Fatalf("[collect] 创建封面目录失败: %v", err)
-	}
 	logx.Infof("[collect] 并发配置：每接口 %d 个分页线程，最多同时采集 %d 个接口", col.PageWorkersCount(), col.SourceWorkersCount())
 	// 下载任务并发，文件保存到 data/videos
 	collector.SetDownloadConcurrency(cfg.Download.SegConcurrency)
@@ -256,21 +292,15 @@ func main() {
 		_ = database.QueryRow(`SELECT COUNT(*) FROM vod_download
 			WHERE status IN ('queued','downloading','merging','paused')`).Scan(&active)
 		return active > 0
-	})
+	}, bgStop)
 	// 预热播放地址计数（226 万行的 COUNT 要走 1s+），别让第一个访问者撞上
-	db.WarmupCounts(database)
+	db.WarmupCounts(database, bgStop)
 
 	// 在线更新器：更新源固定为 Gitee（anglers/video@master），配置里不再保留 update 段。
 	// 匿名下载偶尔被 Gitee 要求验证，可用环境变量 VDL_UPDATE_TOKEN 提供私人令牌。
 	up := updater.New(dataDir, version.Repo, version.Branch, os.Getenv("VDL_UPDATE_TOKEN"))
 	logx.Infof("[update] 在线更新：gitee // %s（分支 %s），运行方式 %s",
 		version.Repo, version.Branch, version.ModeText())
-
-	// 容器里 docker stop / 重启会先发 SIGTERM：优雅退出，避免 SQLite 留下 -wal 尾巴、
-	// 下载中的分片文件被硬切断（下次启动会按"已暂停"恢复）。
-	// 提前创建：更新接口「重启并应用」也复用同一个 stop，走同一条优雅退出路径。
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	srv := &web.Server{
 		DB: database, Col: col, DataDir: dataDir,
@@ -291,8 +321,8 @@ func main() {
 
 	go func() {
 		<-ctx.Done()
-		logx.Infof("[shutdown] 收到退出信号，停止接收新请求（最多等待 20s）…")
-		sctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		logx.Infof("[shutdown] 收到退出信号，停止接收新请求（最多等待 15s）…")
+		sctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if err := httpSrv.Shutdown(sctx); err != nil {
 			logx.Warnf("[shutdown] HTTP 服务关闭超时: %v", err)
@@ -300,17 +330,19 @@ func main() {
 	}()
 
 	logx.Infof("视频采集服务已启动: http://localhost%s", cfg.Server.Addr)
-	if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	// 服务真的起来了 → 清掉回滚哨兵（说明这次自更新成功，没有崩）
+	updater.MarkHealthy(dataDir)
+	// 用前面预检时建好的 listener：端口占用在启动早期就暴露出来，
+	// 不会再等到 ListenAndServe 才报错（那时库已经建好、迁移也跑过了）。
+	if err := httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logx.Fatalf("[startup] 监听失败: %v", err)
 	}
 
+	// 退出顺序：先停后台 goroutine（不再访问 DB）→ 再停调度器 → 最后关库（defer 里做）。
+	// 反过来（先关库）会让还在跑的 goroutine 拿到 "sql: database is closed"。
+	stopBG()
 	sch.Stop()
-	if err := database.Close(); err != nil {
-		logx.Warnf("[shutdown] 关闭数据库失败: %v", err)
-	} else {
-		logx.Infof("[shutdown] 数据库已关闭，进程退出")
-	}
-
+	logx.Infof("[shutdown] 进程退出")
 }
 
 // orDash 空字符串时显示 "-"

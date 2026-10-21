@@ -10,6 +10,7 @@ package logx
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -71,12 +72,31 @@ func oneLine(s string) string {
 	return r.Replace(s)
 }
 
+// ansiRe 匹配 ANSI 转义序列（CSI 序列 + OSC 序列）。
+// 片名、备注、ffmpeg 的 stderr 都可能带 ESC 序列：
+// 不清掉的话可以伪造日志行（\r 回车把内容覆盖成别的样子）、
+// 或用 ESC[2J 清屏 —— 运维看日志时会被骗。
+var ansiRe = regexp.MustCompile("\x1b\\[[0-9;?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)|\x1b[@-Z\\\\-_]")
+
+// stripANSI 去掉所有 ANSI 转义序列
+func stripANSI(s string) string {
+	if !strings.ContainsRune(s, '\x1b') {
+		return s
+	}
+	return ansiRe.ReplaceAllString(s, "")
+}
+
+// sanitize 清洗要写进日志的文本：去 ANSI 转义 + 压成一行
+func sanitize(s string) string {
+	return oneLine(stripANSI(s))
+}
+
 func output(l Level, msg string) {
 	if !Enabled(l) {
 		return
 	}
 	line := fmt.Sprintf("%s %-*s %s\n",
-		time.Now().Format("2006-01-02 15:04:05.000"), width, levelName[l], oneLine(msg))
+		time.Now().Format("2006-01-02 15:04:05.000"), width, levelName[l], sanitize(msg))
 	mu.Lock()
 	_, _ = os.Stdout.WriteString(line)
 	mu.Unlock()

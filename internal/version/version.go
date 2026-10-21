@@ -87,10 +87,26 @@ func InDocker() bool {
 	if _, err := os.Stat("/.dockerenv"); err == nil {
 		return true
 	}
-	// 部分容器运行时没有 /.dockerenv，退而看 cgroup
+	// 部分容器运行时没有 /.dockerenv，退而看 cgroup。
+	//
+	// cgroup v2：/proc/1/cgroup 内容形如 "0::/"（一条统一的层级行），
+	// 里面**没有** docker/kubepods/containerd 字样 —— 只按关键字判会误判成"不是容器"，
+	// 于是 K8s / containerd 里自更新被静默禁用。
+	// 判定：文件里有 v2 的 "0::" 行 → 认为在容器里（v2 统一层级只在容器里出现）。
 	if b, err := os.ReadFile("/proc/1/cgroup"); err == nil {
 		s := string(b)
-		return strings.Contains(s, "docker") || strings.Contains(s, "kubepods") || strings.Contains(s, "containerd")
+		if strings.Contains(s, "docker") || strings.Contains(s, "kubepods") || strings.Contains(s, "containerd") {
+			return true
+		}
+		if strings.Contains(s, "0::") {
+			return true
+		}
+	}
+	// 兜底：cgroup v2 的根挂载点在容器里通常是 /sys/fs/cgroup 且只读
+	if st, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err == nil {
+		if st.Mode().Perm()&0o200 == 0 { // 不可写 = 只读挂载 = 容器特征
+			return true
+		}
 	}
 	return false
 }

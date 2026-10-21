@@ -1,7 +1,6 @@
 package web
 
 import (
-	"fmt"
 	"net/http"
 	"os"
 	"runtime"
@@ -10,6 +9,7 @@ import (
 	"videoDownLoad/internal/collector"
 	db "videoDownLoad/internal/db"
 	"videoDownLoad/internal/ffmpeg"
+	"videoDownLoad/internal/logx"
 	"videoDownLoad/internal/sysinfo"
 )
 
@@ -48,6 +48,9 @@ func (s *Server) sysInfo(w http.ResponseWriter, r *http.Request) {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 
+	// Go 版本：runtime.Version() 是编译期版本，运行环境的工具链版本另探（容器内自更新后两者会不同）
+	goVer, goCompile := sysinfo.GoVersionInfo()
+
 	// ffmpeg 状态：ready/missing/downloading/failed，前端据此显示下载按钮与进度
 	coverOK, coverFail, coverErr := collector.CoverStats()
 
@@ -61,7 +64,7 @@ func (s *Server) sysInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	data := map[string]any{
 		"app": map[string]any{
-			"version": s.Version, "go": runtime.Version(),
+			"version": s.Version, "go": goVer, "go_compile": goCompile,
 			"os": runtime.GOOS, "arch": runtime.GOARCH,
 			"pid": os.Getpid(), "uptime_sec": uptime,
 			"started_at":  s.StartedAt.Format("2006-01-02 15:04:05"),
@@ -72,7 +75,7 @@ func (s *Server) sysInfo(w http.ResponseWriter, r *http.Request) {
 			"dir": s.DataDir, "db_bytes": du.DBBytes, "img_bytes": du.ImgBytes,
 			"img_count": du.ImgCount, "video_bytes": du.VideoBytes,
 			"backup_bytes": du.BackupBytes, "bin_bytes": du.BinBytes,
-			"total_bytes": du.TotalBytes, "partial": du.Partial,
+			"total_bytes": du.TotalBytes, "other_bytes": du.OtherBytes, "partial": du.Partial,
 			"freelist_pct": fl.FreeRatio(), "reclaimable_bytes": reclaim,
 			// 空闲页占比达到自动整理阈值时提示用户（自动整理只在服务空闲时跑，等不到可以手动点）
 			"vacuum_pct":     s.VacuumPct,
@@ -119,7 +122,7 @@ func (s *Server) vacuumDB(w http.ResponseWriter, r *http.Request) {
 	}
 	freed, err := db.Vacuum(s.DB)
 	if err != nil {
-		fail(w, "整理失败: "+err.Error())
+		fail(w, "整理失败: "+publicErr(err))
 		return
 	}
 	db.InvalidatePlaysCount()
@@ -139,7 +142,7 @@ func (s *Server) coverFixStatus(w http.ResponseWriter, r *http.Request) {
 // startCoverFix 启动封面补充：检查全库封面缓存，同剧多源时用其它源的封面补齐拉不到的
 func (s *Server) startCoverFix(w http.ResponseWriter, r *http.Request) {
 	if err := s.Col.StartCoverSupplement(); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, collector.CoverSupplementStatus())
@@ -157,9 +160,11 @@ func (s *Server) stopCoverFix(w http.ResponseWriter, r *http.Request) {
 // healthz 容器健康检查：SELECT 1 探活即可，避免健康检查把 CPU 花在全表 COUNT 上
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 	if err := s.DB.QueryRow(`SELECT 1`).Scan(new(int)); err != nil {
+		// 只回固定文案：DB 错误原文会带表名/SQLite 内部信息
+		logx.Warnf("[healthz] 数据库探活失败: %v", err)
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		fmt.Fprintf(w, "db error: %v\n", err)
+		_, _ = w.Write([]byte("db error\n"))
 		return
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -176,7 +181,7 @@ func (s *Server) ffmpegStatus(w http.ResponseWriter, r *http.Request) {
 // 下载完成后由 ffmpeg 包的回调把新路径交给下载器与图片处理器，无需重启。
 func (s *Server) installFFmpeg(w http.ResponseWriter, r *http.Request) {
 	if err := ffmpeg.StartInstall(s.DataDir); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	// 页面缓存里存的还是 missing，立刻失效，前端下一次轮询才能看到「下载中」

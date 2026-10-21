@@ -85,6 +85,14 @@ var fallbackURLs = map[string][]string{
 // 低于 1MB 的文件一律当作坏包（真的 ffmpeg 静态二进制约 50~80MB）
 const minBinSize = 1 << 20
 
+// maxBinBytes 解压后二进制允许写入的最大字节数（约 300MB）。
+//
+// gzip 是压缩流：一个几 KB 的压缩包可以膨胀出几个 GB（gzip 炸弹）。
+// 原来的 io.Copy(f, gr) 没有任何上限，镜像被投毒 / 响应被劫持时
+// 就能把整个数据卷写满，容器磁盘被占死后服务直接不可用。
+// 这里给解压写入加上硬上限，超了立刻删临时文件并报错。
+const maxBinBytes = 300 << 20
+
 var (
 	mu          sync.Mutex
 	installing  bool
@@ -95,7 +103,19 @@ var (
 	onReady     func(string)
 	versionMu   sync.Mutex
 	versionByOK = map[string]string{}
+
+	// smokeMu / smokeByOK 缓存"这个文件是不是一个能正常运行的 ffmpeg"的冒烟结果。
+	// key 里带了大小和修改时间：文件一旦被替换，缓存自动失效，不会一直认旧结果。
+	smokeMu   sync.Mutex
+	smokeByOK = map[binKey]bool{}
 )
+
+// binKey 标识一个待冒烟校验的二进制：路径 + 大小 + 修改时间。
+type binKey struct {
+	path  string
+	size  int64
+	mtime int64
+}
 
 // SetOnReady 注册下载成功后的回调：main 里用它重新把路径交给下载器与图片处理器
 // （启动时 ffmpeg 缺失，这两个模块拿到的是空路径）。
@@ -121,21 +141,28 @@ func DownloadURL() string { return packURLs[platformKey()] }
 // dataDir 为空时只看环境变量与系统 PATH。
 func Resolve(dataDir string) (string, string, error) {
 	// 1) 显式环境变量
+	//    这里不再"文件存在就用"：VDL_FFMPEG 指向的东西同样会被 exec 执行，
+	//    至少要能跑起来并且真的是 ffmpeg 才认（否则报错信息会很难懂）。
 	if p := strings.TrimSpace(os.Getenv("VDL_FFMPEG")); p != "" {
-		if fi, err := os.Stat(p); err == nil && !fi.IsDir() && fi.Size() > 0 {
+		if usableBin(p) {
 			return p, "env", nil
 		}
 	}
 
 	// 2) 数据目录里下载/安装过的那份
+	//    <data>/bin 在宿主机可写卷上，谁都能往里塞文件：
+	//    只按"大小 > 1MB"判定的话，放一个任意 >1MB 的文件下次就会被
+	//    当成 ffmpeg 交给 exec 执行（容器内可能还是 root）。
+	//    所以要"可执行位 + 真跑一次 -version"才算数。
 	if dataDir != "" {
 		p := filepath.Join(dataDir, "bin", exeName())
-		if fi, err := os.Stat(p); err == nil && fi.Size() > minBinSize {
+		if usableBin(p) {
 			return p, "cache", nil
 		}
 	}
 
 	// 3) 系统 PATH（以及常见安装目录）
+	//    这两个来源由系统/包管理器管理，可信度高于数据目录，维持原判定方式。
 	if p, err := exec.LookPath("ffmpeg"); err == nil {
 		return p, "system", nil
 	}
@@ -146,6 +173,42 @@ func Resolve(dataDir string) (string, string, error) {
 	}
 
 	return "", "", fmt.Errorf("未检测到 ffmpeg，可在此页点击下载（%s）", platformKey())
+}
+
+// usableBin 判断一个路径上的文件能否当作 ffmpeg 使用：
+// 大小合理 + （类 Unix 上）有可执行位 + 真跑一次 `-version` 冒烟通过。
+//
+// 冒烟是本地执行，不联网，保持"解析过程绝不联网"的约定。
+// 结果按 路径+大小+修改时间 缓存，避免每次 Resolve 都启动一个进程。
+func usableBin(p string) bool {
+	fi, err := os.Stat(p)
+	if err != nil || fi.IsDir() {
+		return false
+	}
+	if fi.Size() < minBinSize {
+		return false
+	}
+	// 类 Unix 上必须有可执行位：数据目录可能被挂成可写卷，
+	// 没有执行位也说明这不是一份正常的二进制。
+	if runtime.GOOS != "windows" && fi.Mode().Perm()&0o111 == 0 {
+		return false
+	}
+	key := binKey{path: p, size: fi.Size(), mtime: fi.ModTime().UnixNano()}
+	smokeMu.Lock()
+	ok, cached := smokeByOK[key]
+	smokeMu.Unlock()
+	if cached {
+		return ok
+	}
+	ok = verify(p) == nil
+	smokeMu.Lock()
+	// 缓存条目上限保护：正常只有 env/cache 几个路径，不会无限增长
+	if len(smokeByOK) > 64 {
+		smokeByOK = map[binKey]bool{}
+	}
+	smokeByOK[key] = ok
+	smokeMu.Unlock()
+	return ok
 }
 
 // Ensure 兼容旧调用：只要路径，失败给 error
@@ -258,30 +321,54 @@ func StartInstall(dataDir string) error {
 }
 
 func runInstall(dataDir string) {
-	path, err := downloadAndExtract(dataDir)
+	// 这个 goroutine 里任何 panic 都会跳过下面的 installing = false，
+	// 状态机就永远停在 downloading，前端按钮再也点不动、也看不到错误。
+	// 所以这里用 defer 统一兜底：无论是正常结束还是 panic，
+	// 都要复位 installing 并把错误落到 lastErr 上。
+	var (
+		path string
+		err  error
+	)
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("安装 ffmpeg 时内部错误: %v", r)
+		}
+		mu.Lock()
+		installing = false
+		if err != nil {
+			lastErr = err.Error()
+		} else {
+			installedBy = path
+			lastErr = ""
+		}
+		cb := onReady
+		mu.Unlock()
 
-	mu.Lock()
-	installing = false
-	if err != nil {
-		lastErr = err.Error()
-	} else {
-		installedBy = path
-		lastErr = ""
-	}
-	cb := onReady
-	mu.Unlock()
+		if err != nil {
+			// 失败时把进度归零，前端不要停在半截的进度条上
+			setProgress(0, 0)
+			return
+		}
+		// 下载成功：清掉版本缓存，重新读一次真实版本
+		versionMu.Lock()
+		delete(versionByOK, path)
+		versionMu.Unlock()
+		// 新装好的文件大小/修改时间都变了，冒烟缓存的 key 也随之失效；
+		// 这里顺手把同路径的旧条目删掉，避免缓存表里留垃圾
+		smokeMu.Lock()
+		for k := range smokeByOK {
+			if k.path == path {
+				delete(smokeByOK, k)
+			}
+		}
+		smokeMu.Unlock()
 
-	if err != nil {
-		return
-	}
-	// 下载成功：清掉版本缓存，重新读一次真实版本
-	versionMu.Lock()
-	delete(versionByOK, path)
-	versionMu.Unlock()
+		if cb != nil {
+			cb(path)
+		}
+	}()
 
-	if cb != nil {
-		cb(path)
-	}
+	path, err = downloadAndExtract(dataDir)
 }
 
 func setProgress(read, total int64) {
@@ -346,13 +433,26 @@ func fetchOne(url, binDir, dst string) (string, error) {
 	if total < 0 {
 		total = 0
 	}
+	// 压缩态的 Content-Length 也要设上限：
+	// 一来避免镜像谎报超大长度把进度条搞乱，二来提前挡掉明显异常的大响应。
+	if total > maxBinBytes {
+		return "", fmt.Errorf("下载内容异常（压缩包 %d 字节，超过上限 %d）", total, maxBinBytes)
+	}
 	setProgress(0, total)
 
-	tmp := filepath.Join(binDir, exeName()+".tmp")
-	f, err := os.Create(tmp)
-	if err != nil {
-		return "", fmt.Errorf("写入 %s 失败: %w", tmp, err)
+	// 临时文件名带随机后缀：固定名（ffmpeg.tmp）在同一卷上跑两个实例会互相覆盖，
+	// 一个进程正在写、另一个进程改名，出来的文件就是坏的。
+	// Windows 上额外保留 .exe 后缀：临时文件后面要直接 exec 校验，
+	// 带 .exe 后缀可以避开 Windows 对可执行文件后缀的挑剔。
+	tmpPattern := exeName() + ".tmp-*"
+	if runtime.GOOS == "windows" {
+		tmpPattern = exeName() + ".tmp-*.exe"
 	}
+	f, err := os.CreateTemp(binDir, tmpPattern)
+	if err != nil {
+		return "", fmt.Errorf("写入 %s 失败: %w", binDir, err)
+	}
+	tmp := f.Name()
 	// gzip 解压 + 进度统计（进度按压缩包已读字节算，和 Content-Length 对得上）
 	gr, err := gzip.NewReader(&progressReader{r: resp.Body, total: total})
 	if err != nil {
@@ -360,7 +460,10 @@ func fetchOne(url, binDir, dst string) (string, error) {
 		os.Remove(tmp)
 		return "", fmt.Errorf("下载内容不是有效的 gzip 包: %w", err)
 	}
-	n, err := io.Copy(f, gr)
+	// 解压写入必须限流：gzip 炸弹（几 KB 压缩包膨胀成几个 GB）
+	// 不限制的话能把整个数据卷写满，容器磁盘满后服务直接不可用。
+	// 多读 1 字节用来判断"是否刚好超限"。
+	n, err := io.Copy(f, io.LimitReader(gr, maxBinBytes+1))
 	gr.Close()
 	cerr := f.Close()
 	if err == nil {
@@ -369,6 +472,10 @@ func fetchOne(url, binDir, dst string) (string, error) {
 	if err != nil {
 		os.Remove(tmp)
 		return "", friendlyNetErr(err)
+	}
+	if n > maxBinBytes {
+		os.Remove(tmp)
+		return "", fmt.Errorf("下载内容异常（解压后超过 %d 字节上限）", maxBinBytes)
 	}
 	if n < minBinSize {
 		os.Remove(tmp)
@@ -381,18 +488,25 @@ func fetchOne(url, binDir, dst string) (string, error) {
 		}
 	}
 
-	// 先删旧的（Windows 上 rename 到已存在文件会失败）
-	_ = os.Remove(dst)
+	// 先校验临时文件再改名：改名是原子的，这样"已有的可用 ffmpeg"要么保持原样、
+	// 要么被一份验证过的新文件替换，不会出现中间被坏文件占位的情况。
+	// 真跑一次校验，避免把 HTML 错误页/半截文件当成 ffmpeg。
+	if err := verify(tmp); err != nil {
+		os.Remove(tmp)
+		return "", fmt.Errorf("下载的 ffmpeg 无法运行: %w", err)
+	}
+
+	// 只有 Windows 需要先删：Windows 上 rename 到已存在的文件会失败；
+	// Linux 上 os.Rename 是原子的覆盖，先删会制造"目标文件短暂不存在"的空窗，
+	// 这期间 Resolve 可能拿到不存在的路径。
+	if runtime.GOOS == "windows" {
+		_ = os.Remove(dst)
+	}
 	if err := os.Rename(tmp, dst); err != nil {
 		os.Remove(tmp)
 		return "", fmt.Errorf("安装到 %s 失败: %w", dst, err)
 	}
 
-	// 真跑一次校验，避免把 HTML 错误页/半截文件当成 ffmpeg
-	if err := verify(dst); err != nil {
-		os.Remove(dst)
-		return "", fmt.Errorf("下载的 ffmpeg 无法运行: %w", err)
-	}
 	setProgress(total, total)
 	return dst, nil
 }

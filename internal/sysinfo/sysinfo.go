@@ -20,7 +20,10 @@ type DirUsage struct {
 	VideoBytes  int64 `json:"video_bytes"`
 	BackupBytes int64 `json:"backup_bytes"`
 	BinBytes    int64 `json:"bin_bytes"`
-	TotalBytes  int64 `json:"total_bytes"`
+	// OtherBytes 是根目录零散文件（ui.yml 等）与未知子目录（如自更新的 update/ 源码缓存），
+	// 之前没统计导致 total 偏小、和 du 对不上
+	OtherBytes int64 `json:"other_bytes"`
+	TotalBytes int64 `json:"total_bytes"`
 	// Partial 表示遍历超时被截断（超大目录时只统计了一部分）
 	Partial bool  `json:"partial"`
 	At      int64 `json:"at"`
@@ -102,6 +105,28 @@ func calcDirUsage(dir string, budget time.Duration) DirUsage {
 	walk("videos", &u.VideoBytes, nil)
 	walk("backup", &u.BackupBytes, nil)
 	walk("bin", &u.BinBytes, nil)
-	u.TotalBytes = u.DBBytes + u.ImgBytes + u.VideoBytes + u.BackupBytes + u.BinBytes
+
+	// 根目录零散文件 + 未知子目录：只有 img/videos/backup/bin 四个是认识的名字，
+	// 其余（update/、tmp、ui.yml…）都算进 OtherBytes，保证 total 和实际磁盘占用对得上
+	isKnown := func(name string) bool {
+		switch name {
+		case "img", "videos", "backup", "bin":
+			return true
+		}
+		return false
+	}
+	if ents, err := os.ReadDir(dir); err == nil {
+		for _, e := range ents {
+			if strings.HasPrefix(e.Name(), "videodl.db") || isKnown(e.Name()) {
+				continue
+			}
+			if e.IsDir() {
+				walk(e.Name(), &u.OtherBytes, nil)
+			} else if fi, err := e.Info(); err == nil {
+				u.OtherBytes += fi.Size()
+			}
+		}
+	}
+	u.TotalBytes = u.DBBytes + u.ImgBytes + u.VideoBytes + u.BackupBytes + u.BinBytes + u.OtherBytes
 	return u
 }

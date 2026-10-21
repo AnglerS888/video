@@ -14,6 +14,8 @@ import (
 
 	"videoDownLoad/internal/collector"
 	db "videoDownLoad/internal/db"
+	"videoDownLoad/internal/logx"
+	"videoDownLoad/internal/netguard"
 )
 
 // ---- 筛选项（年份 / 国家地区 / 类型）----
@@ -25,6 +27,7 @@ import (
 //     （同一组合顺序颠倒就算另一个值），还有 "中国大陆"/"大陆"/"内地"/"中国" 四种同义写法；
 //   - 年份有 290 种，混着 "22025"（脏数据）、"1988~"、"1990~1995" 这类区间值；
 //   - 类型有 72 种。
+//
 // 全列出来筛选行会长到几千像素（2026-10-20 用户反馈）。
 // 前 20 名已能覆盖绝大多数影片，剩下的用「其他」兜底：
 // 点它 = 「该列的值不在前 20 名里」，所以规范的取值一个都不会被漏掉。
@@ -44,37 +47,46 @@ type filterItem struct {
 // filterTable 选出用于筛选统计的表：优先聚合表 vod_name_agg（行数少、有索引），
 // 老库还没建好聚合表时退回明细表 vod_info。
 // 统计和取值必须用同一张表，否则「其他」的条数会和实际筛选结果对不上。
+//
+// 为什么固定一张表（以前是「优先聚合表、聚合表空就退回明细表」）：
+// 列表查询恒查 vod_name_agg，统计口径必须跟它一致 ——
+// vod_name_agg 一行 = 一个剧名，vod_info 一行 = 一条来源记录，
+// 两张表的 COUNT(*) 本来就不同。混用会出现「其他」桶条数与实际筛选结果对不上。
+// 聚合表由启动时的 ensureNameAgg 保证存在（老库会自动聚合一次）。
 func (s *Server) filterTable() string {
-	var n int64
-	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM vod_name_agg`).Scan(&n); err == nil && n > 0 {
-		return "vod_name_agg"
-	}
-	return "vod_info"
+	return "vod_name_agg"
+}
+
+// filterColumns 允许出现在筛选里的列名白名单。
+// 这些列名会被拼进 SQL（值走占位符），所以必须有白名单，不能接受外部输入。
+var filterColumns = map[string]bool{
+	"vod_year":  true,
+	"vod_area":  true,
+	"type_name": true,
 }
 
 // filterTopValues 取某列片量最多的前 N 个取值。
 // 排序「片量倒序 + 名称升序」保证结果稳定（否则同样的数据每次刷新顺序可能不同）。
+// 与列表、总数统计用同一张表（filterTable），保证口径一致。
 func (s *Server) filterTopValues(col string) []filterItem {
-	q := `SELECT TRIM(` + col + `) AS v, COUNT(*) AS c FROM %s
+	if !filterColumns[col] {
+		return []filterItem{}
+	}
+	q := `SELECT TRIM(` + col + `) AS v, COUNT(*) AS c FROM ` + s.filterTable() + `
 		WHERE TRIM(` + col + `) <> '' GROUP BY v ORDER BY c DESC, v ASC LIMIT ?`
-	for _, table := range []string{"vod_name_agg", "vod_info"} {
-		rows, err := s.DB.Query(fmt.Sprintf(q, table), filterTopN)
-		if err != nil {
-			continue
-		}
-		out := make([]filterItem, 0, filterTopN)
-		for rows.Next() {
-			var it filterItem
-			if rows.Scan(&it.Value, &it.Count) == nil && it.Value != "" {
-				out = append(out, it)
-			}
-		}
-		rows.Close() // 单连接库：必须关闭后再查下一张，否则死锁
-		if len(out) > 0 {
-			return out
+	rows, err := s.DB.Query(q, filterTopN)
+	if err != nil {
+		return []filterItem{}
+	}
+	defer rows.Close()
+	out := make([]filterItem, 0, filterTopN)
+	for rows.Next() {
+		var it filterItem
+		if rows.Scan(&it.Value, &it.Count) == nil && it.Value != "" {
+			out = append(out, it)
 		}
 	}
-	return []filterItem{}
+	return out
 }
 
 // filterOtherCount = 该表总行数 - 前 N 名覆盖的影片数 = 「其他」桶的大小。
@@ -159,6 +171,11 @@ func (s *Server) listVideos(w http.ResponseWriter, r *http.Request) {
 	if page < 1 {
 		page = 1
 	}
+	// 分页上限：page 越大 OFFSET 越深，SQLite 要扫描并丢弃前面所有行
+	// （?page=100000000 会让一次查询长时间占着连接，连接池只有 4 个）。
+	if page > 10000 {
+		page = 10000
+	}
 	// 每页条数：前端按"每行数 × 8 行"传入，保证末行满行不空缺；
 	// 不传时用 48（2/3/4/6 列都能整除，避免桌面端最后一行少几格）
 	size := 48
@@ -192,16 +209,18 @@ func (s *Server) listVideos(w http.ResponseWriter, r *http.Request) {
 	where := " WHERE 1=1 "
 	var args []any
 	if wd != "" {
-		like := "%" + wd + "%"
+		// LIKE 的通配符要转义：用户搜 "100%" 本意是字面量，
+		// 不转义就会变成"任何以 100 开头的"（语义不准）。
+		like := "%" + escapeLike(wd) + "%"
 		switch searchField {
 		case "name":
-			where += " AND vod_name LIKE ? "
+			where += " AND vod_name LIKE ? ESCAPE '\\' "
 			args = append(args, like)
 		case "actor":
-			where += " AND vod_actor LIKE ? "
+			where += " AND vod_actor LIKE ? ESCAPE '\\' "
 			args = append(args, like)
 		default:
-			where += " AND (vod_name LIKE ? OR vod_actor LIKE ? OR type_name LIKE ?) "
+			where += " AND (vod_name LIKE ? ESCAPE '\\' OR vod_actor LIKE ? ESCAPE '\\' OR type_name LIKE ? ESCAPE '\\') "
 			args = append(args, like, like, like)
 		}
 	}
@@ -243,16 +262,16 @@ func (s *Server) listVideos(w http.ResponseWriter, r *http.Request) {
 	applyFilter("type_name", fType)
 
 	var total int
-	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM vod_name_agg`+where, args...).Scan(&total); err != nil {
-		fail(w, err.Error())
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM `+s.filterTable()+where, args...).Scan(&total); err != nil {
+		fail(w, publicErr(err))
 		return
 	}
 
 	rows, err := s.DB.Query(`SELECT vod_name, cnt, vod_pic, type_name, vod_remarks, vod_year,
-		vod_area, rid, src_ids, updated_at FROM vod_name_agg`+where+
+		vod_area, rid, src_ids, updated_at FROM `+s.filterTable()+where+
 		` ORDER BY updated_at DESC LIMIT ? OFFSET ?`, append(args, size, (page-1)*size)...)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	defer rows.Close()
@@ -281,7 +300,7 @@ func (s *Server) listVideos(w http.ResponseWriter, r *http.Request) {
 			"updated_at": ua.String,
 		}})
 	}
-	rows.Close() // 必须先关闭：连接池只有 1 个连接，未关闭时再查询会死锁
+	rows.Close() // 必须先关闭：持有 rows 时同一条连接上再查询会阻塞
 
 	// 接口名解析 + 已下载数量回填（此时 rows 已关闭）
 	for _, it := range items {
@@ -444,7 +463,7 @@ func (s *Server) videoDetail(w http.ResponseWriter, r *http.Request) {
 		LEFT JOIN vod_detail dd ON dd.vod_id=v.id
 		WHERE v.vod_name=? ORDER BY v.source_id`, vodName)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	var rs []row
@@ -568,6 +587,13 @@ func (s *Server) proxyImage(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// SSRF 防护：这个接口会让服务端去抓任意 URL（盲 SSRF），
+	// 内网地址与云元数据接口必须挡住。确实要抓局域网源站的封面时，
+	// 设 VDL_ALLOW_PRIVATE=1。
+	if _, cerr := netguard.CheckURL(u); cerr != nil {
+		http.Error(w, cerr.Error(), http.StatusForbidden)
+		return
+	}
 	imgDir := filepath.Join(s.DataDir, "img")
 	local := collector.CoverPath(imgDir, u)
 
@@ -589,6 +615,12 @@ func (s *Server) proxyImage(w http.ResponseWriter, r *http.Request) {
 		if data, err := os.ReadFile(legacy); err == nil && len(data) > 0 {
 			serve(data)
 			go func(from, to string) {
+				// recover：后台搬文件时 panic 会杀掉整个进程
+				defer func() {
+					if r := recover(); r != nil {
+						logx.Errorf("[img] 迁移旧封面文件时异常: %v", r)
+					}
+				}()
 				if err := os.MkdirAll(filepath.Dir(to), 0o755); err == nil {
 					_ = os.Rename(from, to)
 				}
@@ -606,4 +638,12 @@ func (s *Server) proxyImage(w http.ResponseWriter, r *http.Request) {
 	// 刷一排红字（每张没来得及缓存的封面都算一次失败请求）。
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// escapeLike 转义 LIKE 里的通配符（% _ 以及转义符本身）。
+// 配合 SQL 里的 ESCAPE '\\' 使用：用户搜 "100%" 时命中的是字面量 "100%"，
+// 而不是"任何以 100 开头的"。
+func escapeLike(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
+	return r.Replace(s)
 }

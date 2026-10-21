@@ -3,6 +3,7 @@ package web
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"videoDownLoad/internal/collector"
+	db "videoDownLoad/internal/db"
 )
 
 func (s *Server) enqueueDownload(w http.ResponseWriter, r *http.Request) {
@@ -29,9 +31,14 @@ func (s *Server) enqueueDownload(w http.ResponseWriter, r *http.Request) {
 		fail(w, "vod_id 与 play_from 必填")
 		return
 	}
+	// 集号数组上限：一部剧正常也就几百集，超出说明是异常输入
+	if len(in.EpIndices) > maxArrayItems {
+		fail(w, fmt.Sprintf("一次最多提交 %d 集（当前 %d 集）", maxArrayItems, len(in.EpIndices)))
+		return
+	}
 	created, skipped, err := collector.EnqueueDownloadBatch(in.VodID, in.PlayFrom, in.EpIndices)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	if created == 0 {
@@ -59,7 +66,7 @@ func (s *Server) listDownloads(w http.ResponseWriter, r *http.Request) {
 func (s *Server) pauseDownload(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err := collector.PauseDownload(id); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, "已暂停")
@@ -68,7 +75,7 @@ func (s *Server) pauseDownload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) resumeDownload(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err := collector.ResumeDownload(id); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, "已继续下载")
@@ -78,7 +85,7 @@ func (s *Server) resumeDownload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) priorityDownload(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err := collector.SetDownloadPriority(id); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, "已设为优先下载，当前这一集完成后立刻轮到它")
@@ -87,7 +94,7 @@ func (s *Server) priorityDownload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) deleteDownload(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err := collector.DeleteDownload(id); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, "已删除")
@@ -97,7 +104,7 @@ func (s *Server) deleteDownload(w http.ResponseWriter, r *http.Request) {
 func (s *Server) retryDownload(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err := collector.RetryDownload(id); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, "已重新加入下载队列")
@@ -115,6 +122,11 @@ func (s *Server) batchDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(in.IDs) == 0 {
 		fail(w, "请先选择任务")
+		return
+	}
+	// 批量操作条数上限：ids 可达百万级，逐条 DB 写会长时间占着连接
+	if len(in.IDs) > maxArrayItems {
+		fail(w, fmt.Sprintf("一次最多操作 %d 个任务（当前 %d 个），请分批操作", maxArrayItems, len(in.IDs)))
 		return
 	}
 	var fn func(int64) error
@@ -154,9 +166,31 @@ func (s *Server) batchDownload(w http.ResponseWriter, r *http.Request) {
 	ok(w, msg)
 }
 
-// playVideo 仅允许播放已下载完成的本地 mp4（参数为 vod_download.id）
+// playVideo 播放已下载完成的本地 mp4。
+//
+// 路径参数有两种：
+//   - 数字 id：本地播放，必须带播放令牌（?t=...）或管理口令。
+//     没有令牌就放行的话，id 是自增整数 → /play/1、/play/2 能被直接枚举，
+//     同一局域网的任何人��能把整个下载库拖走。
+//   - 分享令牌：分享链接专用，按令牌的有效期判定，过期即拒。
 func (s *Server) playVideo(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	key := r.PathValue("id")
+	var id int64
+	if n, err := strconv.ParseInt(key, 10, 64); err == nil {
+		id = n
+		if !validPlayToken(r.URL.Query().Get("t")) && !adminAuthorized(r) {
+			http.Error(w, "需要播放令牌（请刷新页面后重试）", http.StatusForbidden)
+			return
+		}
+	} else {
+		// 分享令牌
+		did, _, valid := db.ShareTokenLookup(s.DB, key)
+		if !valid {
+			http.Error(w, "分享链接无效或已过期", http.StatusForbidden)
+			return
+		}
+		id = did
+	}
 	var file, status string
 	if err := s.DB.QueryRow(`SELECT file_path, status FROM vod_download WHERE id=?`, id).Scan(&file, &status); err != nil {
 		http.Error(w, "下载记录不存在", http.StatusNotFound)
@@ -182,10 +216,14 @@ func (s *Server) playVideo(w http.ResponseWriter, r *http.Request) {
 }
 
 // shareDownload 生成一条局域网可访问的外链（分享页），前端据此展示二维码与链接。
-// 不引入 token：这是内网自用的媒体服务，链接本身只在本机所在局域网可达。
 //
-// 注意：对外只给「分享页」地址 /s/{id}。play_url / file_url 仍随接口返回，
-// 但前端分享弹窗不再展示——直接把视频文件地址发给别人既不好看，
+// 分享链接用**随机令牌**而不是下载 id：
+//   - id 是自增整数，/play/{id} 能被直接枚举（整个下载库都能拖走）；
+//   - 有效期要真正生效，就必须有独立的凭据 —— 现在令牌自带 expires_at，
+//     过期后分享页与文件访问都会被拒（旧实现只校验分享页，文件地址永久有效）。
+//
+// 对外给的是「分享页」地址 /s/{token}。play_url / file_url 也随接口返回，
+// 但前端分享弹窗不展示——直接把视频文件地址发给别人既不好看，
 // 也没法在页面里提示「这一集还没下完」「同剧还有哪几集可看」。
 func (s *Server) shareDownload(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -200,36 +238,90 @@ func (s *Server) shareDownload(w http.ResponseWriter, r *http.Request) {
 		fail(w, "这一集还没下载完成，无法分享")
 		return
 	}
-	// 有效期：?hours=24 / 168（7 天）/ 0（永久）。每次打开分享弹窗都会按选择重写，
-	// 选「永久」等于把之前设过的失效时间清掉。
-	hours, _ := strconv.ParseFloat(r.URL.Query().Get("hours"), 64)
+	// 有效期：?hours=24 / 168（7 天）/ 0（永久）。
+	// 解析失败必须报错 —— 旧实现忽略错误，hours 变成 0 → 静默变成永久有效。
+	hours := 0.0
+	if raw := strings.TrimSpace(r.URL.Query().Get("hours")); raw != "" {
+		h, perr := strconv.ParseFloat(raw, 64)
+		if perr != nil || math.IsNaN(h) || math.IsInf(h, 0) {
+			fail(w, "有效期参数不合法")
+			return
+		}
+		hours = h
+	}
+	var expireAt time.Time
 	expires := ""
 	if hours > 0 {
 		if hours > 24*365 { // 上限一年，防止手滑填出 100 年
 			hours = 24 * 365
 		}
-		expires = time.Now().UTC().Add(time.Duration(hours * float64(time.Hour))).Format("2006-01-02 15:04:05")
+		expireAt = time.Now().UTC().Add(time.Duration(hours * float64(time.Hour)))
+		expires = expireAt.Format("2006-01-02 15:04:05")
+	} else {
+		// 永久：用一个很远的失效时间表示（表结构里空=永久，这里统一存远期时间）
+		expireAt = time.Now().UTC().Add(100 * 365 * 24 * time.Hour)
+		expires = ""
 	}
-	s.DB.Exec(`UPDATE vod_download SET share_expires_at=? WHERE id=?`, expires, id)
+	// 令牌入库
+	token, terr := db.NewShareToken(s.DB, id, expireAt)
+	if terr != nil {
+		fail(w, "生成分享链接失败: "+publicErr(terr))
+		return
+	}
+	// 同步记录到下载行（信息页展示用）；写失败要报错，不能"提示成功但没写进去"
+	if _, err := s.DB.Exec(`UPDATE vod_download SET share_expires_at=? WHERE id=?`, expires, id); err != nil {
+		fail(w, "保存分享有效期失败: "+publicErr(err))
+		return
+	}
 	base := publicBaseURL(r)
 	ep := "整条"
 	if epIdx >= 0 {
 		ep = fmt.Sprintf("第%d集", epIdx+1)
 	}
 	ok(w, map[string]any{
-		"id": id, "name": name, "episode": ep,
+		"id": id, "name": name, "episode": ep, "token": token,
 		// 分享给别人用这个：打开是一个页面，可播放/下载，不会直接拿到视频文件地址
-		"page_url":   base + "/s/" + strconv.FormatInt(id, 10),
-		"play_url":   base + "/play/" + strconv.FormatInt(id, 10),
-		"file_url":   base + "/play/" + strconv.FormatInt(id, 10) + "?dl=1",
+		"page_url":   base + "/s/" + token,
+		"play_url":   base + "/play/" + token,
+		"file_url":   base + "/play/" + token + "?dl=1",
 		"expires_at": expires, // UTC，空 = 永久有效
 	})
 }
 
-// sharePage 分享页数据（/s/{id}）：标题、封面、集数、同剧已下载的其他集。
-// 播放/下载仍走 /play/{id}，由页面上的按钮触发，页面本身不直接嵌入视频直链。
+// sharePage 分享页数据（/s/{token}）：标题、封面、集数、同剧已下载的其他集。
+// 播放/下载走 /play/{token}（同一个令牌），由页面上的按钮触发。
+//
+// 路径参数既支持新令牌，也兼容旧版数字 id（老的分享链接）：
+//   - 令牌：按令牌有效期判定；
+//   - 数字 id：只有这一行确实分享过（share_expires_at 非空）且未过期才放行，
+//     否则要求播放令牌（= 只有分享者本人能看）。
 func (s *Server) sharePage(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	key := r.PathValue("id")
+	var id int64
+	var shareExpires string
+	if n, err := strconv.ParseInt(key, 10, 64); err == nil {
+		id = n
+		var exp string
+		if err := s.DB.QueryRow(`SELECT COALESCE(share_expires_at,'') FROM vod_download WHERE id=?`, id).Scan(&exp); err != nil {
+			fail(w, "分享的内容不存在（可能已被删除）")
+			return
+		}
+		shareExpires = exp
+		if exp == "" || db.ShareExpired(exp) {
+			// 永久分享的旧链接没有失效时间：只允许分享者本人（带播放令牌）查看
+			if !validPlayToken(r.URL.Query().Get("t")) && !adminAuthorized(r) {
+				fail(w, "分享链接无效或已过期")
+				return
+			}
+		}
+	} else {
+		did, exp, valid := db.ShareTokenLookup(s.DB, key)
+		if !valid {
+			fail(w, "分享链接无效或已过期")
+			return
+		}
+		id, shareExpires = did, exp
+	}
 	if id <= 0 {
 		fail(w, "分享链接无效")
 		return
@@ -240,14 +332,12 @@ func (s *Server) sharePage(w http.ResponseWriter, r *http.Request) {
 		playFrom               string
 		epIdx                  int
 		size                   int64
-		shareExpires           string
 	)
 	err := s.DB.QueryRow(`SELECT d.vod_id, d.vod_name, d.ep_index, COALESCE(d.source_name,''),
-		d.status, d.play_from, COALESCE(d.file_size,0), COALESCE(v.vod_pic,''),
-		COALESCE(d.share_expires_at,'')
+		d.status, d.play_from, COALESCE(d.file_size,0), COALESCE(v.vod_pic,'')
 		FROM vod_download d LEFT JOIN vod_info v ON v.id = d.vod_id
 		WHERE d.id=?`, id).
-		Scan(&vodID, &name, &epIdx, &src, &status, &playFrom, &size, &pic, &shareExpires)
+		Scan(&vodID, &name, &epIdx, &src, &status, &playFrom, &size, &pic)
 	if err != nil {
 		fail(w, "分享的内容不存在（可能已被删除）")
 		return
@@ -256,20 +346,17 @@ func (s *Server) sharePage(w http.ResponseWriter, r *http.Request) {
 		fail(w, "这一集还没下载完成，暂时无法分享")
 		return
 	}
-	// 失效时间：分享者选过有效期后，过期的链接不再展示内容
-	if shareExpires != "" {
-		if t, perr := time.Parse("2006-01-02 15:04:05", shareExpires); perr == nil && time.Now().UTC().After(t) {
-			fail(w, "分享链接已过期")
-			return
-		}
-	}
 	ep := "整条"
 	if epIdx >= 0 {
 		ep = fmt.Sprintf("第%d集", epIdx+1)
 	}
 
 	// 同剧其它已下载的集（同名合并，多源同集只留第一条）——
-	// DB 只有 1 个连接：先把结果读成切片，关掉 rows 再继续（否则下一步会永久阻塞）
+	// 先把结果读成切片，关掉 rows 再继续：
+	// 持有 rows 时同一条连接上再发查询会阻塞（连接池默认 4 个连接，但这是同一条）
+	// 同剧其它已下载的集：**只给集号，不给下载 id**。
+	// 旧实现把 id 一起返回，而 /play/{id} 又没有凭据校验 → 拿到一个分享链接
+	// 就能把同一部剧所有集的文件地址全捞走。
 	type epItem struct {
 		ID  int64 `json:"id"`
 		Idx int   `json:"ep_index"`
@@ -296,15 +383,23 @@ func (s *Server) sharePage(w http.ResponseWriter, r *http.Request) {
 		list = append(list, e)
 	}
 
-	ok(w, map[string]any{
+	// 播放/下载地址用令牌（分享页访问者没有播放令牌，只能用分享令牌）
+	playKey := key
+	if _, err := strconv.ParseInt(key, 10, 64); err == nil {
+		playKey = "" // 旧数字链接：没有可用令牌，下面给不出可播放地址
+	}
+	resp := map[string]any{
 		"id": id, "vod_id": vodID, "name": name, "episode": ep,
 		"source_name": src, "vod_pic": pic, "play_from": playFrom,
 		"size_mb":    float64(size) / 1024 / 1024,
-		"play_url":   "/play/" + strconv.FormatInt(id, 10),
-		"file_url":   "/play/" + strconv.FormatInt(id, 10) + "?dl=1",
 		"episodes":   list,
 		"expires_at": shareExpires, // UTC，空 = 永久有效
-	})
+	}
+	if playKey != "" {
+		resp["play_url"] = "/play/" + playKey
+		resp["file_url"] = "/play/" + playKey + "?dl=1"
+	}
+	ok(w, resp)
 }
 
 // shareBase 返回外部可访问的站点根地址（首页/详情页的二维码分享用）。
@@ -316,10 +411,19 @@ func (s *Server) shareBase(w http.ResponseWriter, r *http.Request) {
 // publicBaseURL 推断外部可访问的地址：
 // 优先用请求的 Host（局域网访问时就是 192.168.x.x:5200），
 // 本机 localhost 访问时换成网卡上的第一个内网 IPv4，这样二维码扫出来别人才打得开。
+//
+// 安全：Host 头是客户端可控的，攻击者可以伪造 Host: evil.com，
+// 于是分享链接 / 二维码就指向攻击者的域名（钓鱼）。
+// 所以只有当 Host 指向**本机**（IP 字面量 / localhost / 本机名）时才采信，
+// 其余一律换成内网 IP；反向代理场景用环境变量 VDL_PUBLIC_URL 显式指定。
 func publicBaseURL(r *http.Request) string {
 	scheme := "http"
 	if r.TLS != nil {
 		scheme = "https"
+	}
+	// 反向代理 / 域名访问：由运维显式指定，避免猜错
+	if v := strings.TrimSpace(os.Getenv("VDL_PUBLIC_URL")); v != "" {
+		return strings.TrimRight(v, "/")
 	}
 	// 保留请求本来的端口：以前 Host 不带端口时硬补 5200，
 	// 通过 80 端口/反向代理访问时二维码会扫到 :5200 打不开。
@@ -327,15 +431,44 @@ func publicBaseURL(r *http.Request) string {
 	if err != nil {
 		h, port = r.Host, ""
 	}
-	if h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "" {
+	if !hostIsLocal(h) {
+		// Host 不可信：换成内网 IP（后面统一处理）
+		h = ""
+	}
+	if h == "" || h == "localhost" || h == "127.0.0.1" || h == "::1" {
 		if ip := lanIPv4(); ip != "" {
 			h = ip
+		} else if h == "" {
+			h = "127.0.0.1"
 		}
 	}
 	if port == "" {
 		return scheme + "://" + h
 	}
 	return scheme + "://" + net.JoinHostPort(h, port)
+}
+
+// hostIsLocal 判断 Host 的主机部分是否指向本机：
+// IP 字面量、localhost、本机 hostname 都算；其它（外部域名）一律不信。
+func hostIsLocal(h string) bool {
+	h = strings.TrimSpace(strings.Trim(h, "[]"))
+	if h == "" {
+		return false
+	}
+	if net.ParseIP(h) != nil {
+		return true
+	}
+	lower := strings.ToLower(h)
+	if lower == "localhost" {
+		return true
+	}
+	// 本机 hostname（NAS 上常见 "MyNAS" / "docker"）
+	if name, err := os.Hostname(); err == nil && name != "" {
+		if strings.EqualFold(lower, strings.ToLower(name)) {
+			return true
+		}
+	}
+	return false
 }
 
 // lanIPv4 取本机第一个私有网卡地址

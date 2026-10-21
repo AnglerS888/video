@@ -2,7 +2,7 @@
 import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import CoverImg from '../components/CoverImg.vue'
-import { api } from '../api'
+import { api, playURL } from '../api'
 import { copyText } from '../clipboard'
 import { toast } from '../toast'
 import type { DownloadTask, WatchHistoryItem } from '../types'
@@ -105,9 +105,12 @@ function play(id: number) {
 /**
  * 文件直连：/play/{id} 直接返回 mp4 本体（支持 Range），
  * 浏览器会用它自带的播放器打开，不经过播放页，适合投屏/外部播放器/发给别人。
+ *
+ * 需要播放令牌（?t=）：否则下载 id 可被枚举，整个下载库都能被拖走。
+ * 令牌是异步取的，所以返回 Promise。
  */
-function fileURL(id: number, base = location.origin): string {
-  return `${base.replace(/\/+$/, '')}/play/${id}`
+function fileURL(id: number, base = location.origin): Promise<string> {
+  return playURL(id, base)
 }
 
 // 局域网根地址（后端会把 localhost 换成内网 IP）：复制给别人时不能用 127.0.0.1
@@ -123,12 +126,12 @@ function lanBase(): Promise<string> {
 }
 
 async function copyLink(t: DownloadTask) {
-  const ok = await copyText(fileURL(t.id, await lanBase()))
+  const ok = await copyText(await fileURL(t.id, await lanBase()))
   toast(ok ? `${epLabel(t)} 直链已复制` : '复制失败，请手动复制', ok ? 'ok' : 'err', 1800)
 }
 
-function openDirect(t: DownloadTask) {
-  window.open(fileURL(t.id), '_blank', 'noopener')
+async function openDirect(t: DownloadTask) {
+  window.open(await fileURL(t.id), '_blank', 'noopener')
 }
 
 // 同一部剧里的来源列表（多个源都下载过时在标题上标出来）

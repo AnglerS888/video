@@ -3,7 +3,6 @@ package web
 import (
 	"bytes"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -11,6 +10,7 @@ import (
 	"time"
 
 	"videoDownLoad/internal/logx"
+	"videoDownLoad/internal/netguard"
 )
 
 // ============================================================================
@@ -33,16 +33,13 @@ import (
 const liveUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 	"(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
 
-// liveClient 流式转发不设总超时（分片大小不定），只限制响应头等待时间
-var liveClient = &http.Client{
-	Transport: &http.Transport{
-		MaxIdleConns:          32,
-		MaxIdleConnsPerHost:   8,
-		IdleConnTimeout:       60 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		ForceAttemptHTTP2:     true,
-	},
-}
+// liveClient 流式转发不设总超时（分片大小不定），只限制响应头等待时间。
+//
+// 用 netguard.NewClient 而不是自己拼 Transport：它带两层 SSRF 防护 ——
+//  1. 重定向每一跳都复检主机（只校验初始 URL 的话，
+//     攻击者用一个正常公网地址 302 到 169.254.169.254 就能绕过）；
+//  2. 连接时校验实际连上的 IP（域名指向内网、DNS rebinding 都被挡住）。
+var liveClient = netguard.NewClient(0, 30*time.Second)
 
 // liveURIPat 匹配 m3u8 标签里的 URI="..."
 var liveURIPat = regexp.MustCompile(`URI="([^"]*)"`)
@@ -173,16 +170,16 @@ func (s *Server) liveProxy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Content-Encoding"} {
+	// 只透传长度类头，**不透传上游的 Content-Type**：
+	// 上游返回 text/html 时，浏览器会在本站源下渲染这段 HTML → 同源 XSS
+	// （能读 localStorage、能直接调本站所有接口）。这里固定成二进制流。
+	for _, k := range []string{"Content-Length", "Content-Range", "Accept-Ranges"} {
 		if v := resp.Header.Get(k); v != "" {
 			w.Header().Set(k, v)
 		}
 	}
-	// 上游谎报 Content-Type 的（TS 分片标成 image/jpeg）顺手纠正，
-	// 浏览器按图片处理会直接弃掉响应
-	if len(buf) > 0 && buf[0] == 0x47 && strings.HasPrefix(w.Header().Get("Content-Type"), "image/") {
-		w.Header().Set("Content-Type", "video/mp2t")
-	}
+	w.Header().Set("Content-Type", "video/mp2t")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if w.Header().Get("Accept-Ranges") == "" {
 		w.Header().Set("Accept-Ranges", "bytes")
 	}
@@ -278,29 +275,11 @@ func liveProxyURL(base *url.URL, ref string) string {
 	return "/api/live?u=" + url.QueryEscape(u.String())
 }
 
-// liveHostAllowed 只挡本机/私网 IP 字面量与内网域名。
-// 域名不做 DNS 解析：既省掉每个分片一次解析，也避免 NAS 没配 DNS 时整站播不了。
+// liveHostAllowed 主机是否允许被服务端代为请求。
+// 判定逻辑统一放在 internal/netguard（web 与 collector 共用）：
+// IP 字面量挡私网/回环/链路本地，内网主机名后缀也挡；
+// 域名指向内网的情况由 netguard 的连接层校验兜住（不需要在请求路径上做 DNS 解析，
+// NAS 没配 DNS 也不影响）。
 func liveHostAllowed(host string) bool {
-	h := strings.ToLower(strings.Trim(host, "[]"))
-	if h == "" {
-		return false
-	}
-	switch h {
-	case "localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback":
-		return false
-	}
-	for _, suf := range []string{".local", ".internal", ".localhost", ".lan", ".home"} {
-		if strings.HasSuffix(h, suf) {
-			return false
-		}
-	}
-	ip := net.ParseIP(h)
-	if ip == nil {
-		return true
-	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsInterfaceLocalMulticast() {
-		return false
-	}
-	return true
+	return netguard.HostAllowedFast(host)
 }

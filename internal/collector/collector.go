@@ -25,6 +25,7 @@ import (
 	db "videoDownLoad/internal/db"
 	"videoDownLoad/internal/imgproc"
 	"videoDownLoad/internal/logx"
+	"videoDownLoad/internal/netguard"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/transform"
@@ -436,17 +437,10 @@ func New(db *sql.DB) *Collector {
 	c := &Collector{
 		DB:      db,
 		hostIDs: map[string]int64{},
-		HTTP: &http.Client{
-			Timeout: 40 * time.Second,
-			Transport: &http.Transport{
-				// 空闲连接池按并发量收敛：默认 MaxIdleConns=100 在 NAS 上没意义，
-				// 只会让一批连接长期挂着
-				MaxIdleConns:        32,
-				MaxIdleConnsPerHost: 8,
-				IdleConnTimeout:     60 * time.Second,
-				ForceAttemptHTTP2:   true,
-			},
-		},
+		// HTTP 客户端带 SSRF 防护（internal/netguard）：
+		// 连接时校验实际连上的 IP，域名指向内网 / DNS rebinding 都会被挡住。
+		// 确实要用局域网源站（自建 CMS）时设 VDL_ALLOW_PRIVATE=1 放行。
+		HTTP: netguard.NewClient(40*time.Second, 0),
 	}
 	c.SetWorkers(defaultPageWorkers, defaultSourceWorkers)
 	return c
@@ -568,9 +562,42 @@ type pageResult struct {
 	Format    string // json / xml（测试接口时展示，便于确认源站实际返回的格式）
 }
 
+// apiURLHolder 保存本次采集实际使用的接口地址。
+//
+// 为什么要它：源站首包 404 时会自动纠正地址（/api.php ↔ /api），
+// 旧实现直接写 src.APIURL —— 而 12 个分页 worker 并发读同一个 src，
+// 属于 data race（Go 字符串是 2 字长，非原子写可能读到撕裂值）。
+// 纠正后的地址只写库，同一次采集里通过 holder 传给后续请求。
+type apiURLHolder struct {
+	mu  sync.Mutex
+	url string
+}
+
+func (h *apiURLHolder) get() string {
+	if h == nil {
+		return ""
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.url
+}
+
+func (h *apiURLHolder) set(u string) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.url = u
+	h.mu.Unlock()
+}
+
 // fetch 拉取一页列表数据（自动识别 JSON / XML，容忍非 200 状态码）
-func (c *Collector) fetch(ctx context.Context, src *Source, q url.Values) (*pageResult, error) {
-	body, u, status, err := c.reqRaw(ctx, src.APIURL, q)
+func (c *Collector) fetch(ctx context.Context, src *Source, q url.Values, holder *apiURLHolder) (*pageResult, error) {
+	apiURL := src.APIURL
+	if u := holder.get(); u != "" {
+		apiURL = u
+	}
+	body, u, status, err := c.reqRaw(ctx, apiURL, q)
 	if err != nil {
 		return nil, fmt.Errorf("%v（请求地址 %s）", err, u)
 	}
@@ -578,9 +605,10 @@ func (c *Collector) fetch(ctx context.Context, src *Source, q url.Values) (*page
 	// 用户只填域名时我们默认补 .php 版本；若站点只有另一种写法，首包会 404。
 	// 这里自动换一次，成功后把正确地址回写 vod_source —— 下次直接命中，不再多一次 404。
 	if status == 404 {
-		if alt, ok := alternateAPIURL(src.APIURL); ok {
+		if alt, ok := alternateAPIURL(apiURL); ok {
 			if b2, u2, s2, e2 := c.reqRaw(ctx, alt, q); e2 == nil && s2 == 200 {
 				body, u, status = b2, u2, s2
+				holder.set(alt) // 同一次采集里后续分页立刻用新地址
 				c.persistAPIURL(src, alt)
 			}
 		}
@@ -638,11 +666,12 @@ func alternateAPIURL(u string) (string, bool) {
 var apiURLFixed sync.Map
 
 // persistAPIURL 把自动纠正后的地址写回 vod_source，下次采集直接用对的地址。
+// 注意：这里**不**再写 src.APIURL —— 采集期间 12 个 worker 并发读同一个 src，
+// 写结构体字段是 data race；同一次采集内的传递走 apiURLHolder。
 func (c *Collector) persistAPIURL(src *Source, fixed string) {
 	if fixed == "" || fixed == src.APIURL {
 		return
 	}
-	src.APIURL = fixed // 同一次采集里后续分页立刻用新地址
 	if c.DB == nil || src.ID <= 0 {
 		return
 	}
@@ -778,7 +807,13 @@ func toUTF8XML(body []byte) []byte {
 	}
 	out, _, err := transform.Bytes(simplifiedchinese.GB18030.NewDecoder(), body)
 	if err != nil {
-		return body // 转换失败就按原样解析，至少不会整页丢掉
+		// 转换失败：仍要把声明改成 utf-8 再返回。
+		// 旧实现直接返回原 body（声明还是 gb2312）→ encoding/xml 必然报
+		// `encoding "gb2312" declared but Decoder.CharsetReader is nil` → 整页失败，
+		// 注释说的"至少不会整页丢掉"与事实相反。这里宁可内容有乱码，
+		// 也不要因为声明与实际编码不符而必然解析失败。
+		logx.Printf("[collect] GBK 转 UTF-8 失败（%v），按 utf-8 声明继续解析", err)
+		return xmlEncodingRe.ReplaceAll(body, []byte(`encoding="utf-8"`))
 	}
 	// 声明必须跟着改：字节已经转成 UTF-8，但 encoding="gb2312" 还留着的话，
 	// encoding/xml 会直接报 `encoding "gb2312" declared but Decoder.CharsetReader is nil`
@@ -803,7 +838,7 @@ func (c *Collector) fetchDetails(ctx context.Context, src *Source, ids []int) ma
 		for _, id := range ids[i:end] {
 			strs = append(strs, strconv.Itoa(id))
 		}
-		pr, err := c.fetch(ctx, src, url.Values{"ac": {"detail"}, "ids": {strings.Join(strs, ",")}})
+		pr, err := c.fetch(ctx, src, url.Values{"ac": {"detail"}, "ids": {strings.Join(strs, ",")}}, nil)
 		if err != nil {
 			logx.Printf("[detail] %s ids=%s: %v", src.Name, strings.Join(strs, ","), err)
 			continue
@@ -907,7 +942,7 @@ func (c *Collector) Probe(candidates []string) map[string]any {
 func (c *Collector) probeOne(ctx context.Context, src *Source) map[string]any {
 	q := url.Values{"ac": {"list"}, "pg": {"1"}, "limit": {"2"}}
 	start := time.Now()
-	pr, err := c.fetch(ctx, src, q)
+	pr, err := c.fetch(ctx, src, q, nil)
 	cost := time.Since(start).Milliseconds()
 	res := map[string]any{"cost_ms": cost}
 	if err != nil {
@@ -936,7 +971,7 @@ func (c *Collector) probeOne(ctx context.Context, src *Source) map[string]any {
 	}
 	// 验证分页是否真的生效（部分源站忽略 pg 参数，导致全量只能采到第 1 页）
 	if len(pr.Items) > 0 && pr.PageCount > 1 {
-		if p2, e := c.fetch(ctx, src, url.Values{"ac": {"list"}, "pg": {"2"}, "limit": {"2"}}); e == nil {
+		if p2, e := c.fetch(ctx, src, url.Values{"ac": {"list"}, "pg": {"2"}, "limit": {"2"}}, nil); e == nil {
 			if pageSignature(p2.Items) == pageSignature(pr.Items) {
 				res["pagination"] = false
 				res["pagination_msg"] = "源站忽略 pg 参数，第 2 页与第 1 页内容相同，全量采集只能采到单页数据"
@@ -1386,19 +1421,16 @@ var (
 	coverFailN   atomic.Int64             // 累计下载失败张数
 	coverOKN     atomic.Int64             // 累计下载成功张数
 	coverLastErr atomic.Value             // 最近一次失败原因
-	imgProxy     string                   // 图片代理前缀，空=不用
+	imgProxy     atomic.Pointer[string]   // 图片代理前缀，空=不用
 	// coverSem 同时连接源站下载/解码封面的并发上限。
 	// 每张图解码后要占几 MB（1920x2880 的 JPEG 解成 YCbCr 约 8MB），
 	// 旧的固定 8 并发在 4G 内存的 NAS 上很容易顶出 OOM，改成可由 main 调整（默认 4）。
-	coverSem  = make(chan struct{}, 4)
-	coverHTTP = &http.Client{
-		Timeout: 12 * time.Second,
-		Transport: &http.Transport{
-			MaxIdleConns:        16,
-			MaxIdleConnsPerHost: 4,
-			IdleConnTimeout:     60 * time.Second,
-		},
-	}
+	// 用 atomic.Pointer 存：热更新会整体替换这个 channel，
+	// 释放动作必须归还当初拿到令牌的那个 channel，否则会永久阻塞（封面队列停摆）。
+	coverSem = atomic.Pointer[chan struct{}]{}
+	// 封面抓取同样走带防护的客户端：/api/img?u= 能让服务端抓任意 URL，
+	// 没有防护时就是个盲 SSRF（可读内网与云元数据接口）。
+	coverHTTP = netguard.NewClient(12*time.Second, 0)
 )
 
 const coverFailTTL = 10 * time.Minute
@@ -1498,7 +1530,8 @@ func SetCoverConcurrency(n int) {
 	if n > 16 {
 		n = 16
 	}
-	coverSem = make(chan struct{}, n)
+	ch := make(chan struct{}, n)
+	coverSem.Store(&ch)
 }
 
 // coverMaxWorkers 封面预取协程上限：协程起满这么多，实际同时处理几张由
@@ -1693,8 +1726,11 @@ func (c *Collector) fetchAndStoreCover(u string) {
 	// 全局限速：排到自己那一格再发起下载（图床对批量抓图很敏感）
 	coverPace()
 
-	coverSem <- struct{}{}
-	defer func() { <-coverSem }()
+	// 取令牌与释放必须用同一个 channel：热更新会替换全局 channel，
+	// 若释放时读的是新 channel（空的），这里会永久阻塞。
+	coverCh := currentCoverSem()
+	coverCh <- struct{}{}
+	defer func() { <-coverCh }()
 
 	raw, err := fetchCoverBytes(u)
 	if err != nil {
@@ -1721,9 +1757,27 @@ func (c *Collector) fetchAndStoreCover(u string) {
 	}
 }
 
+// currentCoverSem 取当前的封面并发闸门（未设置时给一个默认容量的）
+func currentCoverSem() chan struct{} {
+	if p := coverSem.Load(); p != nil {
+		return *p
+	}
+	ch := make(chan struct{}, 4)
+	coverSem.Store(&ch)
+	return ch
+}
+
+// currentImgProxy 取当前生效的图片代理前缀（空=不用）
+func currentImgProxy() string {
+	if p := imgProxy.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
 // coverHint 首次失败时给出排查提示（本地/内网环境最常见的是源站被墙、防盗链、DNS 不通）
 func coverHint() string {
-	if imgProxy != "" {
+	if currentImgProxy() != "" {
 		return "" // 已经配了图片代理，别再提示
 	}
 	return "；若大量封面都失败，检查源站是否可访问，或配置 -img-proxy（如 https://wsrv.nl/?url=）"
@@ -1741,8 +1795,8 @@ func fetchCoverBytes(rawURL string) ([]byte, error) {
 		desc      string
 	}
 	var list []attempt
-	if imgProxy != "" {
-		list = append(list, attempt{imgProxy + url.QueryEscape(rawURL), false, "图片代理"})
+	if proxy := currentImgProxy(); proxy != "" {
+		list = append(list, attempt{proxy + url.QueryEscape(rawURL), false, "图片代理"})
 	}
 	list = append(list, attempt{rawURL, true, "原文+Referer"}, attempt{rawURL, false, "原文"})
 	if strings.HasPrefix(rawURL, "https://") {
@@ -1808,7 +1862,14 @@ func fetchCoverBytes(rawURL string) ([]byte, error) {
 }
 
 // SetImageProxy 设置图片代理前缀（形如 https://wsrv.nl/?url=），为空则不用代理
-func SetImageProxy(p string) { imgProxy = strings.TrimSpace(p) }
+func SetImageProxy(p string) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		imgProxy.Store(nil)
+		return
+	}
+	imgProxy.Store(&p)
+}
 
 // CoverStats 封面下载统计（给 /api/system 展示，便于判断"没图"是拉不到还是没触发）
 func CoverStats() (okN, failN int64, lastErr string) {

@@ -63,7 +63,8 @@ const groups: ApiGroup[] = [
   {
     title: '播放与分享',
     items: [
-      { m: 'GET', p: '/play/{id}', d: '播放文件流，?dl=1 作为附件下载' },
+      { m: 'GET', p: '/api/play-token', d: '取本地播放令牌（/play/{id} 需要 ?t=令牌）' },
+      { m: 'GET', p: '/play/{id}', d: '播放文件流，?t=播放令牌，?dl=1 作为附件下载' },
       { m: 'GET', p: '/api/live?u={m3u8}', d: '在线播放代理（改写 m3u8 + 转发分片，绕过源站 CORS）' },
       { m: 'GET', p: '/api/downloads/{id}/share', d: '生成分享链接（局域网地址）' },
       { m: 'GET', p: '/api/share/base', d: '站点根地址（用于二维码）' },

@@ -82,40 +82,59 @@ func pageGap() time.Duration {
 	return pageDelayMin + time.Duration(randInt(int((pageDelayMax-pageDelayMin)/time.Millisecond)))*time.Millisecond
 }
 
-// failGate 记录「连续失败轮次」。任一次成功都会清零，
-// 所以偶发抖动只会触发等待，连续 3 轮才说明源站真的挂了。
+// failGate 记录「连续失败轮次」，用于判断源站是不是真的挂了。
 //
-// 为什么按「轮」而不是按「次」：分页是 12 个 worker 并发的，源站一挂，
-// 同一瞬间会有一批请求一起失败。如果按次数算，3 个并发失败立刻就到 3，
-// 根本等不到 180 秒就把整个接口判死。按轮计算的话，同一批并发失败只算一轮，
-// 等完 180 秒后重试仍然失败才算第二轮。
+// 关键设计（2026-10-21 修复）：**失败计数必须按页独立**。
+// 旧实现只有一个全局 streak，任何一页成功就把整个 streak 清零。分页是 12 个
+// worker 并发的，页 A 持续失败（如响应超限被截断 → 解析失败）而页 B 正常时，
+// 页 A 的失败计数会被页 B 的成功反复清零 → 永远达不到 maxConsecutiveFail=3
+// → 页 A 的 worker 无限重试 → wg.Wait() 永不返回 → 整个源挂死、永远显示「采集中」。
+//
+// 为什么按「轮」而不是按「次」：源站一挂，同一瞬间会有一批请求一起失败。
+// 如果按次数算，3 个并发失败立刻就到 3，根本等不到 180 秒就把整个接口判死。
+// 按轮计算的话，同一批并发失败只算一轮，等完 180 秒后重试仍然失败才算第二轮。
 type failGate struct {
-	mu      sync.Mutex
+	mu    sync.Mutex
+	round int             // 当前轮次编号（每次等待结束进入新一轮）
+	pages map[int]*pgFail // 每个页码各自的失败状态
+}
+
+// pgFail 单个页码的失败状态
+type pgFail struct {
 	streak  int // 连续失败轮次
-	round   int // 当前轮次编号（每次等待结束进入新一轮）
 	counted int // 已经为哪一轮记过失败
 }
 
 // newFailGate 新建闸门。counted 初始为 -1：第 0 轮的第一批失败必须计入。
-func newFailGate() *failGate { return &failGate{counted: -1} }
+func newFailGate() *failGate { return &failGate{pages: map[int]*pgFail{}} }
 
-// fail 记一次失败，返回当前连续失败轮次与是否已达上限
-func (g *failGate) fail() (int, bool) {
+// fail 记一次失败，返回该页的连续失败轮次与是否已达上限
+func (g *failGate) fail(page int) (int, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.counted != g.round {
-		g.streak++
-		g.counted = g.round
+	p := g.pages[page]
+	if p == nil {
+		p = &pgFail{counted: -1}
+		g.pages[page] = p
 	}
-	return g.streak, g.streak >= maxConsecutiveFail
+	if p.counted != g.round {
+		p.streak++
+		p.counted = g.round
+	}
+	return p.streak, p.streak >= maxConsecutiveFail
 }
 
-// ok 记一次成功，返回此前是否存在连续失败（用于清掉进度里的重试提示）
-func (g *failGate) ok() bool {
+// ok 记一次成功，返回此前该页是否存在连续失败（用于清掉进度里的重试提示）。
+// 只清这一页的计数 —— 别的页还在失败时不能把它的计数也清掉。
+func (g *failGate) ok(page int) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	had := g.streak > 0
-	g.streak = 0
+	p := g.pages[page]
+	if p == nil {
+		return false
+	}
+	had := p.streak > 0
+	p.streak = 0
 	return had
 }
 
@@ -221,9 +240,12 @@ func (c *Collector) crawl(src Source, hours, limitPages int) {
 
 	// 探路页：默认用 ac=detail 拿全字段；若源站不支持 detail 分页则回退 ac=list
 	useAC := acDetail
-	first, err := c.fetchPageRetry(ctx, &src, startPage, hours, useAC, gate)
+	// 本次采集使用的接口地址（首包 404 被自动纠正后，后续分页都用新地址）
+	holder := &apiURLHolder{url: src.APIURL}
+
+	first, err := c.fetchPageRetry(ctx, &src, startPage, hours, useAC, gate, holder)
 	if err == nil && len(first.Items) == 0 {
-		if alt, e2 := c.fetchPage(ctx, &src, startPage, hours, acList); e2 == nil && len(alt.Items) > 0 {
+		if alt, e2 := c.fetchPage(ctx, &src, startPage, hours, acList, holder); e2 == nil && len(alt.Items) > 0 {
 			logx.Printf("[collect] %s ac=detail 无数据，回退 ac=list 模式", src.Name)
 			useAC, first = acList, alt
 		}
@@ -277,7 +299,7 @@ func (c *Collector) crawl(src Source, hours, limitPages int) {
 		return
 	}
 	if pageCount > startPage {
-		if probe, perr := c.fetchPage(ctx, &src, startPage+1, hours, useAC); perr == nil {
+		if probe, perr := c.fetchPage(ctx, &src, startPage+1, hours, useAC, holder); perr == nil {
 			if pageSignature(probe.Items) == pageSignature(first.Items) {
 				msg := "源站忽略 pg 参数（第 2 页与第 1 页内容完全相同），已停止分页。" +
 					"该接口不支持分页全量采集，只能采到单页数据；增量采集不受影响。"
@@ -344,7 +366,7 @@ func (c *Collector) crawl(src Source, hours, limitPages int) {
 					// 增量只采前几页，保留原来的轻微抖动即可
 					sleepCtx(ctx, time.Duration(10+randInt(40))*time.Millisecond)
 				}
-				pr, ferr := c.fetchPageRetry(ctx, &src, p, hours, useAC, gate)
+				pr, ferr := c.fetchPageRetry(ctx, &src, p, hours, useAC, gate, holder)
 				if ferr != nil {
 					if ctx.Err() != nil { // 停止/终止导致的失败不再统计
 						continue
@@ -425,23 +447,23 @@ feed:
 
 // fetchPage 拉取一页。ac=detail 时源站一次返回全字段（封面/演员/地区/年份/简介/播放地址），
 // 无需再逐条补 detail，采集效率更高、数据更完整。
-func (c *Collector) fetchPage(ctx context.Context, src *Source, page, hours int, ac string) (*pageResult, error) {
+func (c *Collector) fetchPage(ctx context.Context, src *Source, page, hours int, ac string, holder *apiURLHolder) (*pageResult, error) {
 	q := url.Values{"ac": {ac}, "pg": {strconv.Itoa(page)}, "limit": {strconv.Itoa(pageSize)}}
 	if hours > 0 {
 		q.Set("h", strconv.Itoa(hours))
 		q.Set("by", "time")
 		q.Set("sort", "desc")
 	}
-	return c.fetch(ctx, src, q)
+	return c.fetch(ctx, src, q, holder)
 }
 
 // fetchPageRetry 拉取一页，失败时等 180 秒重试；连续 3 次失败才返回错误（由调用方终止采集）。
 // 只有「连续」失败才计数，成功一次就清零 —— 源站偶发超时不会把整个接口的同步打断。
-func (c *Collector) fetchPageRetry(ctx context.Context, src *Source, page, hours int, ac string, gate *failGate) (*pageResult, error) {
+func (c *Collector) fetchPageRetry(ctx context.Context, src *Source, page, hours int, ac string, gate *failGate, holder *apiURLHolder) (*pageResult, error) {
 	for {
-		pr, err := c.fetchPage(ctx, src, page, hours, ac)
+		pr, err := c.fetchPage(ctx, src, page, hours, ac, holder)
 		if err == nil {
-			if gate.ok() {
+			if gate.ok(page) {
 				// 之前是抖动，已经恢复：清掉进度里的「稍后重试」提示
 				GlobalProgress.update(src.ID, func(sp *SourceProgress) { sp.Error = "" })
 			}
@@ -450,7 +472,7 @@ func (c *Collector) fetchPageRetry(ctx context.Context, src *Source, page, hours
 		if ctx.Err() != nil { // 用户停止：直接把取消原因抛回去
 			return nil, err
 		}
-		n, fatal := gate.fail()
+		n, fatal := gate.fail(page)
 		if fatal {
 			return nil, fmt.Errorf("连续 %d 轮抓取失败（每轮间隔 %d 秒）：%w",
 				maxConsecutiveFail, int(failRetryDelay.Seconds()), err)

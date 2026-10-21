@@ -48,15 +48,18 @@ var (
 			ForceAttemptHTTP2:     true,
 		},
 	}
-	ffmpegBin string
+	ffmpegBin atomic.Pointer[string]
 
 	// 转码参数：弱 CPU 的 NAS 上非常重要（详见 SetTranscodeOptions）
 	ffThreads         = 0    // ffmpeg -threads，0=用默认（通常是全部核心）
 	allowFullReencode = true // 允许"全量重编码视频"兜底（libx264 会把弱 CPU 打满数小时）
 	enableSyncVerify  = true // 合并后是否跑音画同步自检（每次多起 2 个 ffmpeg 进程）
 
-	// segBudget 全局分片下载闸门：多个下载任务共享，避免"2 任务 × 16 并发"瞬间打满内存
-	segBudget chan struct{}
+	// segBudget 全局分片下载闸门：多个下载任务共享，避免"2 任务 × 16 并发"瞬间打满内存。
+	// 用 atomic.Pointer 存：热更新会整体替换这个 channel，
+	// 而 acquireSeg 的释放闭包必须在**调用时**释放当初拿到令牌的那个 channel，
+	// 否则替换后 `<-新channel` 会永久阻塞（下载任务卡在 downloading 不动）。
+	segBudget atomic.Pointer[chan struct{}]
 )
 
 // SetTranscodeOptions 由 main 按机器规格设置 ffmpeg 行为。
@@ -77,15 +80,21 @@ func SetSegmentBudget(n int) {
 	if n < 1 {
 		n = 1
 	}
-	segBudget = make(chan struct{}, n)
+	ch := make(chan struct{}, n)
+	segBudget.Store(&ch)
 }
 
+// acquireSeg 取一个分片令牌，返回释放函数。
+// 释放闭包必须捕获**取令牌时**的 channel：热更新会替换全局 channel，
+// 若释放时再读全局，就会从一个空的新 channel 里读 → 永久阻塞 → 任务卡死。
 func acquireSeg() func() {
-	if segBudget == nil {
+	p := segBudget.Load()
+	if p == nil {
 		return func() {}
 	}
-	segBudget <- struct{}{}
-	return func() { <-segBudget }
+	ch := *p
+	ch <- struct{}{}
+	return func() { <-ch }
 }
 
 // tailBuf 只保留最后 lim 字节的 io.Writer，用来承接 ffmpeg stderr。
@@ -122,10 +131,21 @@ func (t *tailBuf) String() string { return string(t.buf) }
 var ErrCanceled = errors.New("下载已取消")
 
 // Init 注入 ffmpeg 可执行文件路径（内置解压后的路径或系统路径）
-func Init(ffmpegPath string) { ffmpegBin = ffmpegPath }
+func Init(ffmpegPath string) {
+	if ffmpegPath == "" {
+		ffmpegBin.Store(nil)
+		return
+	}
+	ffmpegBin.Store(&ffmpegPath)
+}
 
 // FFmpeg 返回当前可用的 ffmpeg 路径
-func FFmpeg() string { return ffmpegBin }
+func FFmpeg() string {
+	if p := ffmpegBin.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
 
 // threadArgs 给 ffmpeg 传 -threads（弱 CPU 的 NAS 上限制在 1~2，
 // 否则一次合并/重编码就把整机核心占满，页面和其它任务全部卡住）
@@ -432,10 +452,11 @@ func FetchSegments(playURL, dir string, concurrency int, onProgress func(int), o
 		}
 		ts := filepath.Join(dir, "raw.ts")
 		if _, err := os.Stat(ts); err != nil {
-			if ffmpegBin == "" {
+			fb := FFmpeg()
+			if fb == "" {
 				return nil, fmt.Errorf("内置 ffmpeg 不可用，无法处理直链视频")
 			}
-			cmd := exec.Command(ffmpegBin, "-y", "-i", raw, "-c", "copy", "-bsf:a", "aac_adtstoasc", ts)
+			cmd := exec.Command(fb, "-y", "-i", raw, "-c", "copy", "-bsf:a", "aac_adtstoasc", ts)
 			eb := newTailBuf(32 << 10)
 			cmd.Stderr = eb
 			if err := cmd.Run(); err != nil {
@@ -449,7 +470,9 @@ func FetchSegments(playURL, dir string, concurrency int, onProgress func(int), o
 		return &FetchResult{Segments: []string{ts}}, nil
 	}
 
-	body := fetchTextRef(playURL, "")
+	// 播放列表也要带 Referer：分片请求带了，唯独播放列表漏了，
+	// 对校验 Referer 的源会直接 403（表现是"获取 m3u8 失败"）。
+	body := fetchTextRef(playURL, originOf(playURL))
 	if body == "" {
 		return nil, fmt.Errorf("获取 m3u8 失败: %s", playURL)
 	}
@@ -507,10 +530,11 @@ func FetchSegments(playURL, dir string, concurrency int, onProgress func(int), o
 // 直接重编码为 AAC：一方面归一化各分片时间轴（消除分片间戳不连续），
 // 另一方面兼容 .aac/.ts/fMP4 等分片封装差异，避免 concat demuxer 混格式失败。
 func fetchAudioTrack(audioURL, dir string, concurrency int, check func() bool) (string, error) {
-	if ffmpegBin == "" {
+	fb := FFmpeg()
+	if fb == "" {
 		return "", fmt.Errorf("内置 ffmpeg 不可用，无法合并独立音频轨")
 	}
-	body := fetchTextRef(audioURL, "")
+	body := fetchTextRef(audioURL, originOf(audioURL))
 	if body == "" {
 		return "", fmt.Errorf("获取音频 m3u8 失败: %s", audioURL)
 	}
@@ -544,7 +568,7 @@ func fetchAudioTrack(audioURL, dir string, concurrency int, check func() bool) (
 	audioArgs = append(audioArgs, threadArgs()...)
 	audioArgs = append(audioArgs,
 		"-c:a", "aac", "-b:a", "192k", "-af", "aresample=async=1:first_pts=0", out)
-	cmd := exec.Command(ffmpegBin, audioArgs...)
+	cmd := exec.Command(fb, audioArgs...)
 	eb := newTailBuf(32 << 10)
 	cmd.Stderr = eb
 	if err := cmd.Run(); err != nil {
@@ -609,7 +633,16 @@ func DownloadToMP4(playURL, outPath string, opt Options) error {
 	if opt.OnPhase != nil {
 		opt.OnPhase("merge")
 	}
-	if err := ConcatToMP4(res.Segments, outPath, res.AudioFile, res.ForceReenc, res.Duration, opt.OnProgress); err != nil {
+	// 先合并到 .part.mp4 再改名：ffmpeg 被 watchdog kill 时会留下半成品 mp4，
+	// 直接写正式文件名的话，磁盘上会多一个"看起来下载好了、其实播不了"的文件。
+	// 后缀保持 .mp4 是必须的 —— ffmpeg 靠扩展名推断封装格式。
+	tmpOut := outPath + ".part.mp4"
+	os.Remove(tmpOut)
+	if err := ConcatToMP4(res.Segments, tmpOut, res.AudioFile, res.ForceReenc, res.Duration, opt.OnProgress); err != nil {
+		os.Remove(tmpOut) // 半成品没价值
+		return err
+	}
+	if err := os.Rename(tmpOut, outPath); err != nil {
 		return err
 	}
 	os.RemoveAll(outPath + ".segs")
@@ -629,7 +662,8 @@ func ConcatToMP4(segments []string, out, audioFile string, forceReenc bool, tota
 	if len(segments) == 0 {
 		return fmt.Errorf("没有可合并的分片")
 	}
-	if ffmpegBin == "" {
+	fb := FFmpeg()
+	if fb == "" {
 		return fmt.Errorf("内置 ffmpeg 不可用，无法合并为 mp4")
 	}
 	if abs, aerr := filepath.Abs(out); aerr == nil {
@@ -729,7 +763,7 @@ func ConcatToMP4(segments []string, out, audioFile string, forceReenc bool, tota
 //
 // stdout 被 -progress 占用，ffmpeg 的日志仍在 stderr，所以不会互相干扰。
 func runFFmpegProgress(args []string, totalDur float64, onPct func(int)) (string, error) {
-	cmd := exec.Command(ffmpegBin, args...)
+	cmd := exec.Command(FFmpeg(), args...)
 	stdout, perr := cmd.StdoutPipe()
 	if perr != nil {
 		return "", perr
@@ -819,7 +853,7 @@ func verifySync(out string) error {
 		vargs := append([]string{"-hide_banner", "-t", "3", "-i", out, "-map", mapSel, filterOpt, filter},
 			threadArgs()...)
 		vargs = append(vargs, "-f", "null", "-")
-		cmd := exec.Command(ffmpegBin, vargs...)
+		cmd := exec.Command(FFmpeg(), vargs...)
 		ebuf := newTailBuf(64 << 10)
 		cmd.Stderr = ebuf
 		_ = cmd.Run() // -t 截断导致非零退出属正常，只解析输出
@@ -1403,16 +1437,27 @@ func aesCBCDecrypt(key, iv, data []byte) ([]byte, error) {
 
 // ---------------------------------------------------------------- 基础工具
 
-// extraHeaders 额外的全局请求头（如 Cookie），由 main 通过 SetHTTPHeaders 注入
-var extraHeaders = map[string]string{}
+// extraHeaders 额外的全局请求头（如 Cookie），由 main 通过 SetHTTPHeaders 注入。
+// 用 copy-on-write + atomic.Pointer：整体替换 map 与并发遍历会触发
+// runtime "concurrent map iteration and map write" panic。
+var extraHeaders atomic.Pointer[map[string]string]
 
 // SetHTTPHeaders 设置 m3u8 / 分片 / 密钥请求都会带上的额外请求头。
 // 部分源校验 Referer、Cookie，缺了直接 403；Referer 默认按播放列表域名自动补。
 func SetHTTPHeaders(h map[string]string) {
-	extraHeaders = map[string]string{}
+	cp := make(map[string]string, len(h))
 	for k, v := range h {
-		extraHeaders[k] = v
+		cp[k] = v
 	}
+	extraHeaders.Store(&cp)
+}
+
+// currentHeaders 取当前生效的额外请求头（返回的 map 是只读快照，不要改）
+func currentHeaders() map[string]string {
+	if p := extraHeaders.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // originOf 取 URL 的「协议 + 主机」作为默认 Referer（防盗链最常见的要求）
@@ -1437,7 +1482,7 @@ func newReq(u, referer string, start, length int64) (*http.Request, error) {
 	if referer != "" {
 		req.Header.Set("Referer", referer)
 	}
-	for k, v := range extraHeaders {
+	for k, v := range currentHeaders() {
 		req.Header.Set(k, v)
 	}
 	if start >= 0 && length > 0 {
@@ -1583,6 +1628,13 @@ func downloadFile(u, dst string, onProgress func(int), onSpeed func(string), che
 	if err := f.Close(); err != nil {
 		return err
 	}
+	// 截断检测：连接中断/超时也会走到上面的 break 分支，
+	// 旧实现不核对字节数就把半截文件 rename 成正式文件 → 后面合并报错、甚至花屏，
+	// 而且任务状态还会被标成 done。这里按 Content-Length 核对，缺字节就报错并保留 .part 续传。
+	if total > 0 && written < total {
+		return fmt.Errorf("下载不完整：已写入 %s / 预期 %s（连接中断，保留 .part 可续传）",
+			humanSize(written), humanSize(total))
+	}
 	return os.Rename(part, dst)
 }
 
@@ -1648,8 +1700,10 @@ func Sanitize(name string) string {
 	if s == "" {
 		s = "video"
 	}
-	if len(s) > 80 {
-		s = s[:80]
+	// 按 rune 截断：按字节切会把中文劈成半个字符（文件名乱码），
+	// 而且两个不同的片名可能截成同一个名字 → 互相覆盖。
+	if r := []rune(s); len(r) > 80 {
+		s = string(r[:80])
 	}
 	return s
 }

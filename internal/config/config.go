@@ -334,7 +334,18 @@ func (c *Config) normalize() {
 	c.MaxProcs = clampInt(c.MaxProcs, 0, 256)
 	if c.DB.PageSize != 0 {
 		c.DB.PageSize = clampInt(c.DB.PageSize, 512, 65536)
+		// SQLite 只接受 2 的幂作为 page_size，写错会被静默忽略；
+		// 而「设置后读回来比对」的判断逻辑在非 2 的幂下永远不相等 → 每次启动白跑一次全库 VACUUM。
+		// 这里直接把非法值归零（= 用默认 4096），避免反复触发。
+		if !isPowerOfTwo(c.DB.PageSize) {
+			c.DB.PageSize = 0
+		}
 	}
+}
+
+// isPowerOfTwo 判断 n 是否为 2 的幂（n > 0）
+func isPowerOfTwo(n int) bool {
+	return n > 0 && n&(n-1) == 0
 }
 
 // clampInt 把 v 限制在 [lo, hi] 区间
@@ -405,6 +416,26 @@ func Parse(text string) (*Config, error) {
 	cfg := Defaults()
 	if probeLowMem(body) || lowMemFromEnv() {
 		cfg = LowMemDefaults()
+	}
+	if err := applyDoc(body, cfg); err != nil {
+		return nil, err
+	}
+	cfg.normalize()
+	return cfg, nil
+}
+
+// ParseInto 解析一段配置文本并**合并**到给定的基线配置上：
+// 文本里出现的字段覆盖基线，文本里没出现的字段保持基线原值。
+// 用于「贴文本保存」场景——基线必须是磁盘上当前生效的配置，而不是出厂默认值，
+// 否则用户没在文本里提到的字段会被静默重置回默认。
+func ParseInto(base *Config, text string) (*Config, error) {
+	body := normalizeInput(text)
+	var cfg *Config
+	if base != nil {
+		cp := *base // Config 字段全为值类型，浅拷贝即可隔离
+		cfg = &cp
+	} else {
+		cfg = Defaults()
 	}
 	if err := applyDoc(body, cfg); err != nil {
 		return nil, err
@@ -495,11 +526,7 @@ func SaveUI(path string, c *Config) error {
 			return err
 		}
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	return writeFileAtomic(path, b)
 }
 
 // Save 把 advanced 段写成 YAML（原子写：先写临时文件再改名）
@@ -508,11 +535,55 @@ func Save(path string, c *Config) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	return writeFileAtomic(path, b)
+}
+
+// writeFileAtomic 原子写文件：唯一临时名 → 写 → fsync → 改名 → fsync 目录。
+//
+// 为什么不用固定名 "path.tmp"：并发保存（页面连点两次 / 定时任务）会互相截断临时文件，
+// 发布出半截配置。为什么必须 fsync：写完就改名但没落盘时，掉电后可能得到 0 字节配置，
+// 回退默认值后数据目录就跑偏了（表现为"数据全没了"）。
+func writeFileAtomic(path string, b []byte) error {
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer func() {
+		// 出错时清掉临时文件；成功路径已被 Rename 移走，这里删不到东西
+		_ = os.Remove(tmp)
+	}()
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// Windows 上目标文件存在时 os.Rename 会失败，先删掉旧文件
+	if _, statErr := os.Stat(path); statErr == nil && runtime.GOOS == "windows" {
+		_ = os.Remove(path)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	// fsync 目录项，保证改名本身落盘（部分文件系统需要）
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // normalizeInput 统一输入文本：旧版 JSON（以 { 开头）先剥掉 // 与 /* */ 注释；
@@ -823,6 +894,49 @@ func ApplyPatch(cfg *Config, data []byte) error {
 		return err
 	}
 	p.apply(cfg)
+	return nil
+}
+
+// 页面可改的分组：只有这四段允许通过接口写入（保存即生效）。
+var uiWritableSections = map[string]bool{"collect": true, "download": true, "cover": true, "ffmpeg": true}
+
+// ApplyUIPatch 只允许修改「页面可改」的四段（collect / download / cover / ffmpeg），
+// 其余字段（advanced / server / data_dir / log_level / lowmem / mem_limit_mb /
+// max_procs / db）一律拒绝。
+//
+// 为什么要有这个限制：docPatch 同时兼容新旧两种结构，接口如果直接用 ApplyPatch，
+// 一次 PUT 就能把 data_dir 改到别处、server.addr 改到别的端口、db.conns 改到 32 ——
+// 页面只是"改参数"，不该有这些权限（这些项按设计要重启才生效，本来也不该在页面上给）。
+func ApplyUIPatch(cfg *Config, data []byte) error {
+	// 先看原始 key：解析成结构体后 "advanced: {}"（空段）也会被判为"出现了"。
+	// 注意：这里必须用 map[string]any —— YAML 不能反序列化到 json.RawMessage。
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	for k := range raw {
+		if !uiWritableSections[k] {
+			return fmt.Errorf("「%s」不能在页面上修改（该项需要重启才生效，请编辑配置文件）", k)
+		}
+	}
+	var p docPatch
+	if err := yaml.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	// 只应用四段：兼容 UI 段 / 顶层平铺 / advanced 里的旧版 cover
+	if u := p.UI; u != nil {
+		u.Collect.apply(cfg)
+		u.Download.apply(cfg)
+		u.Cover.apply(cfg)
+		u.FFmpeg.apply(cfg)
+	}
+	p.Collect.apply(cfg)
+	p.Download.apply(cfg)
+	p.Cover.apply(cfg)
+	p.FFmpeg.apply(cfg)
+	if a := p.Advanced; a != nil && a.Cover != nil {
+		a.Cover.apply(cfg)
+	}
 	return nil
 }
 

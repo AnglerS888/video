@@ -59,55 +59,87 @@ cp config.example.yml config.yml   # 精简模板：默认值与低配/标准预
 docker compose up -d
 ```
 
+仓库里的 `docker-compose.yml` **已经把国内链路配好**（基础镜像走国内镜像站、Go 模块代理 /
+校验库 / 工具链都走国内代理、apk 走阿里云源），在国内直接 `docker compose up -d` 即可，
+不需要手动改任何源。目标架构由构建器自动决定，ARM 机型（部分飞牛 / 群晖 NAS）也适用。
+
+需要调整时用环境变量覆盖，例如：
+
+```bash
+GOLANG_IMAGE=golang:1.26-alpine RUNTIME_IMAGE=golang:1.26-alpine \
+GOPROXY=https://proxy.golang.org,direct GOSUMDB=sum.golang.org \
+docker compose up -d --build
+```
+
 ### Linux 一键部署 / 更新（推荐）
 
 ```bash
 chmod +x deploy.sh
 sudo ./deploy.sh                 # 交互式：询问宿主端口、数据存储路径
 sudo ./deploy.sh --yes           # 不交互；已有容器则沿用它的端口与数据目录
+sudo ./deploy.sh --check         # 网络体检：Gitee / Go 代理 / 校验库转发 / Alpine 源 / 镜像站逐个探活
 ./deploy.sh --dry-run            # 只打印将要执行的命令，不安装、不构建
 ```
 
 脚本会依次做：
 
-1. **检测 Docker**：没有就按发行版自动安装（apt / dnf / yum / apk / zypper），并 `enable --now`
-   启动服务；构建默认走国内源（见下），不需要手动配镜像加速；
-2. **拉最新源码**：目录里是 git 仓库就 `git pull`，否则下载 Gitee 的 `master.zip` 解压；
-3. **构建镜像**：`docker build --build-arg APP_VERSION=<VERSION>`，旧镜像自动标记为
-   `videodl:previous`（回滚用）；
+1. **检测 Docker**：没有就自动装 —— **优先用国内 docker-ce 源**（阿里云 `mirrors.aliyun.com/docker-ce`，
+   apt / dnf / yum 全覆盖），失败才回退官方脚本 `get.docker.com`，再失败用发行版自带的 `docker.io`；
+   装完 `enable --now` 启动服务；
+2. **拉最新源码**：目录里是 git 仓库就 `git pull`，空目录用 `git clone --depth 1`，
+   都不行就下载 Gitee 的 `master.zip` 解压（下载固定用命令行风格 UA —— Gitee 对浏览器 UA
+   会返回登录页 HTML 而不是 zip，脚本会校验文件头并给出明确报错）；
+3. **构建镜像**：先把基础镜像显式 `docker pull` 下来（国内大层慢，先拉一次能看清进度），
+   再 `docker build`；**镜像站按候选顺序逐个探活，第一个可用的就用它，构建失败自动换下一个重试**；
+   旧镜像自动标记为 `videodl:previous`（回滚用）；
 4. **启动容器**：`--restart unless-stopped`、`-p <端口>:5200`、`-v <数据目录>:/app/videodata`、
    `VDL_CONFIG=/app/videodata/config.yml`，并等 `/healthz` 通过；
 5. **再次执行 = 更新**：自动读取现有容器的端口与数据目录，重建镜像后替换容器；
    新镜像启动失败会自动回滚到 `videodl:previous`。
 
-常用参数：`--port` / `--data` / `--source-dir` / `--registry` / `--apk-mirror` / `--goproxy` /
-`--official` / `--registry-mirror` / `--no-install` / `--yes`，完整说明见 `./deploy.sh --help`。
+常用参数：`--port` / `--data` / `--source-dir` / `--registry` / `--registry-list` / `--apk-mirror` /
+`--goproxy` / `--gosumdb` / `--gotoolchain` / `--arch` / `--official` / `--registry-mirror` /
+`--no-install` / `--check` / `--yes`，
+完整说明见 `./deploy.sh --help`。
 
-首次构建正常 2~5 分钟（国内走 1panel + 阿里云源）；中断后重跑会复用已下载的层，
+首次构建正常 2~5 分钟（国内走镜像站 + 阿里云源）；中断后重跑会复用已下载的层，
 之后的更新构建通常 1~2 分钟。
 
 **国内加速（默认已开启，不用你配）**
 
 | 环节 | 默认值 | 说明 |
 |---|---|---|
-| 基础镜像 | `docker.1panel.live` | 实测大层 ~1.2MB/s；备用 `docker.1ms.run`（其 manifest 快但大层走 CloudFront，实测仅 ~29KB/s） |
-| Alpine 软件源 | `https://mirrors.aliyun.com/alpine` | `apk add` 从几十秒/几分钟降到几秒；**填到 `/alpine` 这一级**，填错（如多一层 /alpine）会 404 |
-| Go 模块代理 | `https://goproxy.cn,direct` | 构建阶段的 `go mod download` |
+| 基础镜像 | `docker.1panel.live` | 候选顺序：1panel → 1ms.run → daocloud → amingg，逐个探活取第一个可用的 |
+| Alpine 软件源 | `https://mirrors.aliyun.com/alpine` | 备用 `https://mirrors.tuna.tsinghua.edu.cn/alpine`；**填到 `/alpine` 这一级**，填错（如多一层 /alpine）会 404 |
+| Go 模块代理 | `goproxy.cn｜阿里云｜腾讯云｜goproxy.io｜direct` | 竖线 `\|` = 前一个代理**出错**也立刻换下一个（国内网络抖必须用竖线，逗号只在 404 时才换） |
+| 校验数据库 | `GOSUMDB=sum.golang.org` | **不关**。`sum.golang.org` 本身连不上，但 Go 会把 sumdb 查询**转发给 GOPROXY 里的代理**（`<代理>/sumdb/sum.golang.org/lookup/...`），实测 goproxy.cn / 阿里云 / 腾讯云都返回 200 |
+| Go 工具链 | `GOTOOLCHAIN=auto` | 基础镜像的 Go 版本低于 `go.mod` 要求时，自动经代理下载对应版本工具链（约 70MB，一次性开销）；离线环境可设 `local` |
+| Docker 本体安装源 | `https://mirrors.aliyun.com/docker-ce` | apt / dnf / yum 全覆盖，比 `get.docker.com` 快得多 |
 
 也就是说国内服务器直接 `sudo ./deploy.sh` 就是全国内链路。要调整：
 
 ```bash
-sudo ./deploy.sh --registry docker.1panel.live # 换基础镜像仓库（传空或 docker.io 用官方）
-sudo ./deploy.sh --registry-fallback ""        # 关掉自动备用仓库
-sudo ./deploy.sh --apk-mirror ""               # 用 Alpine 官方源
-sudo ./deploy.sh --official                    # 全部切回官方（海外机器）
+sudo ./deploy.sh --check                           # 先体检：看哪个镜像站/代理当前可用
+sudo ./deploy.sh --registry docker.1ms.run         # 指定基础镜像仓库
+sudo ./deploy.sh --registry-list "a.example.com b.example.com"  # 自定义候选镜像站（按顺序探活）
+sudo ./deploy.sh --registry-fallback ""            # 关掉自动备用仓库
+sudo ./deploy.sh --apk-mirror ""                   # 用 Alpine 官方源
+sudo ./deploy.sh --goproxy "https://proxy.golang.org,direct"  # 用官方 Go 代理
+sudo ./deploy.sh --official                        # 全部切回官方（海外机器）
 ```
 
-> apk 源不可用时会**自动回退官方源**重试，不会让构建直接失败。
+> 镜像站探活用的是「能不能取到 `golang:1.26-alpine` 的 manifest」，判定规则：
+> 返回 **200** 直接可用；返回 **401/403 且带 `WWW-Authenticate: Bearer`** 说明镜像站愿意发 token
+> （docker 自己能完成握手），同样可用；返回**裸 403**（没有 `WWW-Authenticate` 头）
+> 说明镜像站直接拒绝、docker 也拿不到 token，**判为不可用并自动跳过**
+> （`docker.xuanyuan.me` / `docker.nju.edu.cn` 实测就是这种，已从候选列表里移除）。
 >
-> 不再需要给 Docker daemon 配 `registry-mirrors`（那会重启 Docker，影响机器上的其它容器）。
+> apk 源不可用时会**自动换下一个源**重试，不会让构建直接失败。
+>
+> 默认不给 Docker daemon 配 `registry-mirrors`（那会重启 Docker，影响机器上的其它容器）。
 > 基础镜像是**带仓库前缀的完整名字**，只影响本次构建。确实想给全局加速再加
-> `--registry-mirror https://docker.1ms.run`。
+> `--registry-mirror https://docker.1ms.run`（可给多个，用逗号分隔；脚本会**保留
+> `daemon.json` 里已有的其它配置**，只改 `registry-mirrors` 一个键）。
 
 
 镜像不再内置 ffmpeg（二进制约 12MB，不再是 40MB）。运行时的解析顺序是：
@@ -121,12 +153,49 @@ sudo ./deploy.sh --official                    # 全部切回官方（海外机�
 想彻底离线就自己装：`docker run ... ` 里加 `apk add ffmpeg` 重打镜像，或手动把 ffmpeg 放进
 `videodata/bin/`。状态与进度都在「信息」页，失败会显示原因并可点「重新下载」。
 
-构建阶段默认走国内 Go 模块代理 `https://goproxy.cn`（`proxy.golang.org` 在国内连不上，
-会报 `dial tcp ...:443: i/o timeout`）。海外机器可以覆盖：
+构建阶段默认走国内 Go 模块代理，且**串联多个代理自动兜底**：
+
+```
+GOPROXY=https://goproxy.cn|https://mirrors.aliyun.com/goproxy/|https://mirrors.cloud.tencent.com/go/|https://goproxy.io|direct
+```
+
+竖线 `|` 的含义是「前一个代理出错（超时 / DNS 抖动）也立刻换下一个」；逗号 `,` 只在
+前一个返回 404 时才换 —— 国内网络抖，必须用竖线。`proxy.golang.org` 在国内连不上，
+会报 `dial tcp ...:443: i/o timeout`。
+
+**校验数据库保持开启（`GOSUMDB=sum.golang.org`），不要改成 `off`。**
+`sum.golang.org` 本身国内连不上，但 Go 会把 sumdb 查询**转发给 GOPROXY 里的代理**
+（`<代理>/sumdb/sum.golang.org/lookup/...`），实测 goproxy.cn / 阿里云 / 腾讯云都返回 200，
+所以国内照样能用。
+
+反例（**会失败**）：`GOSUMDB=off` 时，Go 想自动补齐缺失的工具链
+（`golang.org/toolchain`）会走 sumdb 校验，被直接拒绝：
+
+```
+go: download go1.26.9: golang.org/toolchain@v0.0.1-go1.26.9.linux-amd64:
+    verifying module: checksum database disabled by GOSUMDB=off
+```
+
+这会让「基础镜像 Go 版本略旧」的场景直接构建失败。海外机器可以覆盖成官方源：
 
 ```bash
-docker build --build-arg GOPROXY=https://proxy.golang.org,direct -t videodl:latest .
+docker build --build-arg GOPROXY=https://proxy.golang.org,direct \
+             --build-arg GOSUMDB=sum.golang.org -t videodl:latest .
 ```
+
+> 基础镜像也可以整条链换掉（国内镜像站 → 官方）：
+> `docker build --build-arg GOLANG_IMAGE=golang:1.26-alpine --build-arg RUNTIME_IMAGE=golang:1.26-alpine .`
+>
+> 构建时会先校验基础镜像里的 Go 版本是否满足 `go.mod`（国内镜像站的 golang 镜像偶尔滞后）。
+> 默认 `GOTOOLCHAIN=auto`：版本不够时只告警，随后 Go 自动经代理补齐工具链继续构建；
+> 离线环境可以传 `--build-arg GOTOOLCHAIN=local`，此时版本不够会**立刻失败**并给出可操作提示。
+>
+> **目标架构不用配**：BuildKit 会自动注入 `TARGETARCH`（跟随 `--platform`），
+> 老版本 Docker（20.10 的 classic builder）没有这个变量，Dockerfile 会回落到
+> `go env GOARCH`（= 宿主架构）。两种情况都是「给谁构建就出谁的架构」。
+> ⚠️ 不要在 Dockerfile / `docker-compose.yml` 里写死 `TARGETARCH=amd64` —— 那会盖掉
+> BuildKit 注入的值，ARM 机器（部分飞牛/群晖 NAS）上编出 x86 二进制，容器起来直接
+> `exec format error`。`docker-compose.yml` 里这两项刻意留空（null）。
 
 ### 第一次使用
 
@@ -482,10 +551,13 @@ VDL_CONFIG=/vol1/videodata/config.yml ./videodl-linux-amd64
 或直接用仓库里的 `docker-compose.yml`，已经配好：
 
 - `lowmem: true`（或启动前设 `VDL_LOWMEM=1`，`make run-lowmem` 就是这么跑的）
-- 容器内存上限 1G，数据卷 `./videodata:/app/videodata`
+- 容器内存上限 2G（留出来给「在线更新」时在容器内 `go build` 用，弱机可改回 1G），数据卷 `./videodata:/app/videodata`
 - `init: true` + `stop_grace_period: 30s`，`docker stop` 时能让合并中的 ffmpeg 收尾
 - 日志按 10MB × 3 份滚动，避免长期运行吃掉系统盘
 - 健康检查用 `/healthz`（只做 `SELECT 1`），不用会扫全表的 `/api/system`
+- **国内链路已配好**：基础镜像走国内镜像站、Go 模块代理 / 校验库 / 工具链都走国内代理、
+  apk 走阿里云源，`docker compose up -d` 直接可用；`TARGETOS`/`TARGETARCH` 刻意留空，
+  让构建器自动决定架构（ARM NAS 不会被编成 x86）
 
 实测空载 / 小库时常驻约 80~120MB（不再内嵌 ffmpeg，省掉约 40MB 只读段），均不含转码时的额外开销；
 采集与封面预取高峰期会明显上升，NAS 建议在配置里开 `lowmem`。

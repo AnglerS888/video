@@ -63,31 +63,33 @@ var (
 	// dlSegConcurrency 单个下载任务的分片并发数。
 	// 弱 CPU 的 NAS 上默认 16 会让"2 个任务 × 16 分片"同时吃满带宽与内存，
 	// 由 main 按机器规格下调（-seg-concurrency）。
-	dlSegConcurrency = 16
+	// 热更新会改这个值，用 atomic 读写（普通 int 的并发读写是 data race）。
+	dlSegConcurrency atomic.Int64
 
 	// dlMinFreeBytes 磁盘剩余空间保护阈值（0=关闭）：
 	// 低于它时拒绝新建下载任务，已排队的任务在起跑前自动暂停，
 	// 防止一部剧把数据盘彻底写满（盘满后 SQLite 也会跟着写失败）。
-	dlMinFreeBytes int64
+	dlMinFreeBytes atomic.Int64
 )
 
 // SetMinFreeBytes 设置磁盘保护阈值（字节，0=关闭），main 启动时调用
-func SetMinFreeBytes(n int64) { dlMinFreeBytes = n }
+func SetMinFreeBytes(n int64) { dlMinFreeBytes.Store(n) }
 
 // MinFreeBytes 当前磁盘保护阈值（字节），信息页展示/告警用
-func MinFreeBytes() int64 { return dlMinFreeBytes }
+func MinFreeBytes() int64 { return dlMinFreeBytes.Load() }
 
 // diskSpaceLow 数据盘剩余空间是否已低于保护阈值。
 // 平台不支持读取（返回 0）时不误伤，当作空间充足。
 func diskSpaceLow() (uint64, bool) {
-	if dlMinFreeBytes <= 0 || downloadDir == "" {
+	limit := dlMinFreeBytes.Load()
+	if limit <= 0 || downloadDir == "" {
 		return 0, false
 	}
 	_, free := sysinfo.DiskOf(downloadDir)
 	if free == 0 {
 		return 0, false
 	}
-	return free, free < uint64(dlMinFreeBytes)
+	return free, free < uint64(limit)
 }
 
 // SetDownloadConcurrency 设置单任务分片并发（main 调用）
@@ -98,7 +100,16 @@ func SetDownloadConcurrency(n int) {
 	if n > 64 {
 		n = 64
 	}
-	dlSegConcurrency = n
+	dlSegConcurrency.Store(int64(n))
+}
+
+// segConcurrency 当前单任务分片并发数
+func segConcurrency() int {
+	n := int(dlSegConcurrency.Load())
+	if n < 1 {
+		return 1
+	}
+	return n
 }
 
 func dlControl(id int64) *atomic.Bool {
@@ -147,7 +158,7 @@ func EnqueueDownloadBatch(vodID int64, playFrom string, epIndices []int) (int, i
 	// 磁盘保护：剩余空间已低于阈值时直接拒绝，别等下到一半才把盘写满
 	if free, low := diskSpaceLow(); low {
 		return 0, 0, fmt.Errorf("磁盘剩余空间不足（%s），低于保护阈值 %s，请先清理空间再下载",
-			db.HumanBytes(int64(free)), db.HumanBytes(dlMinFreeBytes))
+			db.HumanBytes(int64(free)), db.HumanBytes(MinFreeBytes()))
 	}
 	c := collectorRef
 	var vodName, srcName string
@@ -229,12 +240,22 @@ func EnqueueDownloadBatch(vodID int64, playFrom string, epIndices []int) (int, i
 		}
 		toQueue = append(toQueue, id)
 	}
+	// 投递队列：队列有上限（默认 500）。满了不能静默丢 —— 丢掉的 id 不会再被
+	// worker 取到，任务永远停在「排队中」直到进程重启被改成 paused。
+	// 现在把放不下的任务置为 paused 并计数，由调用方提示用户稍后「继续」。
+	deferred := 0
 	for _, id := range toQueue {
 		dlControl(id).Store(false)
 		select {
 		case dlQueue <- id:
 		default:
+			deferred++
+			c.DB.Exec(`UPDATE vod_download SET status='paused', updated_at=CURRENT_TIMESTAMP WHERE id=?`, id)
 		}
+	}
+	if deferred > 0 {
+		return created, skipped, fmt.Errorf("下载队列已满（上限 %d 个），%d 个任务已置为暂停，请稍后点「继续」",
+			cap(dlQueue), deferred)
 	}
 	return created, skipped, nil
 }
@@ -372,14 +393,27 @@ func DeleteDownload(id int64) error {
 	if err := c.DB.QueryRow(`SELECT status FROM vod_download WHERE id=?`, id).Scan(&cur); err != nil {
 		return fmt.Errorf("下载记录不存在")
 	}
+	if cur == "merging" {
+		// 合并阶段不可中断（ffmpeg 正在写最终文件，且取消标志只在分片下载阶段检查）。
+		// 这里如果继续删记录，worker 结束后会把 mp4 写出来 → 磁盘上留下无主孤儿文件。
+		return fmt.Errorf("这一集正在合并，请等合并完成再删除（大文件可能要几分钟）")
+	}
 	if cur == "downloading" || cur == "queued" || cur == "paused" {
 		dlControl(id).Store(true)
 		for i := 0; i < 40; i++ { // 最多等 4 秒让 worker 停下
 			var st string
-			if err := c.DB.QueryRow(`SELECT status FROM vod_download WHERE id=?`, id).Scan(&st); err == nil && st != "downloading" {
+			if err := c.DB.QueryRow(`SELECT status FROM vod_download WHERE id=?`, id).Scan(&st); err == nil &&
+				st != "downloading" && st != "merging" {
 				break
 			}
 			time.Sleep(100 * time.Millisecond)
+		}
+		// 4 秒后还在跑就别删了：宁可让用户稍后再点，也不要留下孤儿文件
+		var st string
+		if err := c.DB.QueryRow(`SELECT status FROM vod_download WHERE id=?`, id).Scan(&st); err == nil {
+			if st == "downloading" || st == "merging" {
+				return fmt.Errorf("任务正在%s，请等它结束再删除", statusText(st))
+			}
 		}
 	}
 
@@ -541,7 +575,7 @@ func (c *Collector) downloadOne(id int64) {
 	// 用户清理空间后点「继续」即可恢复，不丢任务。
 	if free, low := diskSpaceLow(); low {
 		msg := fmt.Sprintf("磁盘剩余空间不足（%s），低于保护阈值 %s，已自动暂停；清理后点「继续」",
-			db.HumanBytes(int64(free)), db.HumanBytes(dlMinFreeBytes))
+			db.HumanBytes(int64(free)), db.HumanBytes(MinFreeBytes()))
 		c.setDl(id, `status='paused', speed='', error=?`, msg)
 		logx.Printf("[download] 任务 %d 自动暂停：%s", id, msg)
 		return
@@ -569,9 +603,43 @@ func (c *Collector) downloadOne(id int64) {
 	}
 
 	start := time.Now()
+	// 进度上报：分片并发下各 worker 各自回调，直接写库会有两个问题：
+	//   1) 进度倒退（先到 60% 的后到 30%）——前端进度条回退；
+	//   2) 每次回调都 UPDATE 一次，16 并发 × 数千分片 → SQLite 单写者被写爆，
+	//      进度长时间不动（连接池默认只有 4 个连接）。
+	// 这里做「只增不减 + 500ms 节流」。
+	var progPct atomic.Int64
+	var progAt atomic.Int64
+	onProgress := func(pct int) {
+		if pct < 0 {
+			pct = 0
+		}
+		if pct > 100 {
+			pct = 100
+		}
+		for {
+			cur := progPct.Load()
+			if int64(pct) <= cur {
+				break
+			}
+			if progPct.CompareAndSwap(cur, int64(pct)) {
+				break
+			}
+		}
+		now := time.Now().UnixMilli()
+		last := progAt.Load()
+		if now-last < 500 {
+			return
+		}
+		if !progAt.CompareAndSwap(last, now) {
+			return
+		}
+		c.setDl(id, `progress=?`, int(progPct.Load()))
+	}
+
 	perr := downloader.DownloadToMP4(playURL, out, downloader.Options{
-		Concurrency: dlSegConcurrency,
-		OnProgress:  func(pct int) { c.setDl(id, `progress=?`, pct) },
+		Concurrency: segConcurrency(),
+		OnProgress:  onProgress,
 		OnSpeed:     func(sp string) { c.setDl(id, `speed=?`, sp) },
 		OnPhase: func(phase string) {
 			// 下载完成 → 合并阶段：状态切到 merging，进度从 0 重新走

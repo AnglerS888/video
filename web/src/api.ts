@@ -90,6 +90,13 @@ export const api = {
   shareBase() {
     return req<{ base_url: string }>('/api/share/base')
   },
+  /**
+   * 取本地播放令牌（/play/{id} 需要 ?t=令牌）。
+   * 令牌是短期（6 小时）内存态的，服务重启后失效 —— 前端拿不到就重新取一次。
+   */
+  playToken() {
+    return req<{ token: string; expires_at: number }>('/api/play-token')
+  },
   /** 分享页数据：打开 /s/{id} 时读取 */
   shareInfo(id: number | string) {
     return req<SharePage>(`/api/share/${id}`)
@@ -246,4 +253,48 @@ export const api = {
 export function coverURL(u: string, r = 0): string {
   const base = `/api/img?u=${encodeURIComponent(u)}`
   return r > 0 ? `${base}&r=${r}` : base
+}
+
+/**
+ * 本地播放令牌缓存。
+ *
+ * /play/{id} 现在需要 ?t=令牌（否则下载 id 可被枚举，整个库都能拖走）。
+ * 令牌 6 小时有效、服务重启后失效，所以：
+ *   - 缓存一份，多个视图共用；
+ *   - 提前 5 分钟过期，避免用到一半失效；
+ *   - 取不到就返回空串（此时播放会 403，页面提示刷新即可）。
+ */
+let tokenCache = { token: '', exp: 0 }
+let tokenPromise: Promise<string> | null = null
+
+export function playToken(): Promise<string> {
+  const now = Date.now()
+  if (tokenCache.token && tokenCache.exp > now) {
+    return Promise.resolve(tokenCache.token)
+  }
+  if (!tokenPromise) {
+    tokenPromise = api.playToken().then((r) => {
+      tokenPromise = null
+      if (r.ok && r.data?.token) {
+        // 提前 5 分钟作废，留出余量
+        const exp = (r.data.expires_at ? r.data.expires_at * 1000 : now + 6 * 3600 * 1000) - 5 * 60 * 1000
+        tokenCache = { token: r.data.token, exp }
+        return r.data.token
+      }
+      return ''
+    }).catch(() => {
+      tokenPromise = null
+      return ''
+    })
+  }
+  return tokenPromise
+}
+
+/**
+ * 拼本地播放地址（带播放令牌）。
+ * 返回 Promise：令牌要异步取，模板里不能直接 await。
+ */
+export function playURL(id: number | string, base = ''): Promise<string> {
+  const root = (base || location.origin).replace(/\/+$/, '')
+  return playToken().then((t) => (t ? `${root}/play/${id}?t=${encodeURIComponent(t)}` : `${root}/play/${id}`))
 }

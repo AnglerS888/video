@@ -115,7 +115,9 @@ func HumanBytes(n int64) string {
 // StartAutoVacuum 后台定期检查空闲页并在服务空闲时整理。
 // thresholdPct 是触发阈值（空闲页占比），<=0 表示关闭自动整理。
 // busy 返回 true 时跳过本次 —— 正在采集或下载时不能被 VACUUM 的写锁卡住。
-func StartAutoVacuum(d *sql.DB, thresholdPct int, delay, every time.Duration, busy func() bool) {
+//
+// stop 关闭后 goroutine 退出：没有这个信号，进程关库之后它还会去访问已关闭的连接池。
+func StartAutoVacuum(d *sql.DB, thresholdPct int, delay, every time.Duration, busy func() bool, stop <-chan struct{}) {
 	if thresholdPct <= 0 {
 		return
 	}
@@ -126,12 +128,25 @@ func StartAutoVacuum(d *sql.DB, thresholdPct int, delay, every time.Duration, bu
 		every = 6 * time.Hour
 	}
 	go func() {
-		time.Sleep(delay)
+		defer func() {
+			if r := recover(); r != nil {
+				logx.Warnf("[db] 自动整理协程异常退出: %v", r)
+			}
+		}()
+		select {
+		case <-time.After(delay):
+		case <-stop:
+			return
+		}
 		t := time.NewTicker(every)
 		defer t.Stop()
 		for {
 			CheckVacuum(d, thresholdPct, busy)
-			<-t.C
+			select {
+			case <-t.C:
+			case <-stop:
+				return
+			}
 		}
 	}()
 }
@@ -187,8 +202,19 @@ func InvalidatePlaysCount() {
 }
 
 // WarmupCounts 启动时后台预热计数缓存，避免第一个访问者撞上全表扫描。
-func WarmupCounts(d *sql.DB) {
+// stop 关闭后不再启动新的预热（已启动的那次查询会自己结束）。
+func WarmupCounts(d *sql.DB, stop <-chan struct{}) {
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logx.Warnf("[db] 预热计数协程异常退出: %v", r)
+			}
+		}()
+		select {
+		case <-stop:
+			return
+		default:
+		}
 		PlaysCount(d)
 	}()
 }

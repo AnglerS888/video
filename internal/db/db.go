@@ -3,6 +3,8 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"videoDownLoad/internal/logx"
@@ -36,16 +38,7 @@ func InitDB(path string, opt Options) *sql.DB {
 	if opt.AutoCheckpoint <= 0 {
 		opt.AutoCheckpoint = 2048
 	}
-	dsn := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"+
-		"&_pragma=busy_timeout(10000)&_pragma=foreign_keys(1)"+
-		"&_pragma=cache_size(%d)&_pragma=temp_store(2)"+
-		"&_pragma=wal_autocheckpoint(%d)&_pragma=journal_size_limit(67108864)"+
-		"&_pragma=mmap_size(%d)",
-		path, -opt.CacheMB*1024, opt.AutoCheckpoint, opt.MmapMB<<20)
-	if opt.PageSize > 0 {
-		// 只对"新建库"生效；已有库需要配合下面的 applyPageSize + VACUUM
-		dsn += fmt.Sprintf("&_pragma=page_size(%d)", opt.PageSize)
-	}
+	dsn := sqliteDSN(path, opt)
 	d, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		logx.Fatalf("open db: %v", err)
@@ -75,6 +68,28 @@ func InitDB(path string, opt Options) *sql.DB {
 	return d
 }
 
+// sqliteDSN 拼 DSN。
+//
+// 必须用 file: URI 形式：驱动（modernc.org/sqlite）在 DSN 不以 "file:" 开头时
+// 会按「第一个 ?」截断文件名 —— 数据目录里带 ?（Linux 合法，容器里很常见）时
+// 会静默打开另一个库文件，表现就是"数据全没了"。URI 形式下 ? # % 需要转义。
+func sqliteDSN(path string, opt Options) string {
+	p := filepath.ToSlash(path)
+	p = strings.ReplaceAll(p, "%", "%25")
+	p = strings.ReplaceAll(p, "?", "%3F")
+	p = strings.ReplaceAll(p, "#", "%23")
+	dsn := "file:" + p + "?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)" +
+		"&_pragma=busy_timeout(10000)&_pragma=foreign_keys(1)" +
+		"&_pragma=cache_size(%d)&_pragma=temp_store(2)" +
+		"&_pragma=wal_autocheckpoint(%d)&_pragma=journal_size_limit(67108864)" +
+		"&_pragma=mmap_size(%d)"
+	if opt.PageSize > 0 {
+		// 只对"新建库"生效；已有库需要配合下面的 applyPageSize + VACUUM
+		dsn += fmt.Sprintf("&_pragma=page_size(%d)", opt.PageSize)
+	}
+	return fmt.Sprintf(dsn, -opt.CacheMB*1024, opt.AutoCheckpoint, opt.MmapMB<<20)
+}
+
 // OptimizeStats 用 SQLite 推荐的 bounded ANALYZE 刷新统计信息（启动时与全量采集结束后各一次）。
 func OptimizeStats(d *sql.DB) {
 	if _, err := d.Exec(`PRAGMA analysis_limit=2000`); err != nil {
@@ -90,7 +105,16 @@ func OptimizeStats(d *sql.DB) {
 
 // applyPageSize 把已有库的页大小改成 n：page_size 只能在 VACUUM 时真正生效，
 // 所以这里触发一次完整重写。仅在调用方显式要求时执行。
+//
+// 注意：SQLite 只接受 2 的幂作为 page_size，非 2 的幂会被**静默忽略**
+// （PRAGMA 不报错，值也不变）。旧实现只看「当前值 != 目标值」就 VACUUM，
+// 于是配置里写错一个非 2 的幂的值 → 每次启动都白跑一次全库 VACUUM（分钟级）。
+// 现在改成：设完再读一次确认真的生效了才 VACUUM。
 func applyPageSize(d *sql.DB, n int) {
+	if !isPowerOfTwo(n) {
+		logx.Printf("[db] 页大小 %d 不是 2 的幂，SQLite 会静默忽略，跳过（可选值 512~65536）", n)
+		return
+	}
 	var cur int
 	if err := d.QueryRow(`PRAGMA page_size`).Scan(&cur); err != nil || cur == n {
 		return
@@ -101,12 +125,23 @@ func applyPageSize(d *sql.DB, n int) {
 		logx.Printf("[db] 设置 page_size 失败: %v", err)
 		return
 	}
+	// 确认真的被接受了再 VACUUM，避免白跑一次全库重写
+	var after int
+	if err := d.QueryRow(`PRAGMA page_size`).Scan(&after); err != nil || after != n {
+		logx.Printf("[db] 页大小仍为 %d（SQLite 只接受 2 的幂），跳过 VACUUM", cur)
+		return
+	}
 	if _, err := d.Exec(`VACUUM`); err != nil {
 		logx.Printf("[db] VACUUM 失败（库仍按原页大小可用）: %v", err)
 		return
 	}
 	_, _ = d.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
 	logx.Printf("[db] 页大小重写完成，耗时 %v", time.Since(start).Round(time.Second))
+}
+
+// isPowerOfTwo 判断 n 是否是 2 的幂（SQLite 的 page_size 只接受 2 的幂）
+func isPowerOfTwo(n int) bool {
+	return n > 0 && n&(n-1) == 0
 }
 
 // logPragmas 打印实际生效的关键参数（DEBUG 级）。
@@ -249,6 +284,18 @@ CREATE TABLE IF NOT EXISTS vod_download (
 CREATE INDEX IF NOT EXISTS idx_dl_vod ON vod_download(vod_id);
 CREATE INDEX IF NOT EXISTS idx_dl_status ON vod_download(status);
 CREATE INDEX IF NOT EXISTS idx_vod_name_group ON vod_info(vod_name, source_id);
+
+-- 分享令牌：分享链接的有效凭据。
+-- 不能拿 vod_download.id 当分享凭据 —— id 是自增整数，能被直接枚举，
+-- 拿到 /play/{id} 就等于拿到整个下载库。
+-- 令牌是随机串，可过期、可单独撤销，文件访问必须带令牌。
+CREATE TABLE IF NOT EXISTS vod_share_token (
+	token       TEXT PRIMARY KEY,                 -- URL 安全的随机串
+	download_id INTEGER NOT NULL REFERENCES vod_download(id) ON DELETE CASCADE,
+	expires_at  TEXT NOT NULL DEFAULT '',        -- UTC "YYYY-MM-DD HH:mm:ss"，空=永久
+	created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_share_dl ON vod_share_token(download_id);
 `
 
 // playSchema 播放地址表（单独一份，因为旧库升级时要整体重建而不是补字段）。
@@ -338,7 +385,8 @@ func dedupePlays(d *sql.DB) {
 		keepEp int64
 	}
 	var keys []dupKey
-	// 只有 1 个连接：必须先把结果读成切片再删除，否则会自己把自己的连接锁死
+	// 必须先把结果读成切片再删除：SQLite 写事务会占住连接，
+	// 同一连接上再发查询会自己把自己锁死（连接池默认 4 个连接，但这是同一条连接）
 	rows, err := d.Query(`SELECT vod_id, play_from, host_id, path, MIN(ep_index)
 		FROM vod_play GROUP BY vod_id, play_from, host_id, path HAVING COUNT(1) > 1`)
 	if err != nil {
@@ -379,6 +427,9 @@ func dedupePlays(d *sql.DB) {
 		_ = stmt.Close()
 		if err := tx.Commit(); err != nil {
 			logx.Printf("[db] 提交重复播放地址清理失败: %v", err)
+			// 提交失败时必须回滚：否则连接会带着未结束的事务回到池里，
+			// 后续写操作持续 SQLITE_BUSY（连接池默认只有 4 个连接）
+			_ = tx.Rollback()
 			return
 		}
 	}
@@ -414,6 +465,11 @@ func migrate(d *sql.DB) {
 	ensureColumn(d, "vod_download", "share_expires_at", "TEXT NOT NULL DEFAULT ''")
 	migrateDetailContent(d)
 	migrateDownloadEpIndex(d)
+	// 兜底：整表重建（migrateDownloadEpIndex）之后再确认这两列还在。
+	// 旧版实现在重建时把新表定义写漏了这两列，迁移完列直接消失，
+	// 下载页与分享页会报 no such column —— 这两行让历史坏库也能自愈。
+	ensureColumn(d, "vod_download", "priority", "INTEGER NOT NULL DEFAULT 0")
+	ensureColumn(d, "vod_download", "share_expires_at", "TEXT NOT NULL DEFAULT ''")
 }
 
 // migrateDetailContent 旧库的 vod_content 还在 vod_info 里：
@@ -455,25 +511,52 @@ func hasColumn(d *sql.DB, table, column string) bool {
 
 // migrateDownloadEpIndex 旧库的 vod_download 只有 UNIQUE(vod_id, play_from)，
 // 无法表达"同一线路的多集分别下载"，整表重建一次（ep_index 缺失的老行补 0）
+//
+// 两个必须注意的点（2026-10-21 修复，都是实测踩出来的）：
+//  1. 重建不能丢列：priority / share_expires_at 是 migrate() 先补上去的，
+//     旧实现的新表定义里没有这两列 → 迁移完两列消失，下载页/分享页直接报
+//     no such column。现在按「旧表实际有哪些列」动态生成 INSERT 列表，补过的列原样带走。
+//  2. 重建不能丢观看历史：DROP TABLE 在 foreign_keys=1 下会触发 ON DELETE CASCADE，
+//     把 vod_watch_history 里引用这些 id 的行一起删掉（实测 1 行 → 0 行）。
+//     先把历史行备份到临时表，重建后写回。
 func migrateDownloadEpIndex(d *sql.DB) {
-	rows, err := d.Query(`PRAGMA table_info(vod_download)`)
-	if err != nil {
+	oldCols := tableColumns(d, "vod_download")
+	if len(oldCols) == 0 {
 		return
 	}
-	hasEp := false
-	for rows.Next() {
-		var cid, notnull, pk int
-		var name, typ string
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err == nil && name == "ep_index" {
-			hasEp = true
-		}
-	}
-	rows.Close()
-	if hasEp {
+	if containsStr(oldCols, "ep_index") {
 		return
 	}
 	logx.Printf("[db] 升级 vod_download 表结构（支持单集下载）")
+
+	// 1) 备份观看历史（DROP TABLE 会级联删除）
+	if _, err := d.Exec(`DROP TABLE IF EXISTS tmp_watch_backup`); err != nil {
+		logx.Printf("[db] 清理历史备份表失败，迁移中止: %v", err)
+		return
+	}
+	if _, err := d.Exec(`CREATE TABLE tmp_watch_backup AS
+		SELECT download_id, position, duration, finished, updated_at FROM vod_watch_history`); err != nil {
+		logx.Printf("[db] 备份观看历史失败，迁移中止: %v", err)
+		return
+	}
+
+	// 2) 动态生成列清单：只搬旧表里真实存在的列，其余交给新表默认值
+	newCols := []string{
+		"id", "vod_id", "vod_name", "source_id", "source_name", "play_from", "ep_index",
+		"file_path", "file_size", "episodes", "status", "priority", "progress", "speed",
+		"error", "share_expires_at", "created_at", "updated_at",
+	}
+	var sel, expr []string
+	for _, c := range newCols {
+		if !containsStr(oldCols, c) {
+			continue
+		}
+		sel = append(sel, c)
+		expr = append(expr, c)
+	}
+	insertSQL := `INSERT INTO vod_download_new(` + strings.Join(sel, ",") + `)
+		SELECT ` + strings.Join(expr, ",") + ` FROM vod_download`
+
 	tx, terr := d.Begin()
 	if terr != nil {
 		logx.Printf("[db] 迁移失败: %v", terr)
@@ -481,43 +564,76 @@ func migrateDownloadEpIndex(d *sql.DB) {
 	}
 	stmts := []string{
 		`CREATE TABLE vod_download_new (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			vod_id INTEGER NOT NULL REFERENCES vod_info(id) ON DELETE CASCADE,
-			vod_name TEXT NOT NULL,
-			source_id INTEGER NOT NULL,
+			id          INTEGER PRIMARY KEY AUTOINCREMENT,
+			vod_id      INTEGER NOT NULL REFERENCES vod_info(id) ON DELETE CASCADE,
+			vod_name    TEXT NOT NULL,
+			source_id   INTEGER NOT NULL,
 			source_name TEXT DEFAULT '',
-			play_from TEXT NOT NULL,
-			ep_index INTEGER NOT NULL DEFAULT 0,
-			file_path TEXT DEFAULT '',
-			file_size INTEGER DEFAULT 0,
-			episodes INTEGER DEFAULT 0,
-			status TEXT NOT NULL DEFAULT 'queued',
-			progress INTEGER DEFAULT 0,
-			speed TEXT DEFAULT '',
-			error TEXT DEFAULT '',
-			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			play_from   TEXT NOT NULL,
+			ep_index    INTEGER NOT NULL DEFAULT 0,
+			file_path   TEXT DEFAULT '',
+			file_size   INTEGER DEFAULT 0,
+			episodes    INTEGER DEFAULT 0,
+			status      TEXT NOT NULL DEFAULT 'queued',
+			priority    INTEGER NOT NULL DEFAULT 0,
+			progress    INTEGER DEFAULT 0,
+			speed       TEXT DEFAULT '',
+			error       TEXT DEFAULT '',
+			share_expires_at TEXT NOT NULL DEFAULT '',
+			created_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+			updated_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
 			UNIQUE(vod_id, play_from, ep_index)
 		)`,
-		`INSERT INTO vod_download_new(id, vod_id, vod_name, source_id, source_name, play_from, ep_index,
-			file_path, file_size, episodes, status, progress, speed, error, created_at, updated_at)
-		 SELECT id, vod_id, vod_name, source_id, source_name, play_from, 0,
-			file_path, file_size, episodes, status, progress, speed, error, created_at, updated_at FROM vod_download`,
+		insertSQL,
 		`DROP TABLE vod_download`,
 		`ALTER TABLE vod_download_new RENAME TO vod_download`,
 		`CREATE INDEX IF NOT EXISTS idx_dl_vod ON vod_download(vod_id)`,
 		`CREATE INDEX IF NOT EXISTS idx_dl_status ON vod_download(status)`,
+		// 3) 观看历史写回（id 保持不变，外键仍然成立）
+		`INSERT OR REPLACE INTO vod_watch_history(download_id, position, duration, finished, updated_at)
+			SELECT download_id, position, duration, finished, updated_at FROM tmp_watch_backup`,
+		`DROP TABLE tmp_watch_backup`,
 	}
 	for _, q := range stmts {
 		if _, err := tx.Exec(q); err != nil {
 			logx.Printf("[db] 迁移语句失败: %v | %s", err, q[:60])
-			tx.Rollback()
+			_ = tx.Rollback()
 			return
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		logx.Printf("[db] 迁移提交失败: %v", err)
+		_ = tx.Rollback()
 	}
+}
+
+// tableColumns 读表的列名（按 PRAGMA 顺序）
+func tableColumns(d *sql.DB, table string) []string {
+	rows, err := d.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var cols []string
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err == nil {
+			cols = append(cols, name)
+		}
+	}
+	return cols
+}
+
+// containsStr 判断字符串是否在切片里
+func containsStr(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }
 
 func ensureColumn(d *sql.DB, table, column, def string) {

@@ -15,6 +15,7 @@ import (
 	"videoDownLoad/internal/collector"
 	db "videoDownLoad/internal/db"
 	"videoDownLoad/internal/logx"
+	"videoDownLoad/internal/netguard"
 )
 
 // invalidateSourceStats 接口增删改后清缓存，避免统计数字滞后
@@ -68,14 +69,14 @@ func (s *Server) sourceStats() map[int64]srcStat {
 }
 
 func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
-	// 必须先算统计再开 rows：连接池只给 1 个连接（SetMaxOpenConns(1)），
+	// 必须先算统计再开 rows：持有 rows 时同一条连接上再发查询会阻塞，
 	// rows 没遍历完就发新查询会永远等不到连接（表现为接口卡死、页面打不开）。
 	// 统计结果有 30 秒缓存，放前面不增加开销。
 	stats := s.sourceStats()
 	rows, err := s.DB.Query(`SELECT id, name, api_url, enabled, auto_incr, remark, created_at, updated_at
 		FROM vod_source ORDER BY id`)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	defer rows.Close()
@@ -113,7 +114,7 @@ func (s *Server) addSource(w http.ResponseWriter, r *http.Request) {
 	}
 	apiURL, err := normalizeAPIURL(in.APIURL)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	if in.Enabled == 0 {
@@ -130,7 +131,7 @@ func (s *Server) addSource(w http.ResponseWriter, r *http.Request) {
 	res, err := s.DB.Exec(`INSERT INTO vod_source(name, api_url, enabled, remark) VALUES(?,?,?,?)`,
 		in.Name, apiURL, in.Enabled, strings.TrimSpace(in.Remark))
 	if err != nil {
-		fail(w, "添加失败: "+err.Error())
+		fail(w, "添加失败: "+publicErr(err))
 		return
 	}
 	id, _ := res.LastInsertId()
@@ -280,8 +281,18 @@ func (s *Server) probeSource(w http.ResponseWriter, r *http.Request) {
 	}
 	cands, err := apiCandidates(raw)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
+	}
+	// SSRF 防护：预检会让服务端去请求这个地址，
+	// 不校验的话同一局域网的任何人都能借它扫内网、读云厂商元数据接口。
+	for _, c := range cands {
+		if u, perr := neturl.Parse(c); perr == nil {
+			if _, cerr := netguard.CheckURL(u.String()); cerr != nil {
+				fail(w, cerr.Error())
+				return
+			}
+		}
 	}
 	logx.Infof("[source] 预检 %s，候选 %d 个", raw, len(cands))
 	ok(w, s.Col.Probe(cands))
@@ -328,7 +339,7 @@ func (s *Server) updateSource(w http.ResponseWriter, r *http.Request) {
 	}
 	apiURL, err := normalizeAPIURL(in.APIURL)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	var dupID int64
@@ -339,7 +350,7 @@ func (s *Server) updateSource(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := s.DB.Exec(`UPDATE vod_source SET name=?, api_url=?, remark=?, enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`,
 		in.Name, apiURL, strings.TrimSpace(in.Remark), in.Enabled, id); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	s.srcMu.Lock()
@@ -365,7 +376,7 @@ func (s *Server) setAutoIncr(w http.ResponseWriter, r *http.Request) {
 	}
 	res, err := s.DB.Exec(`UPDATE vod_source SET auto_incr=?, updated_at=CURRENT_TIMESTAMP WHERE id=?`, on, id)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
@@ -458,7 +469,7 @@ func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
 		res, err := tx.Exec(st.q, id)
 		if err != nil {
 			tx.Rollback()
-			fail(w, fmt.Sprintf("清理数据失败(%s): %v", st.key, err))
+			fail(w, fmt.Sprintf("清理数据失败(%s): %s", st.key, publicErr(err)))
 			return
 		}
 		n, _ := res.RowsAffected()
@@ -466,11 +477,11 @@ func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, err := tx.Exec(`DELETE FROM vod_source WHERE id=?`, id); err != nil {
 		tx.Rollback()
-		fail(w, "删除接口失败: "+err.Error())
+		fail(w, "删除接口失败: "+publicErr(err))
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		fail(w, "提交失败: "+err.Error())
+		fail(w, "提交失败: "+publicErr(err))
 		return
 	}
 
@@ -514,6 +525,13 @@ func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
 	if coversAsync {
 		stats["covers"] = 0
 		go func() {
+			// recover：后台 goroutine 里 panic 会直接杀掉整个进程，
+			// 而这个任务只是"顺手清一下缓存"，不值得赔上服务。
+			defer func() {
+				if r := recover(); r != nil {
+					logx.Errorf("[source] 清理封面缓存时异常: %v", r)
+				}
+			}()
 			t0 := time.Now()
 			n := cleanCovers()
 			logx.Infof("[source] 删除接口 #%d 的封面缓存完成：%d 张（候选 %d），耗时 %v",
@@ -527,6 +545,11 @@ func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
 
 	// 5) 聚合表重建（大库要几秒，放后台，不阻塞本次请求）
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logx.Errorf("[source] 重建聚合表时异常: %v", r)
+			}
+		}()
 		t0 := time.Now()
 		if err := db.RebuildNameAgg(s.DB); err != nil {
 			logx.Warnf("[source] 删除接口后重建聚合表失败: %v", err)
@@ -570,7 +593,7 @@ type sourceExportItem struct {
 func (s *Server) exportSources(w http.ResponseWriter, r *http.Request) {
 	rows, err := s.DB.Query(`SELECT name, api_url, enabled, auto_incr, remark FROM vod_source ORDER BY id`)
 	if err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	defer rows.Close()
@@ -601,6 +624,18 @@ func (s *Server) importSources(w http.ResponseWriter, r *http.Request) {
 		fail(w, "文件里没有可导入的接口")
 		return
 	}
+	// 条数上限：正常导出文件只有几十条，上限 500 条足够覆盖任何真实场景，
+	// 又能挡住「塞 10 万条进来把库灌爆」的输入。
+	if len(in.Sources) > maxArrayItems {
+		fail(w, fmt.Sprintf("一次最多导入 %d 个接口（当前 %d 个），请分批导入", maxArrayItems, len(in.Sources)))
+		return
+	}
+	// 字段长度上限：SQLite 不限长度，但超长会撑爆列表页与导出文件
+	const (
+		maxNameLen   = 100
+		maxURLLen    = 500
+		maxRemarkLen = 500
+	)
 	// 现有地址集合：规范化后去重
 	existing := map[string]bool{}
 	if rows, err := s.DB.Query(`SELECT api_url FROM vod_source`); err == nil {
@@ -621,6 +656,14 @@ func (s *Server) importSources(w http.ResponseWriter, r *http.Request) {
 			skipped++
 			if len(errs) < 3 && err != nil {
 				errs = append(errs, err.Error())
+			}
+			continue
+		}
+		// 字段长度校验
+		if len(name) > maxNameLen || len(apiURL) > maxURLLen || len(strings.TrimSpace(it.Remark)) > maxRemarkLen {
+			skipped++
+			if len(errs) < 3 {
+				errs = append(errs, name+": 字段过长（名称/地址/备注上限分别为 "+strconv.Itoa(maxNameLen)+"/"+strconv.Itoa(maxURLLen)+"/"+strconv.Itoa(maxRemarkLen)+" 字符）")
 			}
 			continue
 		}

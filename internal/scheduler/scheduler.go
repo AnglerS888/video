@@ -16,6 +16,8 @@ type Scheduler struct {
 	interval time.Duration
 	wake     chan struct{} // 间隔变更时唤醒循环，重建 ticker
 	stop     chan struct{}
+	stopOnce sync.Once     // Stop 幂等：重复调用会 panic（close of closed channel）
+	done     chan struct{} // 循环退出时关闭，Stop 可等待
 	started  atomic.Bool
 }
 
@@ -28,6 +30,7 @@ func New(interval time.Duration, run func()) *Scheduler {
 		interval: interval,
 		wake:     make(chan struct{}, 1),
 		stop:     make(chan struct{}),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -62,6 +65,7 @@ func (s *Scheduler) Start() {
 		return
 	}
 	go func() {
+		defer close(s.done)
 		iv := s.Interval()
 		t := time.NewTicker(iv)
 		defer t.Stop()
@@ -90,4 +94,11 @@ func (s *Scheduler) Start() {
 	}()
 }
 
-func (s *Scheduler) Stop() { close(s.stop) }
+// Stop 停止定时任务。幂等（重复调用不会 panic），并等待循环真正退出 ——
+// 之前只 close(stop) 不等待，主流程接着就关数据库 → 正在跑的增量任务访问已关闭的连接。
+func (s *Scheduler) Stop() {
+	s.stopOnce.Do(func() { close(s.stop) })
+	if s.started.Load() {
+		<-s.done
+	}
+}

@@ -26,9 +26,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,8 +46,10 @@ import (
 const cliUserAgent = "curl/8.10.1"
 
 const (
-	maxZipBytes  = 200 << 20 // 源码包硬上限
-	maxFileBytes = 60 << 20  // 单个文件解压上限
+	maxZipBytes   = 200 << 20 // 源码包硬上限
+	maxFileBytes  = 60 << 20  // 单个文件解压上限
+	maxTotalBytes = 500 << 20 // 解压总字节上限（防 zip 炸弹：单文件不超但总量可以很大）
+	maxFileCount  = 20000     // 解压文件数上限（防大量小文件耗尽磁盘/inode）
 )
 
 // Info 版本与更新检查结果
@@ -131,8 +136,129 @@ func New(dataDir, repo, branch, token string) *Updater {
 			UpdatedAt:    d.At,
 		}
 		_ = os.Remove(donePath(dataDir))
+		// 新进程能读到 done.json 就说明新二进制真的跑起来了（没崩），
+		// 写一份 ok.json 作为「这次更新确实生效」的凭据，方便排障时对照。
+		_ = writeOKFile(dataDir, d.NewVersion, d.NewCommit)
 	}
+	// 回滚检查：替换二进制前会写「崩溃哨兵」。
+	// 新进程启动时认领它；跑起来（监听成功）后再由 MarkHealthy 清掉。
+	// 如果哨兵已被认领却没被清掉 → 上次那轮启动崩了 → 自动换回 .bak。
+	checkCrashAndMaybeRollback(dataDir)
 	return u
+}
+
+// crashSentinel 回滚哨兵的内容
+type crashSentinel struct {
+	NewVersion string `json:"new_version"`
+	Claimed    bool   `json:"claimed"`
+	ClaimedAt  string `json:"claimed_at"`
+}
+
+// crashSentinelPath 回滚哨兵文件
+func crashSentinelPath(dataDir string) string {
+	return filepath.Join(dataDir, "update", "crash.sentinel")
+}
+
+// writeCrashSentinel 替换二进制前写下哨兵（未认领状态）
+func writeCrashSentinel(dataDir string, newVer string) error {
+	p := crashSentinelPath(dataDir)
+	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+	b, _ := json.Marshal(crashSentinel{NewVersion: newVer, Claimed: false})
+	return os.WriteFile(p, b, 0o644)
+}
+
+// MarkHealthy 新进程成功跑起来（HTTP 已监听）后调用：清掉哨兵 = 这次更新成功。
+// 由 main 在 ListenAndServe 之后调用。
+func MarkHealthy(dataDir string) {
+	clearCrashSentinel(dataDir)
+}
+
+// clearCrashSentinel 清掉回滚哨兵
+func clearCrashSentinel(dataDir string) {
+	_ = os.Remove(crashSentinelPath(dataDir))
+}
+
+// checkCrashAndMaybeRollback 处理回滚哨兵：
+//
+//	哨兵不存在        → 没有发生过更新（或上次更新成功），无事发生
+//	哨警未认领        → 这是新版本的**首次**启动：认领它，等跑起来后由 MarkHealthy 清掉
+//	哨兵已认领但还在  → 上一次启动认领后**没能跑起来**（崩了）→ 自动换回 .bak
+//
+// 为什么需要"认领"这一步：光有哨兵区分不了"新版本第一次启动"和"崩溃后重启"，
+// 会在新版本明明正常时也把它换回去。
+func checkCrashAndMaybeRollback(dataDir string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logx.Errorf("[update] 回滚检查异常: %v", r)
+		}
+	}()
+	b, err := os.ReadFile(crashSentinelPath(dataDir))
+	if err != nil {
+		return // 没有哨兵 = 上次更新后新版本正常启动了
+	}
+	var s crashSentinel
+	if json.Unmarshal(b, &s) != nil {
+		return
+	}
+	if !s.Claimed {
+		// 首次启动：认领哨兵。如果这轮启动崩了，哨兵会留在"已认领"状态，
+		// 下一轮就能识别出"上次崩了"并回滚。
+		s.Claimed = true
+		s.ClaimedAt = time.Now().Format(time.RFC3339)
+		nb, _ := json.Marshal(s)
+		if err := os.WriteFile(crashSentinelPath(dataDir), nb, 0o644); err != nil {
+			logx.Warnf("[update] 写入启动认领标记失败: %v", err)
+		}
+		logx.Infof("[update] 已认领更新启动哨兵（版本 %s），服务跑起来后自动清除", s.NewVersion)
+		return
+	}
+	// 已认领却走到这里 = 上次启动崩了
+	if runtime.GOOS == "windows" {
+		logx.Warnf("[update] 检测到上次更新后启动失败，但 Windows 下无法替换运行中的程序文件，"+
+			"请手动用 %s.exe.bak 回滚", "videodl")
+		_ = os.Remove(crashSentinelPath(dataDir))
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	bak := exe + ".bak"
+	if _, err := os.Stat(bak); err != nil {
+		logx.Warnf("[update] 检测到上次更新后启动失败，但没有回滚副本 %s", bak)
+		_ = os.Remove(crashSentinelPath(dataDir))
+		return
+	}
+	// 把 .bak 复制回来（不能直接 rename .bak → exe：那会把唯一的回滚副本搬走）
+	if err := copyFile(bak, exe); err != nil {
+		logx.Errorf("[update] 自动回滚失败（可手动执行 cp %s %s）: %v", bak, exe, err)
+		return
+	}
+	_ = os.Remove(crashSentinelPath(dataDir))
+	logx.Errorf("[update] 检测到新版本（%s）启动失败，已自动回滚到旧版本（备份 %s）", s.NewVersion, bak)
+	// 退出让容器重启策略拉起进程 —— 这次跑的就是恢复回来的旧版本了
+	time.Sleep(500 * time.Millisecond)
+	os.Exit(0)
+}
+
+// copyFile 复制文件（src → dst），保持可执行权限
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 func (u *Updater) ua() string {
@@ -154,10 +280,60 @@ func (u *Updater) archiveURL() string {
 	return fmt.Sprintf("%s/%s/repository/archive/%s.zip", version.SiteBase, u.repo, u.branch)
 }
 
-// zipballURL 官方 OpenAPI 源码包（需要 access_token）
+// zipballURL 官方 OpenAPI 源码包地址（**URL 里不带令牌**）。
+//
+// 令牌改用 Authorization 请求头传递：Gitee 的 OpenAPI 与 GitHub 一致，
+// 支持 "Authorization: token <令牌>" 形式（swagger 里虽然只登记了
+// access_token 查询参数，但请求头同样被服务端接受）。
+// 令牌不能拼在 URL 上——Go 的 *url.Error 会把完整 URL 带进错误文本，
+// 那段文本随后会进容器 stdout 和对外的更新状态接口，等于把令牌公开。
 func (u *Updater) zipballURL() string {
+	return fmt.Sprintf("%s/api/v5/repos/%s/zipball?ref=%s",
+		version.SiteBase, u.repo, url.QueryEscape(u.branch))
+}
+
+// zipballURLWithToken 官方 OpenAPI 源码包地址（令牌放查询串，老接口形态）。
+// 只在请求头方式不被接受时作为回退使用；它生成的错误文本必须经过 redact() 脱敏。
+func (u *Updater) zipballURLWithToken() string {
 	return fmt.Sprintf("%s/api/v5/repos/%s/zipball?ref=%s&access_token=%s",
-		version.SiteBase, u.repo, u.branch, u.token)
+		version.SiteBase, u.repo, url.QueryEscape(u.branch), url.QueryEscape(u.token))
+}
+
+// accessTokenRe 匹配错误文本里的 access_token 查询参数（含 URL 编码后的值）
+var accessTokenRe = regexp.MustCompile(`access_token=[^&\s"']+`)
+
+// authTokenRe 匹配错误文本里的 Authorization 头令牌（万一被回显）
+var authTokenRe = regexp.MustCompile(`(?i)(authorization:\s*(?:token|bearer)\s+)[^\s"']+`)
+
+// redact 脱敏：错误文本里可能混进私有令牌（Gitee 的 access_token / Authorization 头）。
+// 这些文本会写进容器 stdout，也会经 /api/update/status 返回给未鉴权的调用方，
+// 所以所有对外/日志的错误文本都要先过一遍 redact。
+func redact(s string) string {
+	if s == "" {
+		return s
+	}
+	s = accessTokenRe.ReplaceAllString(s, "access_token=***")
+	s = authTokenRe.ReplaceAllString(s, "${1}***")
+	return s
+}
+
+// redactTok 在 redact 之上再抹掉令牌原文本身。
+// 正则只能覆盖已知形态；万一令牌以别的形式出现在错误文本里（比如被编码过、
+// 或者被服务端原样回显），这里兜底：只要知道令牌值，就能把它替换掉。
+func (u *Updater) redactTok(s string) string {
+	s = redact(s)
+	if u.token != "" {
+		s = strings.ReplaceAll(s, u.token, "***")
+	}
+	return s
+}
+
+// redactErr 对错误做脱敏（保留错误信息本身，只抹掉令牌），便于统一处理
+func redactErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return errors.New(redact(err.Error()))
 }
 
 func (u *Updater) base() Info {
@@ -176,17 +352,44 @@ func (u *Updater) base() Info {
 	}
 }
 
-// Current 只返回本地信息 + 上次检查的缓存（不联网），force=false 时调用
+// Current 返回本地信息 + 上次检查的缓存（不联网）。
+//
+// force=true 只表示「忽略 10 分钟缓存窗口」，不代表要联网——联网由 Refresh 负责。
+// 关键点：从未刷新过时（u.infoAt 为零值）必须返回 u.base()，
+// 否则会返回零值 Info{}（版本号/模式全空），页面看着像没装版本信息。
 func (u *Updater) Current(force bool) Info {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if !force && u.infoAt.IsZero() {
+	// 还没检查过：本地基础信息永远有效，先返回它
+	if u.infoAt.IsZero() {
 		return u.base()
 	}
+	// 缓存窗口内且不强制：用上次结果
 	if !force && time.Since(u.infoAt) < 10*time.Minute {
-		return u.info
+		return copyInfo(u.info)
 	}
-	return u.info
+	// 缓存过期（或强制）：仍返回上次结果，由前端触发 Refresh 拿最新数据。
+	// 这里不联网，避免持锁时做网络 IO。
+	return copyInfo(u.info)
+}
+
+// copyInfo 拷贝一份 Info（含 Reasons slice 的底层数组），
+// 避免调用方拿到与内部状态共享的 slice。
+func copyInfo(in Info) Info {
+	out := in
+	if len(in.Reasons) > 0 {
+		out.Reasons = append([]string(nil), in.Reasons...)
+	}
+	return out
+}
+
+// snapshot 持锁拷贝一份当前缓存的 Info。
+// 读侧必须加锁：Refresh 会整体替换 u.info（含 Reasons slice），
+// 无锁读会与写侧形成 data race，slice header 撕裂会直接 panic。
+func (u *Updater) snapshot() Info {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return copyInfo(u.info)
 }
 
 // Refresh 主动联网检查；失败时把错误写进返回值的 Error 字段（不抛错，前端好展示）
@@ -230,9 +433,9 @@ func (u *Updater) Refresh(ctx context.Context) Info {
 		}
 	}
 	if err1 != nil && err2 != nil {
-		info.Error = fmt.Sprintf("检查失败：%v；%v", err1, err2)
+		info.Error = fmt.Sprintf("检查失败：%s；%s", u.redactTok(err1.Error()), u.redactTok(err2.Error()))
 	} else if err1 != nil && remoteVer == "" {
-		info.Error = "读取提交信息失败：" + err1.Error()
+		info.Error = "读取提交信息失败：" + u.redactTok(err1.Error())
 	}
 	info.CheckedAt = time.Now().Format("2006-01-02 15:04:05")
 
@@ -288,17 +491,22 @@ func (u *Updater) fetchRemoteVersion(ctx context.Context) (ver, via string, err 
 func (u *Updater) getJSON(ctx context.Context, url string, dst any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return redactErr(err)
 	}
 	req.Header.Set("User-Agent", u.ua())
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := u.client.Do(req)
 	if err != nil {
-		return err
+		return redactErr(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	// Gitee 要求登录时回的是 HTML：直接丢给 JSON 解码只会得到一句含糊的
+	// "invalid character '<'"，这里提前识别，给出能看懂的提示。
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/html") {
+		return errors.New("Gitee 返回了网页而不是接口数据（可能需要登录/验证）")
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(dst)
 }
@@ -306,22 +514,37 @@ func (u *Updater) getJSON(ctx context.Context, url string, dst any) error {
 func (u *Updater) getText(ctx context.Context, url string, limit int64) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", err
+		return "", redactErr(err)
 	}
 	req.Header.Set("User-Agent", u.ua())
 	resp, err := u.client.Do(req)
 	if err != nil {
-		return "", err
+		return "", redactErr(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
+	// Gitee 在要求登录/验证时回的是 HTML（状态码仍是 200）。
+	// 不拦的话，读 VERSION 会把一整段登录页当成版本号，界面上显示成乱码。
+	if ct := resp.Header.Get("Content-Type"); strings.Contains(ct, "text/html") {
+		return "", errors.New("Gitee 返回了网页而不是文本内容（可能需要登录/验证）")
+	}
 	b, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
 		return "", err
 	}
+	// Content-Type 有时不可靠（代理会改写），再按内容嗅探一次兜底
+	if looksLikeHTML(b) {
+		return "", errors.New("Gitee 返回了网页而不是文本内容（可能需要登录/验证）")
+	}
 	return string(b), nil
+}
+
+// looksLikeHTML 判断内容开头是不是 HTML 文档
+func looksLikeHTML(b []byte) bool {
+	s := strings.ToLower(strings.TrimSpace(string(b)))
+	return strings.HasPrefix(s, "<!doctype html") || strings.HasPrefix(s, "<html")
 }
 
 // compareSemver 比较 a、b 的语义化版本（忽略前导 v 与 -rc 之类的后缀），a>b 返回 1
@@ -407,12 +630,27 @@ func (u *Updater) Start() error {
 			u.running = false
 			u.mu.Unlock()
 		}()
+		// 更新流程里的任何 panic 都不能带崩整个服务（会连带拖垮采集/下载）。
+		// 这里兜住 panic，把状态置为失败并记日志，页面能显示原因。
+		defer func() {
+			if r := recover(); r != nil {
+				logx.Errorf("[update] 更新流程 panic: %v", r)
+				u.setStatus(func(s *Status) {
+					s.Phase = "failed"
+					s.Message = "更新失败：内部错误（已捕获 panic）"
+					s.Error = fmt.Sprintf("panic: %v", r)
+				})
+			}
+		}()
 		if err := u.run(context.Background()); err != nil {
-			logx.Warnf("[update] 更新失败: %v", err)
+			// 错误文本会进容器日志，也会经 /api/update/status 返回给未鉴权调用方：
+			// 必须脱敏，否则私有令牌会泄漏出去。
+			msg := u.redactTok(err.Error())
+			logx.Warnf("[update] 更新失败: %s", msg)
 			u.setStatus(func(s *Status) {
 				s.Phase = "failed"
-				s.Error = err.Error()
-				s.Message = "更新失败：" + err.Error()
+				s.Error = msg
+				s.Message = "更新失败：" + msg
 			})
 		}
 	}()
@@ -430,19 +668,31 @@ func (u *Updater) run(ctx context.Context) error {
 		return fmt.Errorf("创建更新目录失败: %w", err)
 	}
 
+	// 先看有没有 Go 工具链（2026-10-21 起运行基座是 golang）：
+	//   有 → 容器内编译：源码与构建缓存都放容器内部路径，宿主机碰不到（防提权）；
+	//   没有 → 旧镜像：源码必须放数据目录，宿主机重建镜像时要用。
+	goBin, lookErr := exec.LookPath("go")
+	work := dir
+	if lookErr == nil {
+		work = u.buildWorkspace()
+	}
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		return fmt.Errorf("创建更新工作目录失败: %w", err)
+	}
+
 	// 1) 下载源码包
-	zipPath := filepath.Join(dir, "main.zip")
+	zipPath := filepath.Join(work, "main.zip")
 	if err := u.download(ctx, zipPath); err != nil {
 		return err
 	}
 
 	// 2) 解压
 	u.setStatus(func(s *Status) { s.Phase = "extracting"; s.Message = "正在解压源码…"; s.Percent = 70 })
-	srcDir, err := u.extract(zipPath, dir)
+	srcDir, commitHint, err := u.extract(zipPath, work)
+	_ = os.Remove(zipPath)
 	if err != nil {
 		return err
 	}
-	_ = os.Remove(zipPath)
 
 	srcOK := fileExists(filepath.Join(srcDir, "go.mod")) &&
 		fileExists(filepath.Join(srcDir, "internal", "web", "static", "index.html"))
@@ -450,26 +700,56 @@ func (u *Updater) run(ctx context.Context) error {
 		return errors.New("下载的源码包不完整（缺少 go.mod 或前端产物 internal/web/static）")
 	}
 
-	// 3) 镜像自带 Go 工具链（2026-10-21 起运行基座是 golang）就在容器内编译：
+	// 3) 镜像自带 Go 工具链就在容器内编译：
 	//    go build → 替换二进制 → 退出，由 docker 的 restart 策略拉起新进程。
 	//    旧的精简镜像（找不到 go 命令）回退为「落源码 + 提示宿主机重建」。
-	goBin, lookErr := exec.LookPath("go")
 	if lookErr != nil {
 		u.setStatus(func(s *Status) {
 			s.Phase = "staged"
 			s.Percent = 100
 			s.SourceDir = srcDir
 			s.Message = "最新源码已下载到数据目录，请在宿主机重建镜像（当前镜像不含 Go 工具链）"
-			s.Instructions = dockerInstructions(srcDir)
+			s.Instructions = dockerInstructions(srcDir, u.dataDir)
 		})
 		return nil
 	}
-	return u.buildAndRestart(ctx, srcDir, goBin)
+	return u.buildAndRestart(ctx, srcDir, work, commitHint, goBin)
+}
+
+// buildWorkspace 返回本次更新使用的构建工作目录。
+//
+// 为什么不能放在数据目录里：docker-compose 把 ./videodata 挂进容器，
+// 宿主侧有写权限的账号可以替换源码，再让容器以 root 编译它 —— 这是提权路径。
+// 所以「编译用的源码 + go 模块缓存 + go 构建缓存」都放容器内部路径 /tmp/vdl-update，
+// 宿主侧碰不到。代价：容器重建后模块缓存要重新下载（安全优先）。
+//
+// Windows 宿主直跑时 /tmp 不可用（或容器只读 rootfs），回退到数据目录并打警告。
+func (u *Updater) buildWorkspace() string {
+	const preferred = "/tmp/vdl-update"
+	if runtime.GOOS != "windows" {
+		if err := os.MkdirAll(preferred, 0o755); err == nil {
+			// 真写一次确认可写（只读 rootfs / 只挂载了部分目录都会失败）
+			probe := filepath.Join(preferred, ".probe")
+			if err := os.WriteFile(probe, []byte("1"), 0o644); err == nil {
+				_ = os.Remove(probe)
+				return preferred
+			}
+		}
+	}
+	fallback := filepath.Join(u.dataDir, "update", "build")
+	if err := os.MkdirAll(fallback, 0o755); err != nil {
+		return filepath.Join(u.dataDir, "update")
+	}
+	logx.Warnf("[update] 容器内临时目录不可用，构建工作目录回退到数据目录 %s（宿主侧可写，存在源码被替换的风险）", fallback)
+	return fallback
 }
 
 // buildAndRestart 在容器内编译新二进制、校验、原子替换当前程序文件，
 // 然后退出进程——compose 的 restart: unless-stopped（或 deploy.sh 的 --restart）会立刻拉起新二进制。
-func (u *Updater) buildAndRestart(ctx context.Context, srcDir, goBin string) error {
+//
+// work 是容器内的构建工作目录（源码 + go 缓存都在里面，宿主机碰不到）。
+// commitHint 是从归档首层目录名解析出的真实提交号（可能为空）。
+func (u *Updater) buildAndRestart(ctx context.Context, srcDir, work, commitHint, goBin string) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("获取当前程序路径失败: %w", err)
@@ -478,15 +758,23 @@ func (u *Updater) buildAndRestart(ctx context.Context, srcDir, goBin string) err
 		exe = r
 	}
 
-	// 注入版本信息：版本号以源码包里的 VERSION 为准，提交用检查更新时拿到的远端 sha
+	// 注入版本信息：版本号以源码包里的 VERSION 为准
 	newVer := ""
 	if b, err := os.ReadFile(filepath.Join(srcDir, "VERSION")); err == nil {
 		newVer = strings.TrimSpace(string(b))
 	}
+	// commit 优先用归档首层目录名里解析出来的真实 sha；
+	// 用户没先点「检查更新」直接点「立即更新」时 u.info 是零值，
+	// 那时只能用 zip 目录名（Gitee 归档形如 video-<sha>/）兜底，
+	// 实在拿不到才留空（比注入一个错的 sha 好）。
+	info := u.snapshot()
 	if newVer == "" {
-		newVer = u.info.LatestVersion
+		newVer = info.LatestVersion
 	}
-	commit := u.info.LatestCommit
+	commit := commitHint
+	if commit == "" {
+		commit = info.LatestCommit
+	}
 	buildTime := time.Now().UTC().Format(time.RFC3339)
 
 	u.setStatus(func(s *Status) {
@@ -507,15 +795,22 @@ func (u *Updater) buildAndRestart(ctx context.Context, srcDir, goBin string) err
 	cmd := exec.CommandContext(buildCtx, goBin, "build", "-trimpath", "-p", "2",
 		"-ldflags", ldflags, "-o", newBin, ".")
 	cmd.Dir = srcDir
-	// 模块与构建缓存放数据目录（volume）：容器重建不丢，下次更新只增量下载/编译
+	// 模块与构建缓存放容器内非共享路径：数据目录是宿主机可写卷，
+	// 宿主侧能往缓存里塞东西污染编译结果。放在 work 目录里宿主机碰不到。
 	env := append(os.Environ(),
 		"CGO_ENABLED=0",
 		"GOGC=50",
-		"GOMODCACHE="+filepath.Join(u.dataDir, "update", "gomodcache"),
-		"GOCACHE="+filepath.Join(u.dataDir, "update", "gocache"),
+		"GOMODCACHE="+filepath.Join(work, "gomodcache"),
+		"GOCACHE="+filepath.Join(work, "gocache"),
 	)
+	// 国内网络：proxy.golang.org / sum.golang.org 都连不上，
+	// 竖线分隔 = 前一个代理出错（超时/DNS 抖动）也立刻换下一个；
+	// GOSUMDB=off 后 go 仍按仓库里的 go.sum 校验哈希。
 	if os.Getenv("GOPROXY") == "" {
-		env = append(env, "GOPROXY=https://goproxy.cn,direct")
+		env = append(env, "GOPROXY=https://goproxy.cn|https://mirrors.aliyun.com/goproxy/|https://goproxy.io|direct")
+	}
+	if os.Getenv("GOSUMDB") == "" {
+		env = append(env, "GOSUMDB=off")
 	}
 	cmd.Env = env
 	out, err := cmd.CombinedOutput()
@@ -531,6 +826,22 @@ func (u *Updater) buildAndRestart(ctx context.Context, srcDir, goBin string) err
 		return fmt.Errorf("新二进制自检失败: %v %s", verr, tailString(string(vout), 500))
 	}
 
+	// 替换前先把旧二进制留一份 .bak：自更新没有回滚余地的话，
+	// 新版本一启动就崩（容器 crash-loop）就只能重新拉镜像救。
+	// 失败不阻断更新（只是没有回滚手段而已）。
+	bakPath := exe + ".bak"
+	if err := backupBinary(exe, bakPath); err != nil {
+		logx.Warnf("[update] 备份旧二进制失败（更新继续，但没有回滚副本）: %v", err)
+	} else {
+		logx.Infof("[update] 旧二进制已备份到 %s", bakPath)
+	}
+
+	// 写回滚哨兵：新进程启动时认领它，跑起来后清除；
+	// 如果它认领了却没跑起来（崩了），下一轮启动会自动换回 .bak。
+	if err := writeCrashSentinel(u.dataDir, newVer); err != nil {
+		logx.Warnf("[update] 写回滚哨兵失败（更新继续，但崩溃后不会自动回滚）: %v", err)
+	}
+
 	// rename 是原子替换，Linux 下覆盖正在运行的可执行文件也没问题
 	// （旧进程继续用旧 inode，新进程拿到的就是新文件）
 	if err := os.Rename(newBin, exe); err != nil {
@@ -542,7 +853,7 @@ func (u *Updater) buildAndRestart(ctx context.Context, srcDir, goBin string) err
 	u.setStatus(func(s *Status) {
 		s.Phase = "restarting"
 		s.Percent = 100
-		s.Message = "编译完成，正在重启到新版本…"
+		s.Message = "编译完成，正在重启到新版本…（如新版本启动异常，可用容器内 " + bakPath + " 回滚）"
 		s.Instructions = []string{}
 	})
 	// 落一份结果：新进程启动时在 New() 里读出来恢复「更新完成」状态
@@ -552,6 +863,31 @@ func (u *Updater) buildAndRestart(ctx context.Context, srcDir, goBin string) err
 	time.Sleep(2 * time.Second) // 给前端最后一轮轮询留点窗口
 	requestRestart()            // SIGTERM：走 main 的优雅退出，退出后由 restart 策略拉起新二进制
 	return nil                  // 不会执行到这里
+}
+
+// backupBinary 把当前二进制复制一份到 dst，作为回滚副本。
+//
+// 为什么用复制而不是硬链接：硬链接与原文件共享 inode，
+// 任何「就地覆写」原路径的操作（比如 os.WriteFile 打开 O_TRUNC）
+// 会把 .bak 一起改掉，回滚副本就悄悄失效了。
+// 复制出的 .bak 是独立文件，任何后续操作都动不到它。
+func backupBinary(src, dst string) error {
+	_ = os.Remove(dst)
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if _, err := io.Copy(out, in); err != nil {
+		_ = os.Remove(dst)
+		return err
+	}
+	return out.Close()
 }
 
 // tailString 取字符串末尾 n 字节（编译报错要看的是最后几行）
@@ -595,37 +931,63 @@ func readDoneFile(dataDir string) (updateDone, bool) {
 	return d, true
 }
 
+// okPath 新版本成功启动的标记文件
+func okPath(dataDir string) string {
+	return filepath.Join(dataDir, "update", "ok.json")
+}
+
+// writeOKFile 写「新版本已成功启动」的标记
+func writeOKFile(dataDir, newVer, commit string) error {
+	b, err := json.Marshal(updateDone{
+		OldVersion: version.Version, NewVersion: newVer, NewCommit: commit,
+		At: time.Now().Format("2006-01-02 15:04:05"),
+	})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(okPath(dataDir), b, 0o644)
+}
+
 // download 下载源码包。
 //
 // 注意：Gitee 的 /repository/archive/<branch>.zip 对「浏览器 UA」会返回登录/验证网页，
 // 只有命令行 UA 才直接给 zip（2026-10-20 实测）。所以这里分两条路：
 //  1. 配了 Gitee 令牌：走官方 /api/v5/repos/<repo>/zipball（最稳）；
+//     令牌优先用 Authorization 头传（URL 里不带令牌，避免令牌随错误文本外泄），
+//     请求头方式不被接受时再回退到 URL 查询串形式（该形式的错误文本一律脱敏）。
 //  2. 没配令牌：匿名 archive 地址 + CLI 风格 UA（拿到 HTML 时给出明确错误提示）。
 func (u *Updater) download(ctx context.Context, dst string) error {
-	type candidate struct{ url, ua, note string }
+	type candidate struct {
+		url, ua, note string
+		useTokenQuery bool // 令牌放 URL 查询串（兼容回退；错误文本必须脱敏）
+	}
 	var cands []candidate
 	if u.token != "" {
-		cands = append(cands, candidate{u.zipballURL(), u.ua(), "官方接口"})
+		// 主路径：Authorization 头带令牌，URL 干净
+		cands = append(cands, candidate{u.zipballURL(), u.ua(), "官方接口", false})
+		// 兼容回退：令牌放查询串（老接口形态）
+		cands = append(cands, candidate{u.zipballURLWithToken(), u.ua(), "官方接口(兼容)", true})
 	}
-	cands = append(cands, candidate{u.archiveURL(), cliUserAgent, "匿名下载"})
+	cands = append(cands, candidate{u.archiveURL(), cliUserAgent, "匿名下载", false})
 
 	var lastErr error
 	for _, c := range cands {
 		u.setStatus(func(s *Status) { s.Message = "正在下载源码包（Gitee " + c.note + "）…" })
-		err := u.downloadOne(ctx, c.url, c.ua, dst)
+		err := u.downloadOne(ctx, c.url, c.ua, dst, c.useTokenQuery)
 		if err == nil {
 			return nil
 		}
 		lastErr = err
-		logx.Warnf("[update] 下载源码包失败（%s）：%v", c.note, err)
+		// 脱敏后再写日志：出错时错误文本里可能带 URL（含令牌）
+		logx.Warnf("[update] 下载源码包失败（%s）：%s", c.note, u.redactTok(err.Error()))
 	}
 	if lastErr == nil {
 		lastErr = errors.New("未知错误")
 	}
-	return fmt.Errorf("下载源码包失败: %w（可用环境变量 VDL_UPDATE_TOKEN 提供 Gitee 令牌走官方接口）", lastErr)
+	return fmt.Errorf("下载源码包失败: %w（可用环境变量 VDL_UPDATE_TOKEN 提供 Gitee 令牌走官方接口）", errors.New(u.redactTok(lastErr.Error())))
 }
 
-func (u *Updater) downloadOne(ctx context.Context, url, ua, dst string) error {
+func (u *Updater) downloadOne(ctx context.Context, url, ua, dst string, tokenInQuery bool) error {
 	// 下载可能超过 client 的 20s 超时，这里用独立的长超时请求
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -633,6 +995,11 @@ func (u *Updater) downloadOne(ctx context.Context, url, ua, dst string) error {
 	}
 	if ua != "" {
 		req.Header.Set("User-Agent", ua)
+	}
+	// 令牌优先走请求头：URL 一旦带上令牌，Go 的 *url.Error 会把它带进错误文本，
+	// 那段文本会进容器日志和对外接口，属于泄漏。
+	if u.token != "" && !tokenInQuery {
+		req.Header.Set("Authorization", "token "+u.token)
 	}
 	dl := &http.Client{
 		Timeout: 10 * time.Minute,
@@ -643,7 +1010,8 @@ func (u *Updater) downloadOne(ctx context.Context, url, ua, dst string) error {
 	}
 	resp, err := dl.Do(req)
 	if err != nil {
-		return err
+		// 这里必须脱敏：*url.Error 里含完整 URL
+		return redactErr(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -701,26 +1069,44 @@ func (u *Updater) downloadOne(ctx context.Context, url, ua, dst string) error {
 	return os.Rename(tmp, dst)
 }
 
-// extract 解压 zip 到 <dir>/src（覆盖旧的），自动去掉压缩包里那一层仓库名目录
-func (u *Updater) extract(zipPath, dir string) (string, error) {
+// extract 解压 zip 到 <dir>/src（覆盖旧的），自动去掉压缩包里那一层仓库名目录。
+//
+// 返回解压后的目录，以及从归档首层目录名里解析出的提交号（可能为空）。
+//
+// 安全限制（防 zip 炸弹 / 伪造头部）：
+//   - 单文件：头部声明的大小可能被伪造，所以按**实际写入字节数**判定，写满了上限就报错；
+//   - 总量：所有文件解压字节数累加，超过 maxTotalBytes 立刻中止；
+//   - 文件数：超过 maxFileCount 立刻中止（防大量小文件耗尽磁盘/inode）。
+func (u *Updater) extract(zipPath, dir string) (string, string, error) {
 	zr, err := zip.OpenReader(zipPath)
 	if err != nil {
-		return "", fmt.Errorf("源码包不是有效的 zip: %w", err)
+		return "", "", fmt.Errorf("源码包不是有效的 zip: %w", err)
 	}
 	defer zr.Close()
 
 	tmpDir := filepath.Join(dir, "src.new")
 	if err := os.RemoveAll(tmpDir); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := os.MkdirAll(tmpDir, 0o755); err != nil {
-		return "", err
+		return "", "", err
 	}
+
+	var totalWritten int64
+	var fileCount int
+	commitHint := ""
 
 	for _, f := range zr.File {
 		name := filepath.ToSlash(f.Name)
 		// 去掉第一层目录（GitHub 的 zip 一定是 video-main/xxx）
 		if i := strings.IndexByte(name, '/'); i >= 0 {
+			top := name[:i]
+			// 首层目录名形如 video-<sha>：从中解析真实提交号。
+			// 用户没先点「检查更新」直接点「立即更新」时 u.info 是零值，
+			// 只有靠这个才能把正确的 sha 注入新二进制。
+			if commitHint == "" {
+				commitHint = commitFromArchiveDir(top)
+			}
 			name = name[i+1:]
 		}
 		if name == "" {
@@ -729,55 +1115,109 @@ func (u *Updater) extract(zipPath, dir string) (string, error) {
 		// 防 zip-slip：绝对路径、..、盘符一律拒绝
 		clean := filepath.Clean(name)
 		if filepath.IsAbs(clean) || strings.HasPrefix(clean, "..") || strings.Contains(clean, ":") {
-			return "", fmt.Errorf("源码包里有非法路径: %s", f.Name)
+			return "", "", fmt.Errorf("源码包里有非法路径: %s", f.Name)
 		}
 		target := filepath.Join(tmpDir, clean)
 		if !strings.HasPrefix(target, tmpDir+string(os.PathSeparator)) {
-			return "", fmt.Errorf("源码包里有非法路径: %s", f.Name)
+			return "", "", fmt.Errorf("源码包里有非法路径: %s", f.Name)
 		}
 		if f.FileInfo().IsDir() {
 			if err := os.MkdirAll(target, 0o755); err != nil {
-				return "", err
+				return "", "", err
 			}
 			continue
 		}
+		// 头部声明只是快速筛（大文件直接拒），真正的判定在 extractFile 里按实际字节数来
 		if f.UncompressedSize64 > maxFileBytes {
-			return "", fmt.Errorf("源码包里有超大文件: %s", f.Name)
+			return "", "", fmt.Errorf("源码包里有超大文件: %s", f.Name)
+		}
+		fileCount++
+		if fileCount > maxFileCount {
+			return "", "", fmt.Errorf("源码包里文件过多（超过 %d 个）", maxFileCount)
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return "", err
+			return "", "", err
 		}
-		if err := extractFile(f, target); err != nil {
-			return "", fmt.Errorf("解压 %s 失败: %w", f.Name, err)
+		n, err := extractFile(f, target)
+		if err != nil {
+			return "", "", fmt.Errorf("解压 %s 失败: %w", f.Name, err)
+		}
+		totalWritten += n
+		if totalWritten > maxTotalBytes {
+			return "", "", fmt.Errorf("源码包解压后总大小超过上限（%s）", humanBytes(maxTotalBytes))
 		}
 	}
 
 	final := filepath.Join(dir, "src")
 	_ = os.RemoveAll(final)
 	if err := os.Rename(tmpDir, final); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return final, nil
+	return final, commitHint, nil
 }
 
-func extractFile(f *zip.File, target string) error {
+// commitFromArchiveDir 从归档首层目录名解析提交号。
+// Gitee 的归档首层目录形如 video-<sha>/（sha 为 40 位十六进制）；
+// 匿名下载的分支包是 video-master/，解析不出 sha，返回空串。
+func commitFromArchiveDir(top string) string {
+	// 形如 video-<sha>
+	i := strings.LastIndexByte(top, '-')
+	if i < 0 {
+		return ""
+	}
+	sha := top[i+1:]
+	if len(sha) < 7 || len(sha) > 40 {
+		return ""
+	}
+	for _, c := range sha {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return ""
+		}
+	}
+	return sha
+}
+
+// extractFile 解压单个文件，返回实际写入的字节数。
+//
+// 用 LimitReader 限制最多读 maxFileBytes+1 字节：读到第 maxFileBytes+1 字节
+// 就说明文件超过单文件上限，直接报错——不能静默截断，
+// 否则会产出一个「半个 .go 文件」，编译报错很难看出真实原因。
+func extractFile(f *zip.File, target string) (int64, error) {
 	rc, err := f.Open()
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer rc.Close()
 	out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	defer out.Close()
-	_, err = io.Copy(out, io.LimitReader(rc, maxFileBytes+1))
-	return err
+	n, err := io.Copy(out, io.LimitReader(rc, maxFileBytes+1))
+	// 必须先关闭文件再删除：文件句柄还开着时删除会失败（Windows 上直接报「拒绝访问」），
+	// 半截文件就会留在源码目录里。
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(target)
+		return n, err
+	}
+	if n > maxFileBytes {
+		// 写了一半的文件不能留着：宁可删掉让更新失败，也不要让编译器去读半截源码
+		if rmErr := os.Remove(target); rmErr != nil {
+			return n, fmt.Errorf("文件超过单文件上限（%s），且清理半截文件失败: %w", humanBytes(maxFileBytes), rmErr)
+		}
+		return n, fmt.Errorf("文件超过单文件上限（%s）", humanBytes(maxFileBytes))
+	}
+	return n, nil
 }
 
-func dockerInstructions(srcDir string) []string {
+// dockerInstructions 生成「宿主机重建镜像」的提示。
+// dataDir 用实际的数据目录渲染：写死 /app/videodata 会在 data_dir 被改过时误导用户。
+func dockerInstructions(srcDir, dataDir string) []string {
 	return []string{
-		"最新源码已下载到：" + srcDir + "（容器内是 /app/videodata/update/src，对应宿主机数据目录）",
+		"最新源码已下载到（容器内路径）：" + srcDir,
+		"容器内数据目录：" + dataDir + "（宿主机上就是 docker-compose 里挂载的那个 volume）",
 		"在宿主机项目目录更新并重建镜像：",
 		"  1) git pull                              # 或把上面的源码同步到项目目录",
 		"  2) docker compose build && docker compose up -d",

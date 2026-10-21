@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -87,6 +88,15 @@ func (s *Server) cachePut(key string, data []byte) {
 	if s.listCache == nil {
 		s.listCache = map[string]listCacheItem{}
 	}
+	// 覆盖同一个 key 时要先扣掉旧条目的字节数：
+	// 旧实现只加不减 → listBytes 虚高 → 很快超过上限就把整个缓存清空，
+	// 缓存等于没有（同一查询反复命中时尤其明显）。
+	if old, ok := s.listCache[key]; ok {
+		s.listBytes -= len(old.data)
+		if s.listBytes < 0 {
+			s.listBytes = 0
+		}
+	}
 	s.listBytes += len(data)
 	// 按总字节数 + 条数双重限容，整体清空（简单但不会无限增长）
 	if s.listBytes > listCacheMaxBytes || len(s.listCache) > listCacheMaxItems {
@@ -140,12 +150,24 @@ func spaHandler(root fs.FS) http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		// /api/ 下的未知路径必须返回 404 JSON：
+		// 回退成 index.html 会让前端 res.json() 抛异常，
+		// 监控也会把 404 误判成成功，真实错误被掩盖。
+		if strings.HasPrefix(p, "api/") {
+			writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "msg": "接口不存在"})
+			return
+		}
 		serveIndex(w)
 	})
 }
 
+// logMiddleware 访问日志 + 基础安全响应头
 func logMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 安全响应头：防 MIME 嗅探、点击劫持、Referrer 泄露
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "SAMEORIGIN")
+		w.Header().Set("Referrer-Policy", "same-origin")
 		start := time.Now()
 		next.ServeHTTP(w, r)
 		if !strings.HasPrefix(r.URL.Path, "/api/") {
@@ -171,6 +193,55 @@ func ok(w http.ResponseWriter, v any) { writeJSON(w, 200, map[string]any{"ok": t
 
 func fail(w http.ResponseWriter, msg string) {
 	writeJSON(w, 200, map[string]any{"ok": false, "msg": msg})
+}
+
+// publicErr 把内部错误（SQLite / 文件系统）转成对外可展示的文案。
+// 目的：不要把表名、列名、约束名、绝对路径直接暴露给调用方
+// （错误信息里出现 "no such table: vod_xxx" 就等于把库结构送出去了）。
+// 原始错误会写进服务日志，便于排查。
+func publicErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	msg := err.Error()
+	lower := strings.ToLower(msg)
+	internal := []string{
+		"sql logic error", "no such table", "no such column", "constraint failed",
+		"database is closed", "database is locked", "disk i/o error", "sqlite",
+		"sql:", "no such file or directory", "permission denied", "file exists",
+		"cannot find the file", "is being used by another process", "text file busy",
+		"connection refused", "no such host", "unrecognized opcode",
+	}
+	for _, k := range internal {
+		if strings.Contains(lower, k) {
+			logx.Warnf("[api] 内部错误: %v", err)
+			return "操作失败，请查看服务日志"
+		}
+	}
+	// 绝对路径会暴露用户名与部署结构（如 C:\Users\xxx\... 或 /home/xxx/...）：
+	// 没命中上面的内部特征时，也把路径片段替换掉再返回。
+	return maskAbsPaths(msg)
+}
+
+// maskAbsPaths 把消息里的绝对路径替换成「…/父目录/文件名」
+func maskAbsPaths(msg string) string {
+	// Windows: C:\dir\file  |  POSIX: /dir/file
+	rx := regexp.MustCompile(`([A-Za-z]:[\\/]|/)([^\s"'：:，,；;）)]+)`)
+	return rx.ReplaceAllStringFunc(msg, func(m string) string {
+		m = strings.ReplaceAll(m, "\\", "/")
+		idx := strings.LastIndex(m, "/")
+		if idx <= 0 {
+			return "…"
+		}
+		head := m[:idx]
+		tail := m[idx:]
+		// 只保留最后一段父目录
+		if p := strings.LastIndex(head, "/"); p >= 0 {
+			head = head[:p]
+			return "…" + head[p:] + tail
+		}
+		return "…" + tail
+	})
 }
 
 // ---- 接口管理 ----

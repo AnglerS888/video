@@ -47,7 +47,7 @@ func (s *Server) applyUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.Up.Start(); err != nil {
-		fail(w, err.Error())
+		fail(w, publicErr(err))
 		return
 	}
 	ok(w, s.Up.GetStatus())
