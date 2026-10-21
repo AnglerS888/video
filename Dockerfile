@@ -17,7 +17,13 @@ COPY VERSION ./
 ARG GOPROXY=https://goproxy.cn|https://goproxy.io|direct
 ENV GOPROXY=${GOPROXY} GOSUMDB=sum.golang.org GOTOOLCHAIN=auto
 
-RUN go mod download && \
+# 缓存挂载：模块缓存 + 编译缓存放在 BuildKit 缓存里，改代码重建不用重编
+# modernc.org/sqlite（首次约 3~4 分钟）。
+# ⚠️ 需要 BuildKit（Docker 23+ 默认开启）。老 Docker 报
+#    "the --mount option requires BuildKit" / unknown flag 时，删掉两行 --mount 即可。
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go mod download && \
     CGO_ENABLED=0 go build -trimpath \
       -ldflags="-s -w -X videoDownLoad/internal/version.Version=$(cat VERSION)" \
       -o videodl .

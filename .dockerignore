@@ -12,6 +12,8 @@ config.json
 # 前端源码与依赖不需要进镜像（只用构建好的 internal/web/static）
 web/node_modules
 web/src
+web/dist
+web/public
 config.yml
 ui.yml
 # IDE / 工具目录：与构建无关，别白占构建上下文（国内上传上下文慢，上下文越小越好）
