@@ -2,29 +2,41 @@
 # 影视库（videodl）极简 Dockerfile
 # 阶段 1 编译：golang-alpine 静态编译
 # 阶段 2 运行：golang-alpine 基座（保留容器内「立即更新」自编译能力）
+# 兼容性：不依赖 BuildKit / buildx，老版 Docker 也能直接 docker build。
 # ============================================================
 FROM golang:1.26-alpine AS builder
 
+# alpine 官方源（dl-cdn）在国内经常超时/DNS 抖动，默认换阿里云镜像；
+# 海外构建可 --build-arg APK_MIRROR=dl-cdn.alpinelinux.org
+ARG APK_MIRROR=mirrors.aliyun.com
+# git 必装：GOPROXY 列表用 "|" 分隔时，代理只要出错（超时/DNS/404）就会回退到 direct，
+# direct 让 go 直连 VCS 拉模块，而 golang:alpine 基础镜像不带 git，
+# 缺它会报 "exec: git: executable file not found in $PATH"。
+# ca-certificates：代理走 HTTPS 需要根证书（官方镜像自带，显式装上更稳）。
+RUN sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories && \
+    apk add --no-cache git ca-certificates
+
 WORKDIR /app
 
-# 先复制依赖文件（利用 Docker 层缓存）
+# 国内构建走 goproxy.cn；海外可 --build-arg GOPROXY=https://proxy.golang.org,direct
+# 注意分隔符："|" = 前一个出错就换下一个（含超时）；"," = 只在 404/410 时才换下一个。
+ARG GOPROXY=https://goproxy.cn|https://goproxy.io|direct
+ENV GOPROXY=${GOPROXY} GOSUMDB=sum.golang.org GOTOOLCHAIN=auto
+
+# 先只拷 go.mod/go.sum 下依赖：之后改 *.go 不会让这一层缓存失效
 COPY go.mod go.sum ./
+
+# 不依赖 BuildKit：老 Docker（无 buildx）不认 --mount=type=cache，会直接报
+# "the --mount option requires BuildKit" 构建失败。模块缓存改靠 Docker 层缓存：
+# go.mod/go.sum 不变时，这一层直接命中，不会重新下载。
+RUN go mod download
+
 COPY *.go ./
 COPY internal/ ./internal/
 COPY VERSION ./
 
-# 国内构建走 goproxy.cn；海外可 --build-arg GOPROXY=https://proxy.golang.org,direct
-ARG GOPROXY=https://goproxy.cn|https://goproxy.io|direct
-ENV GOPROXY=${GOPROXY} GOSUMDB=sum.golang.org GOTOOLCHAIN=auto
-
-# 缓存挂载：模块缓存 + 编译缓存放在 BuildKit 缓存里，改代码重建不用重编
-# modernc.org/sqlite（首次约 3~4 分钟）。
-# ⚠️ 需要 BuildKit（Docker 23+ 默认开启）。老 Docker 报
-#    "the --mount option requires BuildKit" / unknown flag 时，删掉两行 --mount 即可。
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    go mod download && \
-    CGO_ENABLED=0 go build -trimpath \
+# -buildvcs=false：构建上下文/容器内源码没有 .git 时不必探测版本控制
+RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
       -ldflags="-s -w -X videoDownLoad/internal/version.Version=$(cat VERSION)" \
       -o videodl .
 
@@ -32,6 +44,12 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # 阶段 2：运行
 # ============================================================
 FROM golang:1.26-alpine
+
+ARG APK_MIRROR=mirrors.aliyun.com
+# 容器内「立即更新」会在镜像里执行 go build，代理失败同样会回退 direct，
+# 所以运行时基座也要有 git，否则首次更新就报 git 找不到。
+RUN sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories && \
+    apk add --no-cache git ca-certificates
 
 # 时区已编进二进制（main.go 的 _ "time/tzdata"），无需 tzdata
 ENV TZ=Asia/Shanghai
