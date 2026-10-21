@@ -34,7 +34,7 @@ func (s *Server) checkUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 // applyUpdate 启动一次更新。**只允许 Docker 容器内使用**：
-// 镜像自带 Go 工具链时，容器内直接 go build → 替换二进制 → 退出由 docker 重启拉起；
+// 镜像自带 Go 工具链时，容器内直接 go build → 替换二进制 → 原地 exec 重启（容器不退出）；
 // 旧的精简镜像（无 go）只落源码，由用户在宿主机执行 docker compose build && up -d。
 // 直接运行模式一律拒绝，引导用户去 Gitee 手动更新。
 func (s *Server) applyUpdate(w http.ResponseWriter, r *http.Request) {

@@ -312,7 +312,8 @@ git 提交哈希和构建时间一起通过 `-ldflags` 注入 `internal/version`
 1. 下载并解压最新源码到数据目录；
 2. 容器内 `go build` 编译新二进制（模块/构建缓存在 `update/gomodcache`、`update/gocache`，
    下次只增量编译），并用 `-version` 自检；
-3. 原子替换 `/app/videodl` 后进程退出，由 `restart: unless-stopped` 拉起新进程——
+3. 原子替换 `/app/videodl` 后**进程内原地 exec 新二进制**（PID 不变，容器不会退出，
+   也不需要容器配 `restart` 策略）；exec 失败才退出进程，交给容器重启策略兜底——
    全程不用登录宿主机，数据目录（volume）不受影响。
 
 > 编译时内存开销比日常运行大不少（modernc/sqlite 很吃内存），建议给容器留够 2G 以上

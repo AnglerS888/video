@@ -10,8 +10,8 @@
 // 更新：直接下载 Gitee 的源码包 /repository/archive/<branch>.zip。
 //
 // 只支持 Docker 容器内更新。2026-10-21 起运行镜像自带 Go 工具链（golang 基座），
-// 流程是「下载源码 → 容器内 go build → 替换二进制 → 进程退出，由 docker 的
-// restart 策略拉起新进程」；旧的精简镜像（容器里找不到 go 命令）自动回退为
+// 流程是「下载源码 → 容器内 go build → 原子替换二进制 → 原地 exec 重启（PID 不变，
+// 容器不退出）」；旧的精简镜像（容器里找不到 go 命令）自动回退为
 // 「下载源码到数据目录 → 给出在宿主机重建镜像的指令」。
 // 直接运行（单个二进制 / NAS 裸跑）**不提供自动更新**，页面上只给 Gitee 仓库链接，
 // 由用户自己下载最新版本替换。
@@ -125,7 +125,7 @@ func New(dataDir, repo, branch, token string) *Updater {
 		},
 		status: Status{Phase: "idle", Message: "尚未开始", Instructions: []string{}},
 	}
-	// 容器内自更新是「替换二进制后退出、由 docker 拉起新进程」，新进程的内存态是空的；
+	// 容器内自更新会用新二进制原地 exec（PID 不变），新进程的内存态是空的；
 	// 旧进程退出前会写 done.json，这里读出来恢复成「更新完成」状态给页面展示（只报一次）
 	if d, ok := readDoneFile(dataDir); ok {
 		u.status = Status{
@@ -238,9 +238,13 @@ func checkCrashAndMaybeRollback(dataDir string) {
 	}
 	_ = os.Remove(crashSentinelPath(dataDir))
 	logx.Errorf("[update] 检测到新版本（%s）启动失败，已自动回滚到旧版本（备份 %s）", s.NewVersion, bak)
-	// 退出让容器重启策略拉起进程 —— 这次跑的就是恢复回来的旧版本了
+	// 原地 exec 刚恢复的旧版本：容器不会退出，也不依赖 restart 策略；
+	// exec 失败才退出进程，交给容器重启策略兜底
 	time.Sleep(500 * time.Millisecond)
-	os.Exit(0)
+	if err := Relaunch(); err != nil {
+		logx.Warnf("[update] 回滚后原地重启失败（%v），退出进程交给容器重启策略", err)
+		os.Exit(0)
+	}
 }
 
 // copyFile 复制文件（src → dst），保持可执行权限
@@ -701,7 +705,7 @@ func (u *Updater) run(ctx context.Context) error {
 	}
 
 	// 3) 镜像自带 Go 工具链就在容器内编译：
-	//    go build → 替换二进制 → 退出，由 docker 的 restart 策略拉起新进程。
+	//    go build → 校验 → 原子替换 → 原地 exec 新进程（PID 不变，容器不退出）。
 	//    旧的精简镜像（找不到 go 命令）回退为「落源码 + 提示宿主机重建」。
 	if lookErr != nil {
 		u.setStatus(func(s *Status) {
@@ -745,7 +749,7 @@ func (u *Updater) buildWorkspace() string {
 }
 
 // buildAndRestart 在容器内编译新二进制、校验、原子替换当前程序文件，
-// 然后退出进程——compose 的 restart: unless-stopped（或 deploy.sh 的 --restart）会立刻拉起新二进制。
+// 然后原地 exec 新二进制重启（PID 不变，容器不会退出，不依赖 restart 策略）。
 //
 // work 是容器内的构建工作目录（源码 + go 缓存都在里面，宿主机碰不到）。
 // commitHint 是从归档首层目录名解析出的真实提交号（可能为空）。
@@ -853,15 +857,15 @@ func (u *Updater) buildAndRestart(ctx context.Context, srcDir, work, commitHint,
 	u.setStatus(func(s *Status) {
 		s.Phase = "restarting"
 		s.Percent = 100
-		s.Message = "编译完成，正在重启到新版本…（如新版本启动异常，可用容器内 " + bakPath + " 回滚）"
+		s.Message = "编译完成，正在原地重启到新版本…（如新版本启动异常，可用容器内 " + bakPath + " 回滚）"
 		s.Instructions = []string{}
 	})
 	// 落一份结果：新进程启动时在 New() 里读出来恢复「更新完成」状态
 	_ = writeDoneFile(u.dataDir, oldVer, newVer, commit)
 
-	logx.Infof("[update] 已替换二进制（v%s → v%s），请求优雅退出，等待 docker 拉起新进程", oldVer, newVer)
+	logx.Infof("[update] 已替换二进制（v%s → v%s），请求原地重启（PID 不变，容器不会退出）", oldVer, newVer)
 	time.Sleep(2 * time.Second) // 给前端最后一轮轮询留点窗口
-	requestRestart()            // SIGTERM：走 main 的优雅退出，退出后由 restart 策略拉起新二进制
+	requestRestart()            // SIGTERM：走 main 的优雅退出，收尾后 exec 新二进制
 	return nil                  // 不会执行到这里
 }
 

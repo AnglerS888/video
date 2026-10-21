@@ -197,14 +197,21 @@ func main() {
 		MmapMB:   cfg.DB.MmapMB,
 		Conns:    cfg.DB.Conns,
 	})
-	// 关库兜底：后面任何一步 Fatalf 退出，defer 也能把 SQLite 正常关掉（不留 -wal/-shm）
-	defer func() {
+	// 关库兜底：后面任何一步 Fatalf 退出，defer 也能把 SQLite 正常关掉（不留 -wal/-shm）。
+	// 更新后的原地重启（exec）不会执行 defer，所以收尾路径会先显式调一次 closeDB。
+	dbClosed := false
+	closeDB := func() {
+		if dbClosed {
+			return
+		}
+		dbClosed = true
 		if err := database.Close(); err != nil {
 			logx.Warnf("[shutdown] 关闭数据库失败: %v", err)
 		} else {
 			logx.Infof("[shutdown] 数据库已关闭")
 		}
-	}()
+	}
+	defer closeDB()
 	logx.Infof("[db] 每连接页缓存 %d MiB × %d 连接，mmap %d MiB，自动整理阈值 空闲页>%d%%",
 		cfg.DB.CacheMB, cfg.DB.Conns, cfg.DB.MmapMB, cfg.DB.VacuumPct)
 	col := collector.New(database)
@@ -342,6 +349,16 @@ func main() {
 	// 反过来（先关库）会让还在跑的 goroutine 拿到 "sql: database is closed"。
 	stopBG()
 	sch.Stop()
+	// exec 替换进程后 defer 不会再执行：先真正关库（WAL 正常收尾），
+	// 避免新进程启动时接手一个没关干净的 SQLite 连接。
+	closeDB()
+	if updater.RestartRequested() {
+		// 更新触发：用新二进制原地 exec，PID 不变、容器不退出，
+		// 不依赖 docker 的 restart 策略（手动 docker run 没配 --restart 也能更新）。
+		if err := updater.Relaunch(); err != nil {
+			logx.Warnf("[update] 原地重启失败（%v），改为退出进程，交给容器重启策略", err)
+		}
+	}
 	logx.Infof("[shutdown] 进程退出")
 }
 

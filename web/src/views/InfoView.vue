@@ -437,7 +437,7 @@ const upApplying = ref(false)
 let upTimer: number | undefined
 
 const isDocker = computed(() => upInfo.value?.mode === 'docker')
-// restarting 也算进行中：进程马上退出，接口会断几秒，docker 重启后新进程回 done
+// restarting 也算进行中：进程马上原地 exec 重启，接口会断几秒，新进程回来后回 done
 const upBusy = computed(() => ['downloading', 'extracting', 'building', 'restarting'].includes(upStatus.value?.phase || ''))
 
 const upPhaseText = computed(() => {
@@ -518,7 +518,7 @@ function pollUp() {
   if (upTimer) return
   upTimer = window.setInterval(async () => {
     const r = await api.updateStatus()
-    // restarting 阶段接口会断（进程退出、docker 拉起新进程），失败就等下一轮
+    // restarting 阶段接口会断（进程原地 exec 重启，旧进程已停、新进程还没监听），失败就等下一轮
     if (!r.ok || !r.data) return
     upStatus.value = r.data
     if (['staged', 'failed', 'done'].includes(r.data.phase)) {
@@ -859,7 +859,7 @@ onBeforeUnmount(() => {
           </div>
           <p v-if="isDocker" class="text-[11px] muted">
             自动更新只在 Docker 容器内提供：点「立即更新」后自动下载最新源码、在容器内编译并替换程序，
-            随后容器自动重启生效（期间服务短暂中断），数据目录不受影响，无需登录宿主机。
+            随后进程原地重启生效（PID 不变，容器不会退出；期间服务短暂中断），数据目录不受影响，无需登录宿主机。
             若镜像不含 Go 工具链（旧版精简镜像），则只下载源码并给出宿主机重建镜像的步骤。
           </p>
           <p v-else class="text-[11px] muted">
@@ -978,7 +978,7 @@ onBeforeUnmount(() => {
             <p v-if="info.cover.last_error" class="mt-2 break-all rounded-lg bg-rose-500/10 px-2.5 py-2 text-[11px] text-rose-500">
               最近失败：{{ info.cover.last_error }}
             </p>
-            <p class="mt-1 text-[11px] muted">页面只显示已成功下载并压缩到本地的封面，拉不到就不显示。</p>
+            <p class="mt-1 text-[11px] muted">页面优先读本地封面，拉不到时显示内置占位图。</p>
           </div>
 
           <!-- 封面补充：全库检查，同剧多源互相兜底 -->
@@ -996,7 +996,7 @@ onBeforeUnmount(() => {
             </div>
             <p class="mt-1 text-[11px] muted">
               检查全库封面缓存；同一部剧在多个来源都有记录时，某个源的封面拉不到就自动用其它源的封面补上。
-              直连都失败时再走图片代理（wsrv.nl，每次间隔 2~3 秒）。
+              配置了图片代理时取图优先走代理（失败再直连），未配置时直连都失败再走内置代理（每次间隔 2~3 秒）。
             </p>
 
             <div v-if="fixVisible" class="mt-2 rounded-lg bg-slate-50 px-2.5 py-2 dark:bg-white/5">
