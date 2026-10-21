@@ -37,6 +37,16 @@ function fmtUptime(sec: number) {
   return `${m} 分`
 }
 
+// 构建时间/提交时间是 UTC（RFC3339 带 Z），必须经 Date 按浏览器时区转换后再展示；
+// 直接 replace 掉 Z 会把它当本地时间显示，国内用户会看到早 8 小时的「未来时间差」。
+function fmtLocalTime(s?: string): string {
+  if (!s) return '—'
+  const d = new Date(s)
+  if (Number.isNaN(d.getTime())) return s.replace('T', ' ').replace('Z', '')
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
 const dataParts = computed(() => {
   const d = info.value?.data
   if (!d) return []
@@ -763,7 +773,7 @@ onBeforeUnmount(() => {
           <dl class="grid grid-cols-1 gap-x-4 gap-y-1.5 text-xs sm:grid-cols-2">
             <div class="flex justify-between gap-3">
               <dt class="muted">构建时间</dt>
-              <dd class="tabular-nums">{{ upInfo?.build_time ? upInfo.build_time.replace('T', ' ').replace('Z', '') : '—' }}</dd>
+              <dd class="tabular-nums">{{ fmtLocalTime(upInfo?.build_time) }}</dd>
             </div>
             <div class="flex justify-between gap-3">
               <dt class="muted">更新源</dt>
@@ -775,7 +785,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="flex justify-between gap-3">
               <dt class="muted">提交时间</dt>
-              <dd class="tabular-nums">{{ upInfo?.latest_commit_at ? upInfo.latest_commit_at.replace('T', ' ').replace('Z', '') : '—' }}</dd>
+              <dd class="tabular-nums">{{ fmtLocalTime(upInfo?.latest_commit_at) }}</dd>
             </div>
           </dl>
           <p v-if="upInfo?.latest_commit_msg" class="truncate text-[11px] muted" :title="upInfo.latest_commit_msg">
