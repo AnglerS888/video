@@ -1,112 +1,40 @@
+# ============================================================
+# 影视库（videodl）极简 docker-compose
+# 构建: docker compose build   启动: docker compose up -d
+# ============================================================
 services:
   videodl:
-    build:
-      context: .
-      args:
-        # ⚠️ 这里**不要**出现 TARGETOS / TARGETARCH：BuildKit 会自动注入它们
-        #    （对应 --platform），一旦传了值就会覆盖自动值 —— 写死 amd64 会让
-        #    ARM NAS 编出 x86 二进制，容器起来直接 "exec format error"。
-        #    老 Docker（20.10 classic builder，群晖/飞牛 NAS 常见）没有这两个变量，
-        #    Dockerfile 会回落到 `go env GOOS / GOARCH`（= 宿主架构），同样正确。
-        # ⚠️ 要给别的架构出镜像，改的是**平台**而不是编译目标，只有下面两条有效：
-        #      DOCKER_DEFAULT_PLATFORM=linux/arm64 docker compose build
-        #      docker buildx build --platform linux/arm64 --load -t videodl:latest .
-        #    `--build-arg TARGETARCH=arm64` 只改编译出来的二进制，两个 FROM 仍按宿主
-        #    架构拉镜像、镜像平台标记也不变 → 拿到目标机器上照样 exec format error。
-        # Go 模块代理：国内默认走 goproxy.cn / 阿里云 / 腾讯云 / goproxy.io（proxy.golang.org 连不上会
-        # "go mod download" 超时）。竖线 | 的含义是「前一个代理出错（超时/DNS 抖动）也换下一个」，
-        # 逗号 , 的含义是「前一个返回 404 才换下一个」——国内网络抖，必须用竖线。
-        # ⚠️ 变量名用 VDL_ 前缀：**不能**写 ${GOPROXY:-...}，那是本机 Go 环境变量的名字，
-        #    执行过 `go env -w GOPROXY=off` 或 export 过的人会把本机值带进构建。
-        # 海外构建：VDL_GOPROXY=https://proxy.golang.org,direct docker compose build
-        GOPROXY: "${VDL_GOPROXY:-https://goproxy.cn|https://mirrors.aliyun.com/goproxy/|https://mirrors.cloud.tencent.com/go/|https://goproxy.io|direct}"
-        # 校验数据库：**默认不要关**（国内也用得上）。
-        #   sum.golang.org 本身国内连不上，但 Go 会把 sumdb 查询**转发给 GOPROXY 里的代理**
-        #   （<代理>/sumdb/sum.golang.org/lookup/...），实测 goproxy.cn / 阿里云 / 腾讯云都返回 200。
-        #   关掉（GOSUMDB=off）会让 golang.org/toolchain 无法通过校验 →
-        #   基础镜像 Go 版本低于 go.mod 要求、或容器内「立即更新」时直接报
-        #   "checksum database disabled by GOSUMDB=off" 而失败。
-        GOSUMDB: "${VDL_GOSUMDB:-sum.golang.org}"
-        # 工具链策略：auto = 基础镜像自带的 Go 版本低于 go.mod 要求时，
-        #   go 会自动经 GOPROXY 下载对应版本的工具链（国内代理实测可下，约 70MB，一次性开销）。
-        #   离线/完全不能出网的环境改成 local：此时版本不够会立刻失败并给出可操作提示。
-        GOTOOLCHAIN: "${VDL_GOTOOLCHAIN:-auto}"
-        # 版本信息：APP_VERSION 留空时读仓库根目录 VERSION 文件；
-        # 想显示提交哈希就在宿主机执行：
-        #   GIT_COMMIT=$(git rev-parse --short HEAD) docker compose build
-        APP_VERSION: "${APP_VERSION:-}"
-        GIT_COMMIT: "${GIT_COMMIT:-}"
-        BUILD_TIME: "${BUILD_TIME:-}"
-        # 国内优先：基础镜像走 1panel（1ms.run 的大层走 CloudFront 很慢），apk 走阿里云。
-        # 海外或想用官方：GOLANG_IMAGE=golang:1.26-alpine APK_MIRROR= docker compose build
-        GOLANG_IMAGE: "${GOLANG_IMAGE:-docker.1panel.live/library/golang:1.26-alpine}"
-        # 运行基座（自带 Go 工具链 → 容器内一键更新），默认与构建镜像同一个。
-        # 换官方镜像时记得两个一起改：GOLANG_IMAGE=golang:1.26-alpine RUNTIME_IMAGE=golang:1.26-alpine
-        # 想要精简小镜像（在线更新退回「下载源码+宿主机重建」模式）：
-        #   RUNTIME_IMAGE=docker.1panel.live/library/alpine:3.20 docker compose build
-        RUNTIME_IMAGE: "${RUNTIME_IMAGE:-docker.1panel.live/library/golang:1.26-alpine}"
-        APK_MIRROR: "${APK_MIRROR:-https://mirrors.aliyun.com/alpine}"
-        # 阿里云源抽风时的备用源（清华源）
-        APK_FALLBACK_MIRRORS: "${APK_FALLBACK_MIRRORS:-https://mirrors.tuna.tsinghua.edu.cn/alpine}"
+    build: .
     image: videodl:latest
     container_name: videodl
     restart: unless-stopped
-    # 需要重启的配置在 config.yml（VDL_CONFIG 指向 volume 上的那份），
-    # 采集/下载/封面/ffmpeg 在「信息」页改，落在 volume 里的 ui.yml。
+    # 宿主端口可改：VDL_PORT=8080 docker compose up -d
     ports:
-      # 宿主端口可覆盖，容器内固定 5200：VDL_PORT=8080 docker compose up -d
       - "${VDL_PORT:-5200}:5200"
     volumes:
-      # 数据库、ffmpeg 缓存、封面与下载的视频都在该目录，映射到 NAS 本地盘
+      # 数据库、ffmpeg、封面与下载的视频都在该目录
       - ./videodata:/app/videodata
     environment:
       - TZ=Asia/Shanghai
-      # 需要重启的配置在 config.yml：指向 volume，首次启动自动生成，改完重启容器生效；
-      # 页面可改的项（并发/封面/ffmpeg）在同目录的 ui.yml，保存即生效。
-      # 低配参数（lowmem/并发/内存上限）都在这个文件里，不再用命令行。
+      # 配置在数据目录的 config.yml（首次启动自动生成，改完重启容器）；
+      # 页面可改项在同目录 ui.yml（保存即生效）
       - VDL_CONFIG=/app/videodata/config.yml
-      # 想让每个 API 请求都打一行访问日志时设为 1（默认只在慢请求时打）
-      - VDL_HTTP_LOG=0
-      # 容器内「立即更新」要下源码 + go build，代理必须指向国内（竖线串联多代理自动兜底）
-      # 变量名用 VDL_ 前缀（宿主侧），容器里的名字仍是 GOPROXY / GOSUMDB / GOTOOLCHAIN：
-      # 直接用 ${GOPROXY:-...} 会和宿主机 Go 环境变量撞名，把本机设置带进容器。
-      - GOPROXY=${VDL_GOPROXY:-https://goproxy.cn|https://mirrors.aliyun.com/goproxy/|https://mirrors.cloud.tencent.com/go/|https://goproxy.io|direct}
-      # 校验库同样经代理转发，所以容器内编译不必关校验（关掉会导致工具链下载失败）
-      - GOSUMDB=${VDL_GOSUMDB:-sum.golang.org}
-      # 容器内编译时基础镜像 Go 版本偏低也能自动补齐工具链
-      - GOTOOLCHAIN=${VDL_GOTOOLCHAIN:-auto}
-      # 在线更新：更新源固定为 Gitee（anglers/video），点「立即更新」后容器内
-      # 自动下载源码 → go build → 替换二进制 → 由 restart 策略拉起新进程，
-      # 全程不用登录宿主机。更新令牌用环境变量 VDL_UPDATE_TOKEN（可选）。
-    # init: 让容器里 PID 1 有个小小的 init 负责收尸和转发信号，
-    # docker stop 时 SIGTERM 才能真正送到程序里（否则只会等 10s 后 SIGKILL）
+      # 容器内「立即更新」自编译用的 Go 代理（国内链路）
+      - GOPROXY=${VDL_GOPROXY:-https://goproxy.cn|https://goproxy.io|direct}
+    # PID 1 有 init 收尸转发信号，docker stop 的 SIGTERM 才能送达程序
     init: true
-    # 优雅退出：给正在跑的 ffmpeg 合并/分片下载留出收尾时间
+    # 给正在跑的 ffmpeg 合并/下载留出收尾时间
     stop_grace_period: 30s
-    # 资源上限：容器总内存给 2G——日常运行进程自身有 GC 软上限压着用不到这么多，
-    # 多出来的主要留给「在线更新」时在容器内 go build（modernc/sqlite 编译很吃内存，
-    # 1G 容易 OOM 把容器杀掉）。内存紧张的机器可改回 1G，更新失败时再临时调大。
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-          # cpus 在部分 NAS 的 compose 实现里不生效，可留空；要限制就填 "2.0"
-    # 容器日志限流：NAS 的 docker 日志默认不封顶，长期运行会吃掉系统盘
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-    ulimits:
-      nofile:
-        soft: 65536
-        hard: 65536
     healthcheck:
-      # 用轻量探活（只 SELECT 1），不要用 /api/system（会扫全表 COUNT）
-      # ⚠️ 这里写的是**容器内**端口（固定 5200，与 VDL_PORT 无关）：改了 config.yml
-      #    的 server.addr 就会一直 unhealthy；命令依赖 wget，换非 alpine 的运行基座要同步改。
+      # 轻量探活；端口写死容器内 5200（改 config.yml 的 server.addr 需同步改）
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5200/healthz"]
       interval: 60s
       timeout: 5s
       retries: 3
       start_period: 20s
+    # 日志限流，防止长期运行吃满系统盘
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
