@@ -1,0 +1,1 @@
+function e(e){if(!e||e<=0)return`0 B`;let t=[`B`,`KB`,`MB`,`GB`,`TB`],n=0,r=e;for(;r>=1024&&n<t.length-1;)r/=1024,n++;return`${r.toFixed(r>=100||n===0?0:1)} ${t[n]}`}function t(t){return e((t||0)*1024*1024)}export{t as n,e as t};
