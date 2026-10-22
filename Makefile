@@ -12,7 +12,7 @@ LDFLAGS := -s -w \
 # 常用构建目标。
 # ffmpeg 不再随二进制内嵌：运行时优先用系统已装的，缺失时由「信息」页按需下载到 videodata/bin/。
 # 所以没有 nofmpeg 之类的构建开关了，产物大小与平台无关（约 12MB）。
-.PHONY: all tidy web build windows linux linux-arm nas docker docker-multi run run-lowmem clean
+.PHONY: all tidy web hooks build windows linux linux-arm nas docker docker-multi run run-lowmem clean
 
 all: build
 
@@ -23,6 +23,13 @@ tidy:
 # 产物随仓库提交，所以普通 go build 不需要 Node（想改前端时才需要跑这个）
 web:
 	cd web && npm install --registry=https://registry.npmmirror.com && npm run build
+
+# 启用仓库内的 git hooks：提交时若 web/ 有改动，pre-commit 会自动 vite build
+# 并把产物加进本次提交，不用再手动 make web。新 clone 的仓库跑一次即可。
+hooks:
+	-chmod +x .githooks/pre-commit
+	git config core.hooksPath .githooks
+	@echo "已启用 .githooks（pre-commit 自动构建前端）。关闭：git config --unset core.hooksPath"
 
 # 本机平台构建
 build:

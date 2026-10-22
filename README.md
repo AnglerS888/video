@@ -44,7 +44,10 @@ curl -fsSL https://gitee.com/anglers/video/raw/master/deploy.sh | bash
 | 播放器 | DPlayer + hls.js（按需懒加载） |
 | 打包 | 前端产物通过 `go:embed` 打进可执行文件；ffmpeg 不再内嵌，按需下载（见下） |
 
-前端构建产物已随仓库提交，`go build` 不需要 Node 环境。只有修改前端时才需要 `make web`。
+前端构建产物已随仓库提交，`go build` 不需要 Node 环境。修改前端后**不用**手动 `make web`：
+新克隆的仓库执行一次 `git config core.hooksPath .githooks`（有 make 时也可 `make hooks`），
+之后 `git commit` 时只要有 `web/` 改动，pre-commit 会自动 `vite build` 并把
+`internal/web/static` 一起提交；临时跳过用 `VDL_SKIP_WEB=1 git commit ...` 或 `git commit --no-verify`。
 
 ## 快速开始
 
