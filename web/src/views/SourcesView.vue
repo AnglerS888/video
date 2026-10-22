@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import { confirmDialog } from '../confirm'
 import { toast } from '../toast'
-import type { Source, SourceProgress, SourceTest, SyncLog } from '../types'
+import type { Source, SourceProgress, SourceTest, SyncLog, SyncLogItem } from '../types'
 
 /**
  * 来源管理：添加（只填域名）+ 列表（数据量 / 连通性 / 采集进度）。
@@ -17,6 +17,10 @@ const testing = reactive<Record<number, boolean>>({})
 const logs = reactive<Record<number, SyncLog[] | undefined>>({})
 const logsOpen = reactive<Record<number, boolean>>({})
 const logsLoading = reactive<Record<number, boolean>>({})
+// 单条记录的影片明细：默认不加载，点开某条记录时按需拉取（最多 500 条）
+const logItems = reactive<Record<number, SyncLogItem[] | undefined>>({})
+const logItemsOpen = reactive<Record<number, boolean>>({})
+const logItemsLoading = reactive<Record<number, boolean>>({})
 // 上一次轮询时正在采集的来源：用来在增量刚跑完时自动刷新已展开的记录面板
 const wasRunning = new Set<number>()
 const editing = reactive<Record<number, { name: string; url: string }>>({})
@@ -93,6 +97,12 @@ function logDur(ms?: number): string {
   return Math.floor(n / 60000) + 'm' + Math.round((n % 60000) / 1000) + 's'
 }
 
+// 源站更新时间（vod_time）是源站本地时间，不能当 UTC 转换，只截断展示
+function srcTime(v?: string): string {
+  if (!v) return ''
+  return v.replace('T', ' ').slice(5, 16)
+}
+
 async function loadLogs(id: number) {
   logsLoading[id] = true
   const r = await api.syncLogs(id, 20)
@@ -107,6 +117,24 @@ async function loadLogs(id: number) {
 async function toggleLogs(s: Source) {
   logsOpen[s.id] = !logsOpen[s.id]
   if (logsOpen[s.id]) await loadLogs(s.id)
+}
+
+// 展开/收起某条记录的影片明细（首次展开才请求）
+async function toggleLogItems(s: Source, g: SyncLog) {
+  if (logItemsOpen[g.id]) {
+    logItemsOpen[g.id] = false
+    return
+  }
+  logItemsOpen[g.id] = true
+  if (logItems[g.id]) return
+  logItemsLoading[g.id] = true
+  const r = await api.syncLogItems(s.id, g.id)
+  logItemsLoading[g.id] = false
+  if (!r.ok) {
+    toast(r.msg || '影片明细读取失败', 'err', 2400)
+    return
+  }
+  logItems[g.id] = r.data || []
 }
 
 async function load() {
@@ -620,20 +648,54 @@ onBeforeUnmount(() => {
           <p v-else-if="!logs[s.id]?.length" class="mt-1.5 text-slate-400">
             还没有同步记录：点「增量采集」或等定时任务跑一次（全量采集不记录）。
           </p>
-          <ul v-else class="mt-1.5 space-y-1">
+          <ul v-else class="mt-1.5 space-y-1.5">
             <li
               v-for="g in logs[s.id]" :key="g.id"
-              class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 border-t border-slate-100 pt-1 first:border-0 first:pt-0 dark:border-white/5"
+              class="border-t border-slate-100 pt-1.5 first:border-0 first:pt-0 dark:border-white/5"
             >
-              <span class="tabular-nums text-slate-400">{{ logTime(g.started_at) }}</span>
-              <span class="chip">{{ g.trigger === 'auto' ? '定时' : '手动' }}</span>
-              <span class="font-medium" :class="logStatusClass(g.status)">{{ logStatusText[g.status] || g.status }}</span>
-              <span class="text-slate-500 dark:text-slate-400">
-                抓取 {{ num(g.fetched) }} · 新增 {{ num(g.added) }} · 更新 {{ num(g.updated) }} · 耗时 {{ logDur(g.duration_ms) }}
-              </span>
-              <span v-if="g.error" class="w-full break-all text-rose-500">{{ g.error }}</span>
+              <div class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+                <span class="tabular-nums text-slate-400">{{ logTime(g.started_at) }}</span>
+                <span class="chip">{{ g.trigger === 'auto' ? '自动增量' : '手动增量' }}</span>
+                <span class="font-medium" :class="logStatusClass(g.status)">{{ logStatusText[g.status] || g.status }}</span>
+                <span class="text-slate-500 dark:text-slate-400">
+                  抓取 {{ num(g.fetched) }} · 新增 {{ num(g.added) }} · 更新 {{ num(g.updated) }} · 耗时 {{ logDur(g.duration_ms) }}
+                </span>
+                <button
+                  v-if="g.items_count > 0"
+                  class="ml-auto text-[11px] text-sky-600 hover:underline dark:text-sky-400"
+                  @click="toggleLogItems(s, g)"
+                >{{ logItemsOpen[g.id] ? '收起影片' : `影片 ${num(g.items_count)} 部` }}</button>
+              </div>
+              <p v-if="g.error" class="break-all text-rose-500">{{ g.error }}</p>
+              <!-- 本次新增/更新的影片明细（点开才加载） -->
+              <div v-if="logItemsOpen[g.id]" class="mt-1 rounded-lg bg-white px-2 py-1 dark:bg-black/20">
+                <p v-if="logItemsLoading[g.id]" class="text-slate-400">加载中…</p>
+                <template v-else>
+                  <div
+                    v-for="it in logItems[g.id] || []" :key="it.action + '-' + it.vod_id"
+                    class="flex flex-wrap items-baseline gap-x-1.5 border-b border-slate-100 py-0.5 last:border-0 dark:border-white/5"
+                  >
+                    <span
+                      class="rounded px-1 text-[10px]"
+                      :class="it.action === 'new'
+                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                        : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'"
+                    >{{ it.action === 'new' ? '新增' : '更新' }}</span>
+                    <span class="min-w-0 truncate font-medium">{{ it.name }}</span>
+                    <span v-if="it.remarks" class="truncate text-slate-400">{{ it.remarks }}</span>
+                    <span v-if="it.src_time" class="ml-auto shrink-0 tabular-nums text-slate-400">源站更新 {{ srcTime(it.src_time) }}</span>
+                  </div>
+                  <p v-if="logItems[g.id]?.length === 0" class="text-slate-400">本次没有新增或更新的影片</p>
+                  <p v-if="g.added + g.updated > (logItems[g.id] || []).length" class="pt-0.5 text-slate-400">
+                    仅显示前 {{ (logItems[g.id] || []).length }} 部，本次共 {{ num(g.added + g.updated) }} 部
+                  </p>
+                </template>
+              </div>
             </li>
           </ul>
+          <p v-if="logs[s.id]?.length" class="mt-1 text-[11px] text-slate-400">
+            点记录里的「影片 N 部」可看本次新增/更新的影片与源站更新时间。
+          </p>
         </div>
       </div>
     </section>

@@ -315,7 +315,8 @@ CREATE TABLE IF NOT EXISTS vod_sync_log (
 	updated      INTEGER NOT NULL DEFAULT 0,     -- 有变化的影片数
 	details      INTEGER NOT NULL DEFAULT 0,     -- 补详情请求的批次数
 	status       TEXT NOT NULL DEFAULT 'done',   -- running/done/warning/failed/stopped
-	error        TEXT NOT NULL DEFAULT ''
+	error        TEXT NOT NULL DEFAULT '',
+	items        TEXT NOT NULL DEFAULT '[]'      -- 本次新增/更新的影片明细 JSON（最多 500 条）
 );
 CREATE INDEX IF NOT EXISTS idx_sync_log_src ON vod_sync_log(source_id, id DESC);
 `
@@ -485,6 +486,8 @@ func migrate(d *sql.DB) {
 	ensureColumn(d, "vod_download", "priority", "INTEGER NOT NULL DEFAULT 0")
 	// 分享页失效时间（UTC "YYYY-MM-DD HH:mm:ss"，空=永久）：过期后 /s/{id} 提示已过期
 	ensureColumn(d, "vod_download", "share_expires_at", "TEXT NOT NULL DEFAULT ''")
+	// 增量同步记录：本次新增/更新的影片明细（JSON 数组，旧库补列；默认空数组）
+	ensureColumn(d, "vod_sync_log", "items", "TEXT NOT NULL DEFAULT '[]'")
 	migrateDetailContent(d)
 	migrateDownloadEpIndex(d)
 	// 兜底：整表重建（migrateDownloadEpIndex）之后再确认这两列还在。

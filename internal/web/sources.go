@@ -597,7 +597,7 @@ func (s *Server) syncLogs(w http.ResponseWriter, r *http.Request) {
 		limit = 100
 	}
 	rows, err := s.DB.Query(`SELECT id, source_id, trigger_type, started_at, finished_at,
-		duration_ms, fetched, added, updated, details, status, error
+		duration_ms, fetched, added, updated, details, status, error, items
 		FROM vod_sync_log WHERE source_id=? ORDER BY id DESC LIMIT ?`, id, limit)
 	if err != nil {
 		fail(w, publicErr(err))
@@ -607,19 +607,49 @@ func (s *Server) syncLogs(w http.ResponseWriter, r *http.Request) {
 	out := []map[string]any{}
 	for rows.Next() {
 		var lid, sid, dur, fetched, added, updated, details int64
-		var trigger, started, finished, status, msg string
+		var trigger, started, finished, status, msg, itemsRaw string
 		if rows.Scan(&lid, &sid, &trigger, &started, &finished, &dur,
-			&fetched, &added, &updated, &details, &status, &msg) != nil {
+			&fetched, &added, &updated, &details, &status, &msg, &itemsRaw) != nil {
 			continue
+		}
+		// 列表只给明细条数，具体影片按需走 syncLogDetail 加载（避免 20 条 × 500 部一次传太大）
+		itemCount := 0
+		if itemsRaw != "" {
+			var list []collector.SyncItem
+			if json.Unmarshal([]byte(itemsRaw), &list) == nil {
+				itemCount = len(list)
+			}
 		}
 		out = append(out, map[string]any{
 			"id": lid, "source_id": sid, "trigger": trigger,
 			"started_at": started, "finished_at": finished, "duration_ms": dur,
 			"fetched": fetched, "added": added, "updated": updated, "details": details,
-			"status": status, "error": msg,
+			"status": status, "error": msg, "items_count": itemCount,
 		})
 	}
 	ok(w, out)
+}
+
+// syncLogDetail 单条同步记录的影片明细（哪部片新增/更新、源站更新时间）。
+// 点开某条记录时按需加载：列表接口只回条数，避免一次传几十万条 JSON。
+func (s *Server) syncLogDetail(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	logID, _ := strconv.ParseInt(r.PathValue("logID"), 10, 64)
+	if id <= 0 || logID <= 0 {
+		fail(w, "参数错误")
+		return
+	}
+	var raw string
+	if err := s.DB.QueryRow(`SELECT COALESCE(items,'') FROM vod_sync_log WHERE id=? AND source_id=?`,
+		logID, id).Scan(&raw); err != nil {
+		fail(w, "同步记录不存在")
+		return
+	}
+	list := []collector.SyncItem{}
+	if raw != "" && json.Unmarshal([]byte(raw), &list) != nil {
+		list = []collector.SyncItem{}
+	}
+	ok(w, list)
 }
 
 // sourceExportItem 导出/导入的接口条目（与 sourceInput 分开：导入要带 auto_incr）

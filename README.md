@@ -202,7 +202,7 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct -t videodl:late
 | 在线播放 | `/online/:vid` | 直接播源站 m3u8，不占磁盘；可换线路 |
 | 分享页 | `/s/:token` | 发给别人的独立页面（无站点导航），可播放/下载，同剧其它集可直接切换；令牌永久有效（删除下载记录时失效；旧数字 id 链接仅本机可打开） |
 | 收藏 | `/favorites` | 按剧名收藏，提示源站是否有更新 |
-| 来源 | `/sources` | 接口增删改、连通性测试、全量/增量/停止、自动增量开关、增量同步记录 |
+| 来源 | `/sources` | 接口增删改、连通性测试、全量/增量/停止、自动增量开关、增量同步记录（含影片明细） |
 | 接口文档 | `/api-docs` | 站点自身 HTTP 接口一览（方法、路径、参数），可复制 curl |
 | 网站信息 | `/info` | 版本与在线更新、运行环境、数据占用、磁盘、内存、数据库空闲页、ffmpeg 安装、封面缓存检查 |
 
@@ -226,8 +226,9 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct -t videodl:late
 - **只入库 m3u8**：源站常把网页分享页（`/share/<hash>`，返回 HTML）塞进播放列表，这类地址会被丢弃
 - **播放地址去重**：同一部片同一条线路里，重复出现的地址只保留第一条（源站有时把相邻两集给同一个 m3u8）
 - **两个开关别混**：接口「启用」= 是否参与任何采集；「自动增量」= 只控每小时定时任务，关掉后仍可手动增量/全量
-- **增量留痕**：每次增量采集（手动或定时）给每个来源写一条同步记录（时间、触发方式、抓取/新增/更新数、
-  耗时、状态与错误），来源卡片点「同步记录」即可回看；每个来源只保留最近 100 条，全量采集不记录
+- **增量留痕**：每次增量采集（手动或定时）给每个来源写一条同步记录（手动增量/自动增量、时间、
+  抓取/新增/更新数、耗时、状态与错误），并记下本次新增/更新的影片（片名、备注、源站更新时间）；
+  来源卡片点「同步记录」→「影片 N 部」即可回看；每个来源只保留最近 100 条，全量采集不记录
 
 ### 在线播放原理
 
@@ -664,7 +665,8 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 | PUT | `/api/sources/{id}` | 修改接口 |
 | DELETE | `/api/sources/{id}` | 删除接口，**连带清空该源所有影片、播放地址、下载文件与封面** |
 | GET | `/api/sources/{id}/test` | 测试连通性与分页 |
-| GET | `/api/sources/{id}/sync-logs` | 增量同步记录（`?limit=20`，最多 100 条，新的在前） |
+| GET | `/api/sources/{id}/sync-logs` | 增量同步记录（`?limit=20`，最多 100 条，新的在前；含 `items_count`） |
+| GET | `/api/sources/{id}/sync-logs/{logID}` | 单条同步记录的影片明细（新增/更新、片名、备注、源站更新时间） |
 | POST | `/api/sources/probe` | 添加前预检（填域名，自动试 4 种地址，不写库）`{"url":"…"}` |
 | POST | `/api/sources/{id}/auto-incr` | 开关「自动增量」`{"on":0\|1}` |
 | GET | `/api/sources/export` | 导出全部接口为 JSON（换机/重装备份） |

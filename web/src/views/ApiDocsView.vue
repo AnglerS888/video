@@ -104,10 +104,17 @@ const groups: ApiGroup[] = [
         params: [{ in: 'path', name: 'id', desc: '来源 id', required: true }],
       },
       {
-        m: 'GET', p: '/api/sources/{id}/sync-logs', d: '增量同步记录（每次手动/定时增量一条汇总，新的在前）',
+        m: 'GET', p: '/api/sources/{id}/sync-logs', d: '增量同步记录（每次手动/自动增量一条汇总，新的在前；含影片明细数）',
         params: [
           { in: 'path', name: 'id', desc: '来源 id', required: true },
           { in: 'query', name: 'limit', desc: '返回条数（默认 20，最多 100）', def: '20', example: '20' },
+        ],
+      },
+      {
+        m: 'GET', p: '/api/sources/{id}/sync-logs/{logID}', d: '单条同步记录的影片明细（新增/更新了哪几部、源站更新时间）',
+        params: [
+          { in: 'path', name: 'id', desc: '来源 id', required: true },
+          { in: 'path', name: 'logID', desc: '同步记录 id', required: true },
         ],
       },
       {

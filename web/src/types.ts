@@ -62,6 +62,18 @@ export interface Progress {
   sources: SourceProgress[]
 }
 
+/** 同步记录里的一部影片明细 */
+export interface SyncLogItem {
+  vod_id: number
+  name: string
+  /** new=新增 / update=更新 */
+  action: string
+  /** 源站备注（如「更新至12集」） */
+  remarks: string
+  /** 源站更新时间（vod_time，源站时区，不做时区换算） */
+  src_time: string
+}
+
 /** 一次增量同步的汇总记录（GET /api/sources/{id}/sync-logs，新的在前） */
 export interface SyncLog {
   id: number
@@ -81,6 +93,8 @@ export interface SyncLog {
   /** running/done/warning/failed/stopped */
   status: string
   error: string
+  /** 本次新增/更新的影片明细条数（明细最多保存 500 条） */
+  items_count: number
 }
 
 export interface VideoItem {
@@ -213,12 +227,14 @@ export interface ShareInfo {
   file_url: string
 }
 
-/** 分享页 /s/{id} 的数据 */
+/** 分享页 /s/{token} 的数据（旧版 /s/{数字id} 仅本机可看） */
 export interface SharePage {
   id: number
   vod_id: number
   name: string
   episode: string
+  /** 当前集的集号（-1=整条） */
+  ep_index: number
   source_name: string
   vod_pic: string
   play_from: string
@@ -226,7 +242,7 @@ export interface SharePage {
   play_url: string
   file_url: string
   /** 同剧其它已下载的集（按集号升序，多源同集已去重） */
-  episodes: { id: number; ep_index: number }[]
+  episodes: { ep_index: number }[]
 }
 
 export interface WatchHistoryItem {

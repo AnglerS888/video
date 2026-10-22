@@ -1,6 +1,6 @@
 import type {
   ApiResp, CoverFixStatus, Downloads, FavItem, FfmpegStatus, Filters, Progress, ShareInfo, SharePage, Source, SourceTest,
-  ConfigData, ConfigInfo, SyncLog, SysInfo, UpdateInfo, UpdateStatus, VersionResp, VideoDetail, VideoList, WatchHistoryItem,
+  ConfigData, ConfigInfo, SyncLog, SyncLogItem, SysInfo, UpdateInfo, UpdateStatus, VersionResp, VideoDetail, VideoList, WatchHistoryItem,
 } from './types'
 
 async function req<T>(path: string, init?: RequestInit): Promise<ApiResp<T>> {
@@ -97,9 +97,10 @@ export const api = {
   playToken() {
     return req<{ token: string; expires_at: number }>('/api/play-token')
   },
-  /** 分享页数据：打开 /s/{id} 时读取 */
-  shareInfo(id: number | string) {
-    return req<SharePage>(`/api/share/${id}`)
+  /** 分享页数据：打开 /s/{token} 时读取；ep=同剧其他集的集号 */
+  shareInfo(id: number | string, ep?: number) {
+    const q = typeof ep === 'number' && Number.isFinite(ep) ? `?ep=${ep}` : ''
+    return req<SharePage>(`/api/share/${id}${q}`)
   },
   saveProgress(download_id: number, position: number, duration: number) {
     return req<{ finished: number }>('/api/watch/progress', json({ download_id, position, duration }))
@@ -142,6 +143,10 @@ export const api = {
   /** 增量同步记录：每次手动/定时增量一条汇总（新的在前） */
   syncLogs(id: number, limit = 20) {
     return req<SyncLog[]>(`/api/sources/${id}/sync-logs?limit=${limit}`)
+  },
+  /** 单条同步记录的影片明细（展开某条记录时按需加载） */
+  syncLogItems(id: number, logId: number) {
+    return req<SyncLogItem[]>(`/api/sources/${id}/sync-logs/${logId}`)
   },
   /** 添加前预检：填域名即可，后端会依次尝试 .php / 无 .php / at=xml 等写法 */
   probeSource(url: string) {

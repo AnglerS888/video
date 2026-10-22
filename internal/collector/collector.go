@@ -427,6 +427,20 @@ type dbtx interface {
 	QueryRow(query string, args ...any) *sql.Row
 }
 
+// SyncItem 一条增量同步记录里的影片明细：哪部片、新增还是更新、源站更新时间。
+type SyncItem struct {
+	VodID   int64  `json:"vod_id"`
+	Name    string `json:"name"`
+	Action  string `json:"action"`   // new=新增 / update=更新
+	Remarks string `json:"remarks"`  // 源站备注（如「更新至12集」）
+	SrcTime string `json:"src_time"` // 源站更新时间 vod_time
+}
+
+// maxSyncItems 单条同步记录最多保存的影片明细数。
+// 首次增量可能一次新增几千部（每接口保留 100 条记录），全存会撑大库，
+// 只留前 500 条，页面上提示「仅显示前 500 部」。
+const maxSyncItems = 500
+
 type Collector struct {
 	DB   *sql.DB
 	HTTP *http.Client
@@ -442,6 +456,11 @@ type Collector struct {
 	// 分页采集是多线程的，所以带锁。
 	dictMu  sync.Mutex
 	hostIDs map[string]int64
+
+	// 增量同步明细：按接口 id 收集本次新增/更新的影片，收尾时写入 vod_sync_log.items。
+	// 全量采集不初始化，appendSyncItem 会直接跳过。
+	syncMu    sync.Mutex
+	syncItems map[int64][]SyncItem
 }
 
 func New(db *sql.DB) *Collector {
@@ -1090,6 +1109,9 @@ func (c *Collector) startJobs(sources []Source, mode string, limitPages int, res
 			logID := int64(0)
 			if mode == "incr" {
 				logID = c.startSyncLog(src, trigger, startedAt)
+				if logID > 0 {
+					c.beginSyncItems(src.ID)
+				}
 			}
 			defer func() {
 				if r := recover(); r != nil {
@@ -1101,7 +1123,7 @@ func (c *Collector) startJobs(sources []Source, mode string, limitPages int, res
 				if logID > 0 {
 					// 必须在 end 之前取最终统计：end 只改 Running/Finished，不影响计数
 					sp, _ := GlobalProgress.get(src.ID)
-					c.finishSyncLog(logID, src.ID, sp, startedAt)
+					c.finishSyncLog(logID, src.ID, sp, startedAt, c.takeSyncItems(src.ID))
 				}
 				GlobalProgress.end(src.ID)
 			}()
@@ -1113,6 +1135,37 @@ func (c *Collector) startJobs(sources []Source, mode string, limitPages int, res
 		}(src)
 	}
 	return started, skipped
+}
+
+// beginSyncItems 开始收集某接口本次增量的影片明细（全量采集不调用）。
+func (c *Collector) beginSyncItems(sourceID int64) {
+	c.syncMu.Lock()
+	if c.syncItems == nil {
+		c.syncItems = map[int64][]SyncItem{}
+	}
+	c.syncItems[sourceID] = nil
+	c.syncMu.Unlock()
+}
+
+// appendSyncItem 记一条本次新增/更新的影片；不在收集状态（全量采集）时忽略。
+// 超过 maxSyncItems 后不再追加，前端按 added+updated 与明细长度对比提示截断。
+func (c *Collector) appendSyncItem(sourceID int64, it SyncItem) {
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+	list, collecting := c.syncItems[sourceID]
+	if !collecting || len(list) >= maxSyncItems {
+		return
+	}
+	c.syncItems[sourceID] = append(list, it)
+}
+
+// takeSyncItems 取走某接口的明细并结束收集（收尾时调用，避免残留）。
+func (c *Collector) takeSyncItems(sourceID int64) []SyncItem {
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+	list := c.syncItems[sourceID]
+	delete(c.syncItems, sourceID)
+	return list
 }
 
 // startSyncLog 开一条增量同步记录，返回记录 id（写库失败返回 0，不影响采集）。
@@ -1130,19 +1183,23 @@ func (c *Collector) startSyncLog(src Source, trigger string, started time.Time) 
 	return id
 }
 
-// finishSyncLog 收尾一条同步记录（统计/状态/耗时），并只保留每个来源最近 100 条。
+// finishSyncLog 收尾一条同步记录（统计/状态/耗时/影片明细），并只保留每个来源最近 100 条。
 // 同步记录属于“有就用、没有也不影响采集”的附属数据，任何失败只记日志。
-func (c *Collector) finishSyncLog(logID, sourceID int64, sp SourceProgress, started time.Time) {
+func (c *Collector) finishSyncLog(logID, sourceID int64, sp SourceProgress, started time.Time, items []SyncItem) {
 	status := sp.Phase
 	switch status {
 	case "done", "warning", "failed", "stopped":
 	default:
 		status = "done"
 	}
+	raw, jerr := json.Marshal(items)
+	if jerr != nil || string(raw) == "null" {
+		raw = []byte("[]")
+	}
 	if _, err := c.DB.Exec(`UPDATE vod_sync_log SET finished_at=?, duration_ms=?, fetched=?, added=?,
-		updated=?, details=?, status=?, error=? WHERE id=?`,
+		updated=?, details=?, status=?, error=?, items=? WHERE id=?`,
 		time.Now().UTC().Format(timeLayout), time.Since(started).Milliseconds(),
-		sp.Fetched, sp.Added, sp.Updated, sp.Details, status, sp.Error, logID); err != nil {
+		sp.Fetched, sp.Added, sp.Updated, sp.Details, status, sp.Error, string(raw), logID); err != nil {
 		logx.Warnf("[sync-log] 更新同步记录 #%d 失败: %v", logID, err)
 		return
 	}
@@ -1205,6 +1262,17 @@ func (c *Collector) savePage(ctx context.Context, src *Source, items []VodItem) 
 			added++
 		} else if changed {
 			updated++
+		}
+		if isNew || changed {
+			// 记录本次新增/更新的影片（仅增量采集在收集；全量采集直接忽略）
+			action := "update"
+			if isNew {
+				action = "new"
+			}
+			c.appendSyncItem(src.ID, SyncItem{
+				VodID: int64(items[i].VodID), Name: items[i].VodName,
+				Action: action, Remarks: items[i].VodRemarks, SrcTime: items[i].SrcTime,
+			})
 		}
 		if !isNew && !changed {
 			continue // 源站更新时间未变，跳过（不重复入库）

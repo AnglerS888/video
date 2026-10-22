@@ -17,7 +17,12 @@ import type { SharePage } from '../types'
 const route = useRoute()
 const router = useRouter()
 
-const id = computed(() => Number(route.params.id) || 0)
+/** 分享令牌是 32 位十六进制串，绝不能当数字解析（旧实现 Number(token)=NaN→0，页面永远提示失效） */
+const token = computed(() => String(route.params.id || ''))
+const epParam = computed(() => {
+  const v = Number(route.query.ep)
+  return Number.isFinite(v) ? v : NaN
+})
 const info = ref<SharePage | null>(null)
 const loading = ref(true)
 const errMsg = ref('')
@@ -31,8 +36,14 @@ function epLabel(i: number): string {
 }
 
 async function load() {
+  if (!token.value) {
+    loading.value = false
+    errMsg.value = '分享链接无效'
+    return
+  }
   loading.value = true
-  const r = await api.shareInfo(id.value)
+  const ep = Number.isFinite(epParam.value) ? epParam.value : undefined
+  const r = await api.shareInfo(token.value, ep)
   loading.value = false
   if (!r.ok || !r.data) {
     errMsg.value = r.msg || '分享的内容不存在'
@@ -45,15 +56,16 @@ async function load() {
   playing.value = r.data.episodes.length <= 1
 }
 
-function goEp(eid: number) {
-  if (eid === id.value) return
+// 切集用 ?ep=N（分享令牌对应一部剧，后端按集号换到那一条下载记录）
+function goEp(e: { ep_index: number }) {
+  if (!info.value || e.ep_index === info.value.ep_index) return
   playing.value = false
-  router.replace(`/s/${eid}`)
+  router.replace({ path: `/s/${token.value}`, query: { ep: e.ep_index } })
 }
 
 onMounted(load)
-watch(id, () => {
-  if (id.value > 0) load()
+watch([token, epParam], () => {
+  if (token.value) load()
 })
 </script>
 
@@ -100,11 +112,11 @@ watch(id, () => {
         </div>
 
         <div class="flex flex-wrap items-center gap-2 border-t border-slate-100 px-3 py-2.5 dark:border-white/5">
-          <button class="btn btn-primary btn-sm" @click="playing = true">
+          <button v-if="info.play_url" class="btn btn-primary btn-sm" @click="playing = true">
             <svg viewBox="0 0 24 24" class="h-4 w-4" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
             播放
           </button>
-          <a class="btn btn-ghost btn-sm" :href="info.file_url">
+          <a v-if="info.file_url" class="btn btn-ghost btn-sm" :href="info.file_url">
             <svg viewBox="0 0 24 24" class="h-4 w-4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
               <path d="M12 4v10m0 0 3.5-3.5M12 14l-3.5-3.5M5 18h14" />
             </svg>
@@ -115,7 +127,7 @@ watch(id, () => {
       </section>
 
       <!-- 播放器：点击播放后才创建，避免手机上自动播放被拦 -->
-      <section v-if="playing" class="card overflow-hidden">
+      <section v-if="playing && info.play_url" class="card overflow-hidden">
         <VideoPlayer :url="info.play_url" :poster="poster" />
       </section>
 
@@ -127,12 +139,12 @@ watch(id, () => {
         </div>
         <div class="grid grid-cols-3 gap-2 sm:grid-cols-5 md:grid-cols-8">
           <button
-            v-for="e in info.episodes" :key="e.id"
+            v-for="e in info.episodes" :key="e.ep_index"
             class="truncate rounded-lg border px-2 py-1.5 text-xs transition tap"
-            :class="e.id === info.id
+            :class="e.ep_index === info.ep_index
               ? 'border-amber-400 bg-amber-500/15 font-medium text-amber-700 dark:text-amber-300'
               : 'border-slate-200 hover:border-slate-300 dark:border-white/10 dark:hover:border-white/25'"
-            @click="goEp(e.id)"
+            @click="goEp(e)"
           >
             {{ epLabel(e.ep_index) }}
           </button>
