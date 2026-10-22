@@ -3,7 +3,6 @@ package web
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"net"
 	"net/http"
 	neturl "net/url"
@@ -11,7 +10,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	"videoDownLoad/internal/collector"
 	db "videoDownLoad/internal/db"
@@ -172,7 +170,7 @@ func (s *Server) batchDownload(w http.ResponseWriter, r *http.Request) {
 //   - 数字 id：本地播放，必须带播放令牌（?t=...）或管理口令。
 //     没有令牌就放行的话，id 是自增整数 → /play/1、/play/2 能被直接枚举，
 //     同一局域网的任何人��能把整个下载库拖走。
-//   - 分享令牌：分享链接专用，按令牌的有效期判定，过期即拒。
+//   - 分享令牌：分享链接专用，长期有效（删除下载记录时一并失效）。
 func (s *Server) playVideo(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("id")
 	var id int64
@@ -184,9 +182,9 @@ func (s *Server) playVideo(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		// 分享令牌
-		did, _, valid := db.ShareTokenLookup(s.DB, key)
+		did, valid := db.ShareTokenLookup(s.DB, key)
 		if !valid {
-			http.Error(w, "分享链接无效或已过期", http.StatusForbidden)
+			http.Error(w, "分享链接无效", http.StatusForbidden)
 			return
 		}
 		id = did
@@ -219,8 +217,9 @@ func (s *Server) playVideo(w http.ResponseWriter, r *http.Request) {
 //
 // 分享链接用**随机令牌**而不是下载 id：
 //   - id 是自增整数，/play/{id} 能被直接枚举（整个下载库都能拖走）；
-//   - 有效期要真正生效，就必须有独立的凭据 —— 现在令牌自带 expires_at，
-//     过期后分享页与文件访问都会被拒（旧实现只校验分享页，文件地址永久有效）。
+//   - 令牌是独立的随机凭据，删除下载记录时一并失效。
+//
+// 分享链接永久有效，不再提供有效期选项。
 //
 // 对外给的是「分享页」地址 /s/{token}。play_url / file_url 也随接口返回，
 // 但前端分享弹窗不展示——直接把视频文件地址发给别人既不好看，
@@ -238,39 +237,10 @@ func (s *Server) shareDownload(w http.ResponseWriter, r *http.Request) {
 		fail(w, "这一集还没下载完成，无法分享")
 		return
 	}
-	// 有效期：?hours=24 / 168（7 天）/ 0（永久）。
-	// 解析失败必须报错 —— 旧实现忽略错误，hours 变成 0 → 静默变成永久有效。
-	hours := 0.0
-	if raw := strings.TrimSpace(r.URL.Query().Get("hours")); raw != "" {
-		h, perr := strconv.ParseFloat(raw, 64)
-		if perr != nil || math.IsNaN(h) || math.IsInf(h, 0) {
-			fail(w, "有效期参数不合法")
-			return
-		}
-		hours = h
-	}
-	var expireAt time.Time
-	expires := ""
-	if hours > 0 {
-		if hours > 24*365 { // 上限一年，防止手滑填出 100 年
-			hours = 24 * 365
-		}
-		expireAt = time.Now().UTC().Add(time.Duration(hours * float64(time.Hour)))
-		expires = expireAt.Format("2006-01-02 15:04:05")
-	} else {
-		// 永久：用一个很远的失效时间表示（表结构里空=永久，这里统一存远期时间）
-		expireAt = time.Now().UTC().Add(100 * 365 * 24 * time.Hour)
-		expires = ""
-	}
-	// 令牌入库
-	token, terr := db.NewShareToken(s.DB, id, expireAt)
+	// 令牌入库（永久有效）
+	token, terr := db.NewShareToken(s.DB, id)
 	if terr != nil {
 		fail(w, "生成分享链接失败: "+publicErr(terr))
-		return
-	}
-	// 同步记录到下载行（信息页展示用）；写失败要报错，不能"提示成功但没写进去"
-	if _, err := s.DB.Exec(`UPDATE vod_download SET share_expires_at=? WHERE id=?`, expires, id); err != nil {
-		fail(w, "保存分享有效期失败: "+publicErr(err))
 		return
 	}
 	base := publicBaseURL(r)
@@ -281,10 +251,9 @@ func (s *Server) shareDownload(w http.ResponseWriter, r *http.Request) {
 	ok(w, map[string]any{
 		"id": id, "name": name, "episode": ep, "token": token,
 		// 分享给别人用这个：打开是一个页面，可播放/下载，不会直接拿到视频文件地址
-		"page_url":   base + "/s/" + token,
-		"play_url":   base + "/play/" + token,
-		"file_url":   base + "/play/" + token + "?dl=1",
-		"expires_at": expires, // UTC，空 = 永久有效
+		"page_url": base + "/s/" + token,
+		"play_url": base + "/play/" + token,
+		"file_url": base + "/play/" + token + "?dl=1",
 	})
 }
 
@@ -292,35 +261,25 @@ func (s *Server) shareDownload(w http.ResponseWriter, r *http.Request) {
 // 播放/下载走 /play/{token}（同一个令牌），由页面上的按钮触发。
 //
 // 路径参数既支持新令牌，也兼容旧版数字 id（老的分享链接）：
-//   - 令牌：按令牌有效期判定；
-//   - 数字 id：只有这一行确实分享过（share_expires_at 非空）且未过期才放行，
-//     否则要求播放令牌（= 只有分享者本人能看）。
+//   - 令牌：永久有效，删除下载记录时一并失效；
+//   - 数字 id：没有分享凭据，只允许分享者本人（播放令牌/管理口令）查看。
 func (s *Server) sharePage(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("id")
 	var id int64
-	var shareExpires string
 	if n, err := strconv.ParseInt(key, 10, 64); err == nil {
+		// 旧版数字链接没有分享凭据：只允许分享者本人查看
+		if !validPlayToken(r.URL.Query().Get("t")) && !adminAuthorized(r) {
+			fail(w, "分享链接无效")
+			return
+		}
 		id = n
-		var exp string
-		if err := s.DB.QueryRow(`SELECT COALESCE(share_expires_at,'') FROM vod_download WHERE id=?`, id).Scan(&exp); err != nil {
-			fail(w, "分享的内容不存在（可能已被删除）")
-			return
-		}
-		shareExpires = exp
-		if exp == "" || db.ShareExpired(exp) {
-			// 永久分享的旧链接没有失效时间：只允许分享者本人（带播放令牌）查看
-			if !validPlayToken(r.URL.Query().Get("t")) && !adminAuthorized(r) {
-				fail(w, "分享链接无效或已过期")
-				return
-			}
-		}
 	} else {
-		did, exp, valid := db.ShareTokenLookup(s.DB, key)
+		did, valid := db.ShareTokenLookup(s.DB, key)
 		if !valid {
-			fail(w, "分享链接无效或已过期")
+			fail(w, "分享链接无效")
 			return
 		}
-		id, shareExpires = did, exp
+		id = did
 	}
 	if id <= 0 {
 		fail(w, "分享链接无效")
@@ -391,9 +350,8 @@ func (s *Server) sharePage(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"id": id, "vod_id": vodID, "name": name, "episode": ep,
 		"source_name": src, "vod_pic": pic, "play_from": playFrom,
-		"size_mb":    float64(size) / 1024 / 1024,
-		"episodes":   list,
-		"expires_at": shareExpires, // UTC，空 = 永久有效
+		"size_mb":  float64(size) / 1024 / 1024,
+		"episodes": list,
 	}
 	if playKey != "" {
 		resp["play_url"] = "/play/" + playKey

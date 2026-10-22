@@ -53,7 +53,7 @@ func (s *Server) collectIncr(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 手动增量：不限页数（仍按 24 小时过滤）；定时任务才限制前 5 页
-	started, skipped := s.Col.RunIncremental(srcs, 0)
+	started, skipped := s.Col.RunIncremental(srcs, 0, "manual")
 	if started == 0 {
 		fail(w, "已在采集中："+strings.Join(skipped, "、"))
 		return

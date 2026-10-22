@@ -252,7 +252,7 @@ func main() {
 		if len(srcs) == 0 {
 			return // 所有接口都关了自动增量：不发请求，也不刷日志
 		}
-		started, skipped := col.RunIncremental(srcs, int(incrPages.Load()))
+		started, skipped := col.RunIncremental(srcs, int(incrPages.Load()), "auto")
 		if started > 0 || len(skipped) > 0 {
 			logx.Infof("[scheduler] 定时增量：启动 %d 个接口，跳过 %d 个", started, len(skipped))
 		}

@@ -352,6 +352,17 @@ func (p *Progress) StopAll() int {
 	return n
 }
 
+// get 取单个接口的进度副本（同步记录收尾时用）
+func (p *Progress) get(id int64) (SourceProgress, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sp, ok := p.sources[id]
+	if !ok {
+		return SourceProgress{}, false
+	}
+	return *sp, true
+}
+
 // stopChan 取该接口的停止信号通道（nil 表示该接口不受停止控制）
 func (p *Progress) stopChan(id int64) <-chan struct{} {
 	p.mu.Lock()
@@ -1030,13 +1041,14 @@ const (
 // 每个接口独立起一个 goroutine，因此可以同时启动多个接口的全量采集；
 // 已在采集的接口会被跳过（返回在 skipped 里）。
 func (c *Collector) RunFull(sources []Source, restart bool) (started int, skipped []string) {
-	return c.startJobs(sources, "full", 0, restart)
+	return c.startJobs(sources, "full", 0, restart, "")
 }
 
 // RunIncremental 增量采集：只取各接口当天（24 小时内）有更新的数据；
 // limitPages > 0 时只同步前 N 页（定时任务用，避免每次跑全量）。
-func (c *Collector) RunIncremental(sources []Source, limitPages int) (started int, skipped []string) {
-	return c.startJobs(sources, "incr", limitPages, false)
+// trigger 写入同步记录：manual=手动点「增量采集」，auto=定时任务。
+func (c *Collector) RunIncremental(sources []Source, limitPages int, trigger string) (started int, skipped []string) {
+	return c.startJobs(sources, "incr", limitPages, false, trigger)
 }
 
 // maxConcurrentSources 同时采集的接口数硬上限（保护源站，也避免本地连接打满）
@@ -1055,7 +1067,7 @@ func (c *Collector) sourceLimit() int {
 }
 
 // startJobs 为每个接口起独立采集协程（非阻塞，立即返回）
-func (c *Collector) startJobs(sources []Source, mode string, limitPages int, restart bool) (int, []string) {
+func (c *Collector) startJobs(sources []Source, mode string, limitPages int, restart bool, trigger string) (int, []string) {
 	var skipped []string
 	started := 0
 	limit := c.sourceLimit()
@@ -1074,12 +1086,22 @@ func (c *Collector) startJobs(sources []Source, mode string, limitPages int, res
 			c.DB.Exec(`UPDATE vod_sync_state SET last_page=0, completed=0 WHERE mode='full' AND source_id=?`, src.ID)
 		}
 		go func(src Source) {
+			startedAt := time.Now()
+			logID := int64(0)
+			if mode == "incr" {
+				logID = c.startSyncLog(src, trigger, startedAt)
+			}
 			defer func() {
 				if r := recover(); r != nil {
 					logx.Printf("[collect] %s panic: %v", src.Name, r)
 					GlobalProgress.update(src.ID, func(sp *SourceProgress) {
 						sp.Phase, sp.Error = "failed", fmt.Sprintf("内部错误: %v", r)
 					})
+				}
+				if logID > 0 {
+					// 必须在 end 之前取最终统计：end 只改 Running/Finished，不影响计数
+					sp, _ := GlobalProgress.get(src.ID)
+					c.finishSyncLog(logID, src.ID, sp, startedAt)
 				}
 				GlobalProgress.end(src.ID)
 			}()
@@ -1091,6 +1113,44 @@ func (c *Collector) startJobs(sources []Source, mode string, limitPages int, res
 		}(src)
 	}
 	return started, skipped
+}
+
+// startSyncLog 开一条增量同步记录，返回记录 id（写库失败返回 0，不影响采集）。
+func (c *Collector) startSyncLog(src Source, trigger string, started time.Time) int64 {
+	if trigger != "auto" {
+		trigger = "manual"
+	}
+	res, err := c.DB.Exec(`INSERT INTO vod_sync_log(source_id, source_name, trigger_type, started_at, status)
+		VALUES(?,?,?,?,'running')`, src.ID, src.Name, trigger, started.UTC().Format(timeLayout))
+	if err != nil {
+		logx.Warnf("[sync-log] %s 写入同步记录失败: %v", src.Name, err)
+		return 0
+	}
+	id, _ := res.LastInsertId()
+	return id
+}
+
+// finishSyncLog 收尾一条同步记录（统计/状态/耗时），并只保留每个来源最近 100 条。
+// 同步记录属于“有就用、没有也不影响采集”的附属数据，任何失败只记日志。
+func (c *Collector) finishSyncLog(logID, sourceID int64, sp SourceProgress, started time.Time) {
+	status := sp.Phase
+	switch status {
+	case "done", "warning", "failed", "stopped":
+	default:
+		status = "done"
+	}
+	if _, err := c.DB.Exec(`UPDATE vod_sync_log SET finished_at=?, duration_ms=?, fetched=?, added=?,
+		updated=?, details=?, status=?, error=? WHERE id=?`,
+		time.Now().UTC().Format(timeLayout), time.Since(started).Milliseconds(),
+		sp.Fetched, sp.Added, sp.Updated, sp.Details, status, sp.Error, logID); err != nil {
+		logx.Warnf("[sync-log] 更新同步记录 #%d 失败: %v", logID, err)
+		return
+	}
+	// 只留最近 100 次：每小时一次的定时任务一年就是 8760 条，不清理会无限增长
+	if _, err := c.DB.Exec(`DELETE FROM vod_sync_log WHERE source_id=? AND id NOT IN (
+		SELECT id FROM vod_sync_log WHERE source_id=? ORDER BY id DESC LIMIT 100)`, sourceID, sourceID); err != nil {
+		logx.Debugf("[sync-log] 清理旧同步记录失败: %v", err)
+	}
 }
 
 // pageSignature 用本页所有 vod_id 生成指纹，用于识别"源站忽略 pg 参数"的情况

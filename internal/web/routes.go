@@ -27,6 +27,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/sources/{id}", guard(s.updateSource))
 	mux.HandleFunc("DELETE /api/sources/{id}", guard(s.deleteSource))
 	mux.HandleFunc("GET /api/sources/{id}/test", s.testSource)
+	// 增量同步记录：每次手动/定时增量一条汇总，接口页展开历史用
+	mux.HandleFunc("GET /api/sources/{id}/sync-logs", s.syncLogs)
 	mux.HandleFunc("POST /api/sources/{id}/auto-incr", guard(s.setAutoIncr))
 	// 接口列表导出/导入（JSON）：换机/重装迁移用，导入按 api_url 去重
 	mux.HandleFunc("GET /api/sources/export", s.exportSources)

@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
 import { api } from '../api'
 import { confirmDialog } from '../confirm'
 import { toast } from '../toast'
-import type { Source, SourceProgress, SourceTest } from '../types'
+import type { Source, SourceProgress, SourceTest, SyncLog } from '../types'
 
 /**
  * 来源管理：添加（只填域名）+ 列表（数据量 / 连通性 / 采集进度）。
@@ -13,6 +13,12 @@ const list = ref<Source[]>([])
 const progress = ref<Record<number, SourceProgress>>({})
 const tests = reactive<Record<number, SourceTest | undefined>>({})
 const testing = reactive<Record<number, boolean>>({})
+// 增量同步记录：默认收起，点「同步记录」时按需拉取，避免列表页一次请求所有来源的历史
+const logs = reactive<Record<number, SyncLog[] | undefined>>({})
+const logsOpen = reactive<Record<number, boolean>>({})
+const logsLoading = reactive<Record<number, boolean>>({})
+// 上一次轮询时正在采集的来源：用来在增量刚跑完时自动刷新已展开的记录面板
+const wasRunning = new Set<number>()
 const editing = reactive<Record<number, { name: string; url: string }>>({})
 const draft = reactive({ name: '', url: '' })
 const busy = ref(false)
@@ -58,6 +64,51 @@ function when(v?: string): string {
   return v && v.length >= 16 ? v.slice(5, 16) : '—'
 }
 
+const logStatusText: Record<string, string> = {
+  running: '同步中…', done: '完成', warning: '有警告', failed: '失败', stopped: '已停止',
+}
+
+function logStatusClass(st: string): string {
+  if (st === 'failed') return 'text-rose-500'
+  if (st === 'warning' || st === 'stopped') return 'text-amber-600 dark:text-amber-400'
+  if (st === 'running') return 'text-sky-600 dark:text-sky-400'
+  return 'text-emerald-600 dark:text-emerald-400'
+}
+
+// 后端时间是 UTC，但格式可能是 RFC3339（驱动把 DATETIME 解成 time.Time）或
+// SQLite 原样的 "YYYY-MM-DD HH:mm:ss"，两种都兼容，最后按本地时区展示
+function logTime(v?: string): string {
+  if (!v) return '—'
+  const t = new Date(v.includes('T') ? v : v.replace(' ', 'T') + 'Z')
+  if (Number.isNaN(t.getTime())) return v.slice(5, 16)
+  return t.toLocaleString('zh-CN', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  })
+}
+
+function logDur(ms?: number): string {
+  const n = ms || 0
+  if (n < 1000) return n + 'ms'
+  if (n < 60000) return (n / 1000).toFixed(1) + 's'
+  return Math.floor(n / 60000) + 'm' + Math.round((n % 60000) / 1000) + 's'
+}
+
+async function loadLogs(id: number) {
+  logsLoading[id] = true
+  const r = await api.syncLogs(id, 20)
+  logsLoading[id] = false
+  if (!r.ok) {
+    toast(r.msg || '同步记录读取失败', 'err', 2400)
+    return
+  }
+  logs[id] = r.data || []
+}
+
+async function toggleLogs(s: Source) {
+  logsOpen[s.id] = !logsOpen[s.id]
+  if (logsOpen[s.id]) await loadLogs(s.id)
+}
+
 async function load() {
   const r = await api.sources()
   if (!r.ok || !r.data) return
@@ -71,7 +122,17 @@ async function loadProgress() {
   const r = await api.progress()
   if (!r.ok || !r.data) return
   const m: Record<number, SourceProgress> = {}
-  for (const p of r.data.sources || []) m[p.source_id] = p
+  const nowRunning = new Set<number>()
+  for (const p of r.data.sources || []) {
+    m[p.source_id] = p
+    if (p.running) nowRunning.add(p.source_id)
+    // 这一轮里刚跑完的增量：已展开的记录面板自动刷新，不用手动点「刷新」
+    if (wasRunning.has(p.source_id) && !p.running && p.mode === 'incr' && logsOpen[p.source_id]) {
+      loadLogs(p.source_id)
+    }
+  }
+  wasRunning.clear()
+  for (const id of nowRunning) wasRunning.add(id)
   progress.value = m
 }
 
@@ -165,7 +226,7 @@ async function remove(s: Source) {
   const okc = await confirmDialog({
     title: '删除来源',
     message: `删除来源「${s.name}」？\n\n${detail}删除后会一并清空：\n` +
-      `· 影片记录、播放地址\n· 下载记录与已下载文件\n· 封面缓存\n· 采集断点\n\n该操作不可恢复。`,
+      `· 影片记录、播放地址\n· 下载记录与已下载文件\n· 封面缓存\n· 采集断点与增量同步记录\n\n该操作不可恢复。`,
     okText: '删除',
     danger: true,
   })
@@ -456,6 +517,12 @@ onBeforeUnmount(() => {
             自动增量
           </button>
           <button
+            class="btn btn-ghost btn-sm"
+            :class="logsOpen[s.id] ? 'text-sky-600 dark:text-sky-400' : ''"
+            title="每次增量同步一条记录（手动 + 定时）"
+            @click="toggleLogs(s)"
+          >同步记录</button>
+          <button
             v-if="progress[s.id]?.running"
             class="btn btn-warn btn-sm"
             :disabled="progress[s.id]?.phase === 'stopping'"
@@ -536,6 +603,37 @@ onBeforeUnmount(() => {
           <p v-if="progress[s.id].phase === 'stopped'" class="mt-1 text-amber-600 dark:text-amber-400">
             已手动停止，采到的数据已入库；再点「全量采集」会从断点继续。
           </p>
+        </div>
+
+        <!-- 增量同步记录：每次手动/定时增量一条汇总（新的在前） -->
+        <div v-if="logsOpen[s.id]" class="mt-2 rounded-xl bg-slate-50 px-2.5 py-2 text-xs dark:bg-white/5">
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="font-medium">同步记录</span>
+            <span class="chip">仅增量 · 保留最近 {{ (logs[s.id] || []).length }} 条</span>
+            <button class="btn btn-ghost btn-sm ml-auto" :disabled="logsLoading[s.id]" @click="loadLogs(s.id)">
+              {{ logsLoading[s.id] ? '刷新中…' : '刷新' }}
+            </button>
+          </div>
+          <p v-if="!logs[s.id]" class="mt-1.5 text-slate-400">
+            {{ logsLoading[s.id] ? '加载中…' : '暂无记录' }}
+          </p>
+          <p v-else-if="!logs[s.id]?.length" class="mt-1.5 text-slate-400">
+            还没有同步记录：点「增量采集」或等定时任务跑一次（全量采集不记录）。
+          </p>
+          <ul v-else class="mt-1.5 space-y-1">
+            <li
+              v-for="g in logs[s.id]" :key="g.id"
+              class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 border-t border-slate-100 pt-1 first:border-0 first:pt-0 dark:border-white/5"
+            >
+              <span class="tabular-nums text-slate-400">{{ logTime(g.started_at) }}</span>
+              <span class="chip">{{ g.trigger === 'auto' ? '定时' : '手动' }}</span>
+              <span class="font-medium" :class="logStatusClass(g.status)">{{ logStatusText[g.status] || g.status }}</span>
+              <span class="text-slate-500 dark:text-slate-400">
+                抓取 {{ num(g.fetched) }} · 新增 {{ num(g.added) }} · 更新 {{ num(g.updated) }} · 耗时 {{ logDur(g.duration_ms) }}
+              </span>
+              <span v-if="g.error" class="w-full break-all text-rose-500">{{ g.error }}</span>
+            </li>
+          </ul>
         </div>
       </div>
     </section>

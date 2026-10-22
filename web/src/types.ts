@@ -62,6 +62,27 @@ export interface Progress {
   sources: SourceProgress[]
 }
 
+/** 一次增量同步的汇总记录（GET /api/sources/{id}/sync-logs，新的在前） */
+export interface SyncLog {
+  id: number
+  source_id: number
+  /** manual=手动点「增量采集」 / auto=定时任务 */
+  trigger: string
+  /** UTC 时间（RFC3339 或 SQLite 格式） */
+  started_at: string
+  finished_at: string
+  duration_ms: number
+  /** 本次比对过的影片数 */
+  fetched: number
+  added: number
+  updated: number
+  /** 补详情请求的批次数 */
+  details: number
+  /** running/done/warning/failed/stopped */
+  status: string
+  error: string
+}
+
 export interface VideoItem {
   id: number
   vod_name: string
@@ -190,8 +211,6 @@ export interface ShareInfo {
   page_url: string
   play_url: string
   file_url: string
-  /** 分享失效时间（UTC "YYYY-MM-DD HH:mm:ss"），空 = 永久有效 */
-  expires_at?: string
 }
 
 /** 分享页 /s/{id} 的数据 */
@@ -208,8 +227,6 @@ export interface SharePage {
   file_url: string
   /** 同剧其它已下载的集（按集号升序，多源同集已去重） */
   episodes: { id: number; ep_index: number }[]
-  /** 分享失效时间（UTC），空 = 永久有效 */
-  expires_at?: string
 }
 
 export interface WatchHistoryItem {

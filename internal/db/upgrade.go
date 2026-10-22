@@ -39,7 +39,6 @@ func UpgradeSchema(path string) (string, error) {
 	dropRedundantIndexes(d)
 	dedupePlays(d)
 	ensureNameAgg(d)
-	PurgeExpiredShareTokens(d)
 
 	after := tableColumns(d, "vod_download")
 	for _, c := range after {

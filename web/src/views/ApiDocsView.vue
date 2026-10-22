@@ -70,7 +70,7 @@ const groups: ApiGroup[] = [
       { m: 'GET', p: '/api/filters', d: '筛选项：年份 / 地区 / 类型' },
       {
         m: 'GET', p: '/api/img', d: '封面图代理（解决源站防盗链）',
-        params: [{ in: 'query', name: 'u', desc: '封面原地址（URL 编码后放查询参数）', required: true }],
+        params: [{ in: 'query', name: 'u', desc: '封面原地址（直接填原始 URL，本页会自动编码）', required: true }],
         noTry: '返回图片，用「新窗口打开」查看',
       },
     ],
@@ -102,6 +102,13 @@ const groups: ApiGroup[] = [
       {
         m: 'GET', p: '/api/sources/{id}/test', d: '测试来源连通性',
         params: [{ in: 'path', name: 'id', desc: '来源 id', required: true }],
+      },
+      {
+        m: 'GET', p: '/api/sources/{id}/sync-logs', d: '增量同步记录（每次手动/定时增量一条汇总，新的在前）',
+        params: [
+          { in: 'path', name: 'id', desc: '来源 id', required: true },
+          { in: 'query', name: 'limit', desc: '返回条数（默认 20，最多 100）', def: '20', example: '20' },
+        ],
       },
       {
         m: 'POST', p: '/api/sources/{id}/auto-incr', d: '开关「定时增量」',
@@ -166,6 +173,8 @@ const groups: ApiGroup[] = [
         m: 'POST', p: '/api/downloads/batch', d: '批量操作',
         body: { action: 'pause', ids: [1, 2] },
         q: 'action=pause|resume|retry|delete',
+        confirm: 'action=delete 时会连同已下载的 mp4 文件一起删除，不可恢复；pause/resume/retry 不动文件。',
+        danger: true,
       },
       {
         m: 'DELETE', p: '/api/downloads/{id}', d: '删除任务与文件',
@@ -173,7 +182,6 @@ const groups: ApiGroup[] = [
         confirm: '会同时删除已下载的 mp4 文件，不可恢复。',
         danger: true,
       },
-      { m: 'GET', p: '/api/local', d: '本地已完成的影片（按剧名分组）' },
     ],
   },
   {
@@ -194,16 +202,13 @@ const groups: ApiGroup[] = [
         params: [{ in: 'query', name: 'u', desc: 'm3u8 地址', required: true }],
       },
       {
-        m: 'GET', p: '/api/downloads/{id}/share', d: '生成分享链接（局域网地址）',
-        params: [
-          { in: 'path', name: 'id', desc: '下载任务 id', required: true },
-          { in: 'query', name: 'hours', desc: '有效期，0 = 永久', def: '24', example: '24' },
-        ],
+        m: 'GET', p: '/api/downloads/{id}/share', d: '生成分享链接（永久有效，局域网地址）',
+        params: [{ in: 'path', name: 'id', desc: '下载任务 id', required: true }],
       },
       { m: 'GET', p: '/api/share/base', d: '站点根地址（用于二维码）' },
       {
         m: 'GET', p: '/api/share/{id}', d: '分享页数据（不直接暴露视频地址）',
-        params: [{ in: 'path', name: 'id', desc: '分享令牌或下载任务 id', required: true }],
+        params: [{ in: 'path', name: 'id', desc: '分享令牌（旧版数字下载 id 需本机访问）', required: true }],
       },
     ],
   },
@@ -319,6 +324,7 @@ function toggleTry(it: ApiItem) {
 }
 
 function reset(it: ApiItem) {
+  aborts.get(keyOf(it))?.abort()
   states[keyOf(it)] = initState(it)
 }
 
@@ -351,6 +357,9 @@ watch(adminToken, (v) => {
   else localStorage.removeItem(tokenKey)
 })
 
+/** 进行中的请求：重置时先中止，避免旧请求的结果回来时写进已经被丢弃的状态 */
+const aborts = new Map<string, AbortController>()
+
 async function send(it: ApiItem) {
   const st = stateOf(it)
   if (st.sending) return
@@ -380,6 +389,14 @@ async function send(it: ApiItem) {
   const token = adminToken.value.trim()
   if (token) headers['X-Admin-Token'] = token
 
+  // fetch 默认没有超时：vacuum / update/apply 这类接口可能几分钟不回，
+  // 不设超时按钮会永久停在「发送中…」。重置也会 abort。
+  const ac = new AbortController()
+  aborts.set(keyOf(it), ac)
+  init.signal = ac.signal
+  let timedOut = false
+  const timeout = window.setTimeout(() => { timedOut = true; ac.abort() }, 120_000)
+
   st.sending = true
   const t0 = performance.now()
   try {
@@ -398,7 +415,10 @@ async function send(it: ApiItem) {
     // 大响应（列表/导出）只留前 50KB，避免页面卡死
     const truncated = text.length > 50_000
     if (truncated) text = text.slice(0, 50_000)
-    const binary = type !== '' && !/^(text\/|application\/(json|xml|javascript|x-yaml|yaml))/.test(type)
+    // 明确是文本才按文本展示：m3u8（application/vnd.apple.mpegurl）等也是纯文本
+    const isText = type === '' ||
+      /^(text\/|application\/(json|xml|javascript|x-yaml|yaml|vnd\.apple\.mpegurl|x-mpegurl|x-ndjson|graphql))/i.test(type)
+    const binary = !isText
     st.result = {
       status: r.status,
       statusText: r.statusText,
@@ -409,17 +429,24 @@ async function send(it: ApiItem) {
       truncated,
     }
   } catch (e) {
+    const aborted = e instanceof DOMException && e.name === 'AbortError'
     st.result = {
       status: 0,
-      statusText: '请求失败',
+      statusText: aborted ? (timedOut ? '请求超时' : '已取消') : '请求失败',
       ms: Math.round(performance.now() - t0),
       size: 0,
       type: '',
-      body: e instanceof Error ? e.message : String(e),
+      body: aborted
+        ? (timedOut ? '超过 120 秒没有响应，已自动取消' : '请求已取消')
+        : e instanceof Error ? e.message : String(e),
       truncated: false,
     }
-    toast('请求失败', 'err', 1800)
+    if (timedOut) toast('请求超时（120 秒），已取消', 'err', 2400)
+    else if (!aborted) toast('请求失败', 'err', 1800)
   } finally {
+    window.clearTimeout(timeout)
+    // 重置后可能已经发了新请求，别把新请求的 controller 删掉
+    if (aborts.get(keyOf(it)) === ac) aborts.delete(keyOf(it))
     st.sending = false
   }
 }

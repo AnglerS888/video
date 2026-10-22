@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from './api'
 import ConfirmDialog from './components/ConfirmDialog.vue'
 import QrShareDialog from './components/QrShareDialog.vue'
 import { isDark, toggleTheme } from './theme'
-import { toasts } from './toast'
+import { toast, toasts } from './toast'
 
 const route = useRoute()
 
@@ -35,12 +35,44 @@ async function shareSite() {
   shareURL.value = `${base}/`
 }
 
-// 版本号：顶栏右下角显示真实版本（来自 /api/version，取不到就不显示）
+// 版本号：顶栏右下角显示真实版本（来自 /api/version，取不到就不显示）。
+// 同时兼任「版本看守」：容器内自更新是原地重启并整体替换前端产物，旧页面里
+// 带 hash 的 chunk 在服务器上已经不存在，不刷新的话再点导航就会 404。
+// 指纹用「版本号 + 构建时间」：强制重装同一版本号时，编译时间也会变。
 const appVersion = ref('')
-onMounted(async () => {
+const verPrint = ref('')
+let verTimer: number | undefined
+
+async function pollVersion() {
+  if (document.hidden) return
   const r = await api.version()
-  const v = r.ok ? r.data?.info?.current_version : ''
-  if (v) appVersion.value = 'v' + v
+  const info = r.ok ? r.data?.info : null
+  if (!info) return
+  const fp = `${info.current_version || ''}|${info.build_time || ''}`
+  // 首次只记录；之后指纹不一致 = 服务端换过二进制，整页刷新换成新产物
+  if (verPrint.value && fp !== verPrint.value) {
+    if (verTimer) { window.clearInterval(verTimer); verTimer = undefined }
+    toast(`站点已更新${info.current_version ? '到 v' + info.current_version : ''}，页面即将刷新`, 'ok', 6000)
+    window.setTimeout(() => location.reload(), 2000)
+    return
+  }
+  verPrint.value = fp
+  if (info.current_version) appVersion.value = 'v' + info.current_version
+}
+
+// 切回页面时立刻对一次（手机锁屏后定时器会被节流，可能错过更新窗口）
+function onVisible() {
+  if (!document.hidden) pollVersion()
+}
+
+onMounted(() => {
+  pollVersion()
+  verTimer = window.setInterval(pollVersion, 60_000)
+  document.addEventListener('visibilitychange', onVisible)
+})
+onBeforeUnmount(() => {
+  if (verTimer) window.clearInterval(verTimer)
+  document.removeEventListener('visibilitychange', onVisible)
 })
 </script>
 

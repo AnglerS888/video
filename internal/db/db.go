@@ -288,14 +288,36 @@ CREATE INDEX IF NOT EXISTS idx_vod_name_group ON vod_info(vod_name, source_id);
 -- 分享令牌：分享链接的有效凭据。
 -- 不能拿 vod_download.id 当分享凭据 —— id 是自增整数，能被直接枚举，
 -- 拿到 /play/{id} 就等于拿到整个下载库。
--- 令牌是随机串，可过期、可单独撤销，文件访问必须带令牌。
+-- 令牌是随机串，可单独撤销，文件访问必须带令牌。
+-- expires_at 是旧版有效期功能的遗留列（旧库结构兼容），现在固定为空、不再校验：
+-- 分享链接永久有效，删除下载记录时令牌随外键级联删除。
 CREATE TABLE IF NOT EXISTS vod_share_token (
 	token       TEXT PRIMARY KEY,                 -- URL 安全的随机串
 	download_id INTEGER NOT NULL REFERENCES vod_download(id) ON DELETE CASCADE,
-	expires_at  TEXT NOT NULL DEFAULT '',        -- UTC "YYYY-MM-DD HH:mm:ss"，空=永久
+	expires_at  TEXT NOT NULL DEFAULT '',        -- 已废弃：空=永久有效
 	created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_share_dl ON vod_share_token(download_id);
+
+-- 增量同步记录：每次增量采集（手动/定时）每个接口写一条汇总，用于在接口页回看历史。
+-- 只记录增量（全量采集不写），每个接口只保留最近 100 条（采集收尾时清理）。
+-- 不建外键约束到 vod_source：来源被删除后历史记录仍然可读（source_id 仅作展示/过滤）。
+CREATE TABLE IF NOT EXISTS vod_sync_log (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	source_id    INTEGER NOT NULL,               -- 接口 id（可能已删除，不做外键级联）
+	source_name  TEXT NOT NULL DEFAULT '',       -- 冗余接口名，改名/删接口后仍可读
+	trigger_type TEXT NOT NULL DEFAULT 'manual', -- manual=手动增量 / auto=定时增量
+	started_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+	finished_at  DATETIME DEFAULT CURRENT_TIMESTAMP,
+	duration_ms  INTEGER NOT NULL DEFAULT 0,     -- 本次增量耗时
+	fetched      INTEGER NOT NULL DEFAULT 0,     -- 抓到（比对过）的影片数
+	added        INTEGER NOT NULL DEFAULT 0,     -- 新增影片数
+	updated      INTEGER NOT NULL DEFAULT 0,     -- 有变化的影片数
+	details      INTEGER NOT NULL DEFAULT 0,     -- 补详情请求的批次数
+	status       TEXT NOT NULL DEFAULT 'done',   -- running/done/warning/failed/stopped
+	error        TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_sync_log_src ON vod_sync_log(source_id, id DESC);
 `
 
 // playSchema 播放地址表（单独一份，因为旧库升级时要整体重建而不是补字段）。

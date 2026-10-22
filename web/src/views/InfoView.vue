@@ -434,6 +434,7 @@ const upStatus = ref<UpdateStatus | null>(null)
 const upChecking = ref(false)
 const upApplying = ref(false)
 let upTimer: number | undefined
+let reloadTimer: number | undefined
 
 const isDocker = computed(() => upInfo.value?.mode === 'docker')
 // restarting 也算进行中：进程马上原地 exec 重启，接口会断几秒，新进程回来后回 done
@@ -555,8 +556,12 @@ function pollUp() {
       if (upTimer) { window.clearInterval(upTimer); upTimer = undefined }
       upApplying.value = false
       if (r.data.phase === 'failed') toast(r.data.error || '更新失败', 'err', 6000)
-      else if (r.data.phase === 'done') toast(r.data.message || '更新完成，已自动重启', 'ok', 6000)
-      else toast(r.data.message || '源码已就绪，请到宿主机重建镜像', 'ok', 5000)
+      else if (r.data.phase === 'done') {
+        toast(r.data.message || '更新完成，已自动重启', 'ok', 6000)
+        // 新进程已就绪：等提示露个脸就整页刷新，换成本次更新带上的前端产物。
+        // 旧页面里带 hash 的 chunk 已被替换，不刷新再点导航会 404。
+        reloadTimer = window.setTimeout(() => location.reload(), 1800)
+      } else toast(r.data.message || '源码已就绪，请到宿主机重建镜像', 'ok', 5000)
       loadVersion()
     }
   }, 1200)
@@ -582,6 +587,7 @@ onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer)
   if (fixTimer) window.clearInterval(fixTimer)
   if (upTimer) window.clearInterval(upTimer)
+  if (reloadTimer) window.clearTimeout(reloadTimer)
   stopFfPoll()
 })
 </script>

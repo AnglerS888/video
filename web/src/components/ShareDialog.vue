@@ -19,24 +19,7 @@ const info = ref<ShareInfo | null>(null)
 const qr = ref('')
 const loading = ref(true)
 
-// 分享有效期：0=永久；每次切换都会重写该集的失效时间
-const hours = ref(0)
-const hourOptions = [
-  { h: 0, label: '永久' },
-  { h: 24, label: '24 小时' },
-  { h: 168, label: '7 天' },
-]
-
 const link = computed(() => info.value?.page_url || '')
-
-// 后端存的是 UTC "YYYY-MM-DD HH:mm:ss"，显示时转成本地时间
-const expiresText = computed(() => {
-  const e = info.value?.expires_at
-  if (!e) return ''
-  const t = new Date(e.replace(' ', 'T') + 'Z')
-  if (Number.isNaN(t.getTime())) return ''
-  return t.toLocaleString('zh-CN', { hour12: false })
-})
 
 function hostOf(u: string): string {
   try {
@@ -48,7 +31,7 @@ function hostOf(u: string): string {
 
 async function load() {
   loading.value = true
-  const r = await api.share(props.id, hours.value)
+  const r = await api.share(props.id)
   loading.value = false
   if (!r.ok || !r.data) {
     toast(r.msg || '生成分享链接失败', 'err')
@@ -89,13 +72,6 @@ async function copy() {
   }
 }
 
-// 切换有效期：重新向后端登记失效时间并刷新链接信息
-function setHours(h: number) {
-  if (hours.value === h) return
-  hours.value = h
-  load()
-}
-
 onMounted(load)
 </script>
 
@@ -120,20 +96,6 @@ onMounted(load)
         <p class="text-center text-[11px] muted">
           手机扫码打开分享页（需与服务器在同一局域网：{{ hostOf(link) }}）
         </p>
-
-        <!-- 有效期：过期后打开分享页会提示「已过期」 -->
-        <div class="flex items-center gap-2">
-          <span class="shrink-0 text-xs muted">有效期</span>
-          <div class="flex rounded-lg bg-slate-100 p-0.5 text-xs dark:bg-white/5">
-            <button
-              v-for="o in hourOptions" :key="o.h"
-              class="rounded-md px-2.5 py-1"
-              :class="hours === o.h ? 'bg-white font-medium shadow-sm dark:bg-white/10' : 'text-slate-500'"
-              @click="setHours(o.h)"
-            >{{ o.label }}</button>
-          </div>
-          <span v-if="expiresText" class="text-[11px] text-amber-600 dark:text-amber-400">{{ expiresText }} 后失效</span>
-        </div>
 
         <div class="flex items-center gap-2">
           <input class="input select-all text-xs" :value="link" readonly />

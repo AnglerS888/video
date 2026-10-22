@@ -464,6 +464,7 @@ func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
 		{"downloads", `DELETE FROM vod_download WHERE source_id=?`},
 		{"videos", `DELETE FROM vod_info WHERE source_id=?`},
 		{"sync", `DELETE FROM vod_sync_state WHERE source_id=?`},
+		{"sync_log", `DELETE FROM vod_sync_log WHERE source_id=?`},
 	}
 	for _, st := range steps {
 		res, err := tx.Exec(st.q, id)
@@ -578,6 +579,47 @@ func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
 func (s *Server) testSource(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	ok(w, s.Col.Test(id))
+}
+
+// syncLogs 返回某个接口最近的增量同步记录（新的在前）。
+// 只记录增量采集；全量采集不写记录。每个接口最多保留 100 条（写入时清理）。
+func (s *Server) syncLogs(w http.ResponseWriter, r *http.Request) {
+	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if id <= 0 {
+		fail(w, "参数错误")
+		return
+	}
+	limit := 20
+	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 {
+		limit = v
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	rows, err := s.DB.Query(`SELECT id, source_id, trigger_type, started_at, finished_at,
+		duration_ms, fetched, added, updated, details, status, error
+		FROM vod_sync_log WHERE source_id=? ORDER BY id DESC LIMIT ?`, id, limit)
+	if err != nil {
+		fail(w, publicErr(err))
+		return
+	}
+	defer rows.Close()
+	out := []map[string]any{}
+	for rows.Next() {
+		var lid, sid, dur, fetched, added, updated, details int64
+		var trigger, started, finished, status, msg string
+		if rows.Scan(&lid, &sid, &trigger, &started, &finished, &dur,
+			&fetched, &added, &updated, &details, &status, &msg) != nil {
+			continue
+		}
+		out = append(out, map[string]any{
+			"id": lid, "source_id": sid, "trigger": trigger,
+			"started_at": started, "finished_at": finished, "duration_ms": dur,
+			"fetched": fetched, "added": added, "updated": updated, "details": details,
+			"status": status, "error": msg,
+		})
+	}
+	ok(w, out)
 }
 
 // sourceExportItem 导出/导入的接口条目（与 sourceInput 分开：导入要带 auto_incr）

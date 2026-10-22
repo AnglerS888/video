@@ -1,6 +1,6 @@
 import type {
   ApiResp, CoverFixStatus, Downloads, FavItem, FfmpegStatus, Filters, Progress, ShareInfo, SharePage, Source, SourceTest,
-  ConfigData, ConfigInfo, SysInfo, UpdateInfo, UpdateStatus, VersionResp, VideoDetail, VideoList, WatchHistoryItem,
+  ConfigData, ConfigInfo, SyncLog, SysInfo, UpdateInfo, UpdateStatus, VersionResp, VideoDetail, VideoList, WatchHistoryItem,
 } from './types'
 
 async function req<T>(path: string, init?: RequestInit): Promise<ApiResp<T>> {
@@ -83,8 +83,8 @@ export const api = {
   },
 
   /* ---- 本地 / 分享 / 观看历史 ---- */
-  share(id: number, hours = 0) {
-    return req<ShareInfo>(`/api/downloads/${id}/share${hours > 0 ? `?hours=${hours}` : ''}`)
+  share(id: number) {
+    return req<ShareInfo>(`/api/downloads/${id}/share`)
   },
   /** 站点根地址（二维码分享用；本机 localhost 访问时后端会换成内网 IP） */
   shareBase() {
@@ -138,6 +138,10 @@ export const api = {
   },
   testSource(id: number) {
     return req<SourceTest>(`/api/sources/${id}/test`)
+  },
+  /** 增量同步记录：每次手动/定时增量一条汇总（新的在前） */
+  syncLogs(id: number, limit = 20) {
+    return req<SyncLog[]>(`/api/sources/${id}/sync-logs?limit=${limit}`)
   },
   /** 添加前预检：填域名即可，后端会依次尝试 .php / 无 .php / at=xml 等写法 */
   probeSource(url: string) {
