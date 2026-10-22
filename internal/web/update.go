@@ -37,6 +37,9 @@ func (s *Server) checkUpdate(w http.ResponseWriter, r *http.Request) {
 // 镜像自带 Go 工具链时，容器内直接 go build → 替换二进制 → 原地 exec 重启（容器不退出）；
 // 旧的精简镜像（无 go）只落源码，由用户在宿主机执行 docker compose build && up -d。
 // 直接运行模式一律拒绝，引导用户去 Gitee 手动更新。
+//
+// force=1 为「强制更新」：跳过版本号判断，无论本机是什么版本都按远端最新源码重装；
+// 不带该参数时要求远端版本号与本机不同（版本号相同/还没检查过的请求由 updater 拒绝）。
 func (s *Server) applyUpdate(w http.ResponseWriter, r *http.Request) {
 	if s.Up == nil {
 		fail(w, "更新模块未启用")
@@ -46,7 +49,8 @@ func (s *Server) applyUpdate(w http.ResponseWriter, r *http.Request) {
 		fail(w, "当前为直接运行模式，不支持自动更新。请到 "+version.RepoURL(version.Repo)+" 下载最新版本后手动替换")
 		return
 	}
-	if err := s.Up.Start(); err != nil {
+	force := r.URL.Query().Get("force")
+	if err := s.Up.Start(force == "1" || force == "true"); err != nil {
 		fail(w, publicErr(err))
 		return
 	}

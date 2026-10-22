@@ -617,16 +617,37 @@ func (u *Updater) setStatus(fn func(*Status)) {
 }
 
 // Start 启动一次更新任务（异步）。已在运行时返回错误。
-func (u *Updater) Start() error {
+//
+// force=false 时要求「已检查到远端版本号，且本机版本号与它不同」：
+// 版本号一致时重复下载、编译同一个版本没有意义，页面上的「立即更新」
+// 也正是按这个条件置灰；检查结果还没拿到时也拒绝，提示用户先检查。
+// force=true 跳过版本判断：无论本机是什么版本（相同、更低甚至更高），
+// 都按远端最新源码重新编译替换，用于「版本号没变但想重装最新提交」这类场景。
+func (u *Updater) Start(force bool) error {
 	u.mu.Lock()
 	if u.running {
 		u.mu.Unlock()
 		return errors.New("更新任务正在进行中")
 	}
+	latest := u.info.LatestVersion
+	if !force {
+		if latest == "" {
+			u.mu.Unlock()
+			return errors.New("还没检查到远端版本号，请先点「检查更新」，或改用「强制更新」")
+		}
+		if compareSemver(latest, version.Version) == 0 {
+			u.mu.Unlock()
+			return fmt.Errorf("本机版本号 %s 与远端 %s 相同，如需按最新提交重装请用「强制更新」",
+				version.Version, latest)
+		}
+	}
 	u.running = true
 	u.status = Status{Phase: "downloading", Message: "准备下载最新源码…", Instructions: []string{}}
 	u.status.UpdatedAt = time.Now().Format("2006-01-02 15:04:05")
 	u.mu.Unlock()
+
+	// 强制更新不依赖上次检查结果，日志里带上远端版本只为排障时对得上号
+	logx.Infof("[update] 启动更新任务（强制=%v）：本机 %s，远端 %s", force, version.Version, latest)
 
 	go func() {
 		defer func() {
@@ -768,7 +789,7 @@ func (u *Updater) buildAndRestart(ctx context.Context, srcDir, work, commitHint,
 		newVer = strings.TrimSpace(string(b))
 	}
 	// commit 优先用归档首层目录名里解析出来的真实 sha；
-	// 用户没先点「检查更新」直接点「立即更新」时 u.info 是零值，
+	// 用户没先点「检查更新」直接点「强制更新」时 u.info 是零值，
 	// 那时只能用 zip 目录名（Gitee 归档形如 video-<sha>/）兜底，
 	// 实在拿不到才留空（比注入一个错的 sha 好）。
 	info := u.snapshot()

@@ -439,6 +439,21 @@ const isDocker = computed(() => upInfo.value?.mode === 'docker')
 // restarting 也算进行中：进程马上原地 exec 重启，接口会断几秒，新进程回来后回 done
 const upBusy = computed(() => ['downloading', 'extracting', 'building', 'restarting'].includes(upStatus.value?.phase || ''))
 
+// 「立即更新」只在版本号确实不同时可用；版本号相同（或还没检查到远端版本）只能走「强制更新」，
+// 避免同一版本反复下载编译。与后端 compareSemver 一致：忽略前导 v 与 -rc 之类的后缀，只比三段数字。
+function verParts(s: string): number[] {
+  const core = (s || '').trim().replace(/^v/i, '').split(/[-+ ]/)[0]
+  return core.split('.').map((x) => parseInt(x, 10) || 0)
+}
+const upVersionDiff = computed(() => {
+  const cur = upInfo.value?.current_version || ''
+  const latest = upInfo.value?.latest_version || ''
+  if (!cur || !latest) return false
+  const a = verParts(cur)
+  const b = verParts(latest)
+  return [0, 1, 2].some((i) => (a[i] || 0) !== (b[i] || 0))
+})
+
 const upPhaseText = computed(() => {
   const s = upStatus.value
   if (!s) return ''
@@ -480,7 +495,14 @@ async function checkUp(silent = false) {
     if (!silent) toast(r.data.error, 'err', 5000)
     return
   }
-  if (!silent) toast(r.data.available ? '发现可用更新' : '当前已是最新版本', r.data.available ? 'ok' : 'info', 2400)
+  if (!silent) {
+    // 版本号相同但远端有新提交时，不能误导成「可以立即更新」
+    if (r.data.available && r.data.latest_version && !upVersionDiff.value) {
+      toast('远端有新提交，但版本号与本机相同；如需重装请用「强制更新」', 'info', 3200)
+    } else {
+      toast(r.data.available ? '发现可用更新' : '当前已是最新版本', r.data.available ? 'ok' : 'info', 2400)
+    }
+  }
 }
 
 // 进信息页时自动检查一次：超过 30 分钟没查过才查，避免每次刷新都打接口
@@ -491,20 +513,29 @@ async function maybeAutoCheck() {
   if (Number.isNaN(ts) || Date.now() - ts > 30 * 60 * 1000) return checkUp(true)
 }
 
-async function applyUp() {
+async function applyUp(force = false) {
   if (upApplying.value || upBusy.value) return
-  if (!upInfo.value?.available) return toast('当前没有可用的新版本', 'info', 2200)
   if (!isDocker.value) {
     return toast('直接运行模式不支持自动更新，请到 Gitee 下载最新版', 'info', 3000)
   }
-  const tip = '会自动下载最新源码、在容器内编译并替换程序，然后自动重启生效。\n期间服务会中断几秒到几分钟（编译耗时取决于机器性能）。继续？'
+  if (!force && !upVersionDiff.value) {
+    return toast('当前版本号与远端相同，如需按最新提交重装请用「强制更新」', 'info', 2800)
+  }
+  const cur = upInfo.value?.current_version ? 'v' + upInfo.value.current_version : '未知'
+  const latest = upInfo.value?.latest_version ? 'v' + upInfo.value.latest_version : '未知（以下载到的源码为准）'
+  const tip = force
+    ? `强制更新会忽略版本号判断：本机 ${cur}，远端 ${latest}。\n` +
+      '将直接下载远端最新源码、在容器内重新编译并替换程序，然后自动重启生效。\n' +
+      '期间服务会中断几秒到几分钟（编译耗时取决于机器性能）。继续？'
+    : '会自动下载最新源码、在容器内编译并替换程序，然后自动重启生效。\n期间服务会中断几秒到几分钟（编译耗时取决于机器性能）。继续？'
   if (!(await confirmDialog({
-    title: '在线更新',
+    title: force ? '强制更新' : '在线更新',
     message: tip,
-    okText: '开始更新',
+    okText: force ? '强制更新' : '开始更新',
+    danger: force,
   }))) return
   upApplying.value = true
-  const r = await api.applyUpdate()
+  const r = await api.applyUpdate(force)
   if (!r.ok) {
     upApplying.value = false
     return toast(r.msg || '启动更新失败', 'err', 4000)
@@ -777,8 +808,9 @@ onBeforeUnmount(() => {
             <span class="chip">{{ upInfo?.current_version ? 'v' + upInfo.current_version : '—' }}</span>
             <span v-if="upInfo?.current_commit" class="chip">提交 {{ upInfo.current_commit.slice(0, 7) }}</span>
             <span class="chip">{{ isDocker ? 'Docker 容器' : '直接运行' }}</span>
-            <span v-if="upInfo?.available" class="chip chip-on">有新版本</span>
-            <button class="btn btn-ghost btn-sm ml-auto" :disabled="upChecking || upBusy" @click="checkUp">
+            <span v-if="upInfo?.available" class="chip chip-on">{{ upVersionDiff ? '有新版本' : '有新提交' }}</span>
+            <!-- 注意要写成 checkUp()：直接写 checkUp 会把 MouseEvent 传进 silent 参数，导致提示被吞 -->
+            <button class="btn btn-ghost btn-sm ml-auto" :disabled="upChecking || upBusy" @click="checkUp()">
               {{ upChecking ? '检查中…' : '检查更新' }}
             </button>
           </div>
@@ -834,15 +866,28 @@ onBeforeUnmount(() => {
             <p v-if="upStatus.source_dir" class="mt-1 break-all text-[11px] text-slate-400">{{ upStatus.source_dir }}</p>
           </div>
 
+          <p v-if="isDocker && upInfo?.available && !upVersionDiff" class="rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] muted dark:bg-white/5">
+            远端有更新，但版本号与本机相同{{ upInfo?.latest_version ? '（' + upInfo.latest_version + '）' : '' }}；
+            「立即更新」只在版本号不同时可用，想按最新提交重装请点「强制更新」。
+          </p>
+
           <div class="flex flex-wrap items-center gap-2">
             <template v-if="isDocker">
               <button
                 class="btn btn-primary btn-sm"
-                :disabled="!upInfo?.available || upApplying || upBusy"
-                :title="upInfo?.available ? '' : '当前已是最新版本（或还没检查），不能更新'"
-                @click="applyUp"
+                :disabled="!upVersionDiff || upApplying || upBusy"
+                :title="upVersionDiff ? '' : '版本号与远端相同（或还没检查到远端版本），请用「强制更新」'"
+                @click="applyUp()"
               >
                 {{ upApplying || upBusy ? '更新中…' : '立即更新' }}
+              </button>
+              <button
+                class="btn btn-ghost btn-sm"
+                :disabled="upApplying || upBusy"
+                title="忽略版本号判断，直接按远端最新源码重新编译并替换（同版本重装用）"
+                @click="applyUp(true)"
+              >
+                强制更新
               </button>
             </template>
             <a
@@ -858,7 +903,8 @@ onBeforeUnmount(() => {
             >Gitee 仓库</a>
           </div>
           <p v-if="isDocker" class="text-[11px] muted">
-            自动更新只在 Docker 容器内提供：点「立即更新」后自动下载最新源码、在容器内编译并替换程序，
+            自动更新只在 Docker 容器内提供：「立即更新」仅在版本号与远端不同时可用；
+            「强制更新」不看版本号，随时可以按远端最新源码重装。两者都会自动下载源码、在容器内编译并替换程序，
             随后进程原地重启生效（PID 不变，容器不会退出；期间服务短暂中断），数据目录不受影响，无需登录宿主机。
             若镜像不含 Go 工具链（旧版精简镜像），则只下载源码并给出宿主机重建镜像的步骤。
           </p>

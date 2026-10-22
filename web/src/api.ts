@@ -229,9 +229,9 @@ export const api = {
   checkUpdate() {
     return req<UpdateInfo>('/api/update/check', { method: 'POST' })
   },
-  /** 下载源码（直接运行模式会自动编译） */
-  applyUpdate() {
-    return req<UpdateStatus>('/api/update/apply', { method: 'POST' })
+  /** 下载源码（直接运行模式会自动编译）；force=true 跳过版本号判断，强制按最新源码重装 */
+  applyUpdate(force = false) {
+    return req<UpdateStatus>(`/api/update/apply${force ? '?force=1' : ''}`, { method: 'POST' })
   },
   updateStatus() {
     return req<UpdateStatus>('/api/update/status')
