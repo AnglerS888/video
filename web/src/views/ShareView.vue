@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import CoverImg from '../components/CoverImg.vue'
 import VideoPlayer from '../components/VideoPlayer.vue'
 import { api, coverURL } from '../api'
+import { fmtMB } from '../format'
 import type { SharePage } from '../types'
 
 /**
@@ -23,7 +24,7 @@ const errMsg = ref('')
 const playing = ref(false)
 
 const poster = computed(() => (info.value?.vod_pic ? coverURL(info.value.vod_pic) : ''))
-const sizeText = computed(() => (info.value && info.value.size_mb > 0 ? info.value.size_mb.toFixed(1) + ' MB' : ''))
+const sizeText = computed(() => (info.value && info.value.size_mb > 0 ? fmtMB(info.value.size_mb) : ''))
 
 function epLabel(i: number): string {
   return i >= 0 ? `第${i + 1}集` : '整条'

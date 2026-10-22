@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import CoverImg from '../components/CoverImg.vue'
 import { api } from '../api'
 import { confirmDialog } from '../confirm'
+import { fmtMB } from '../format'
 import { toast } from '../toast'
 import type { DownloadTask } from '../types'
 
@@ -383,7 +384,7 @@ onBeforeUnmount(() => {
 
               <div class="min-w-0 flex-1">
                 <div class="flex items-center gap-1.5 text-[11px] text-slate-500 dark:text-slate-400">
-                  <span v-if="t.size_mb > 0" class="shrink-0">{{ t.size_mb.toFixed(1) }} MB</span>
+                  <span v-if="t.size_mb > 0" class="shrink-0">{{ fmtMB(t.size_mb) }}</span>
                   <span v-if="['downloading', 'queued', 'merging', 'paused'].includes(t.status)" class="shrink-0">{{ t.percent }}%</span>
                   <span v-if="t.error" class="min-w-0 truncate text-rose-500" :title="t.error">{{ t.error }}</span>
                 </div>

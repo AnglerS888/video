@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../api'
 import { confirmDialog } from '../confirm'
+import { fmtBytes } from '../format'
 import { toast } from '../toast'
 import type { ConfigData, ConfigInfo, CoverFixStatus, FfmpegStatus, SysInfo, UpdateInfo, UpdateStatus } from '../types'
 
@@ -10,18 +11,6 @@ const loading = ref(true)
 const at = ref('')
 const vacuuming = ref(false)
 let timer: number | undefined
-
-function fmtBytes(n?: number): string {
-  if (!n || n <= 0) return '0 B'
-  const u = ['B', 'KB', 'MB', 'GB', 'TB']
-  let i = 0
-  let v = n
-  while (v >= 1024 && i < u.length - 1) {
-    v /= 1024
-    i++
-  }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${u[i]}`
-}
 
 function pct(used: number, total: number) {
   if (!total) return 0
@@ -36,6 +25,16 @@ function fmtUptime(sec: number) {
   if (d) return `${d} 天 ${h} 小时`
   if (h) return `${h} 小时 ${m} 分`
   return `${m} 分`
+}
+
+// 目录统计在后端是缓存 + 后台重扫，页面上可能是稍早的快照；
+// at 是扫描开始的 Unix 秒，按浏览器时区显示到分钟
+function fmtStatAt(sec?: number): string {
+  if (!sec) return '—'
+  const d = new Date(sec * 1000)
+  if (Number.isNaN(d.getTime())) return '—'
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
 // 构建时间/提交时间是 UTC（RFC3339 带 Z），必须经 Date 按浏览器时区转换后再展示；
@@ -587,10 +586,11 @@ onBeforeUnmount(() => {
       <div class="grid gap-3 xl:grid-cols-2">
         <!-- 存储 -->
         <section class="card card-pad">
-          <div class="mb-3 flex items-center gap-2">
+          <div class="mb-3 flex flex-wrap items-center gap-2">
             <span class="title">数据目录</span>
             <span class="chip">{{ fmtBytes(info.data.total_bytes) }}</span>
             <span v-if="info.data.partial" class="chip">统计未完成</span>
+            <span class="chip">统计于 {{ fmtStatAt(info.data.at) }}</span>
           </div>
           <code class="block break-all rounded-lg bg-slate-50 px-2.5 py-2 text-xs dark:bg-white/5">{{ info.data.dir }}</code>
 

@@ -5,6 +5,7 @@ import CoverImg from '../components/CoverImg.vue'
 import { api, playURL } from '../api'
 import { copyText } from '../clipboard'
 import { confirmDialog } from '../confirm'
+import { fmtMB } from '../format'
 import { toast } from '../toast'
 import type { DownloadTask, WatchHistoryItem } from '../types'
 
@@ -192,7 +193,7 @@ onMounted(load)
     <section class="card card-pad flex flex-wrap items-center gap-2">
       <span class="title">本地</span>
       <span class="chip">{{ done.length }} 集 · {{ groups.length }} 部</span>
-      <span class="chip">{{ totalSize.toFixed(1) }} MB</span>
+      <span class="chip">{{ fmtMB(totalSize) }}</span>
       <div class="relative ml-auto w-full sm:w-64">
         <svg viewBox="0 0 24 24" class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" fill="none" stroke="currentColor" stroke-width="2">
           <circle cx="11" cy="11" r="7" /><path d="m20 20-3.5-3.5" />
@@ -267,7 +268,7 @@ onMounted(load)
             >{{ g.name }}</RouterLink>
             <div class="mt-1 flex flex-wrap items-center gap-2">
               <span class="chip">{{ g.episodes.length }} 集</span>
-              <span class="text-[11px] muted">{{ g.sizeMB.toFixed(1) }} MB</span>
+              <span class="text-[11px] muted">{{ fmtMB(g.sizeMB) }}</span>
               <span
                 v-if="srcList(g.episodes).length > 1"
                 class="chip border-amber-400/60 text-amber-600 dark:text-amber-400"

@@ -76,6 +76,8 @@ func (s *Server) sysInfo(w http.ResponseWriter, r *http.Request) {
 			"img_count": du.ImgCount, "video_bytes": du.VideoBytes,
 			"backup_bytes": du.BackupBytes, "bin_bytes": du.BinBytes,
 			"total_bytes": du.TotalBytes, "other_bytes": du.OtherBytes, "partial": du.Partial,
+			// 统计时间给前端展示：目录体积在后台重扫，数字可能比页面刷新时间早一点
+			"at":           du.At / int64(time.Second),
 			"freelist_pct": fl.FreeRatio(), "reclaimable_bytes": reclaim,
 			// 空闲页占比达到自动整理阈值时提示用户（自动整理只在服务空闲时跑，等不到可以手动点）
 			"vacuum_pct":     s.VacuumPct,

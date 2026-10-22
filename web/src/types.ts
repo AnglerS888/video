@@ -251,6 +251,8 @@ export interface SysInfo {
   data: {
     dir: string; db_bytes: number; img_bytes: number; img_count: number
     video_bytes: number; backup_bytes: number; bin_bytes: number; total_bytes: number; partial: boolean
+    /** 这组数字的统计时间（Unix 秒）：目录体积在后台重扫，可能比页面刷新时间早一点 */
+    at: number
     /** 数据库空闲页占比（%）：采集/删接口留下的空洞，SQLite 不会自动归还 */
     freelist_pct: number
     /** 整理数据库可回收的字节数 */

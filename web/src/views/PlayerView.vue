@@ -4,6 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import VideoPlayer from '../components/VideoPlayer.vue'
 import ShareDialog from '../components/ShareDialog.vue'
 import { api, playURL } from '../api'
+import { fmtMB } from '../format'
 import { toast } from '../toast'
 import type { DownloadTask } from '../types'
 
@@ -141,7 +142,7 @@ watch(tasks, () => {
         <div class="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] muted">
           <span v-if="current">{{ epLabel(current) }}</span>
           <span v-if="current?.source_name">{{ current.source_name }}</span>
-          <span v-if="current && current.size_mb > 0">{{ current.size_mb.toFixed(1) }} MB</span>
+          <span v-if="current && current.size_mb > 0">{{ fmtMB(current.size_mb) }}</span>
           <span v-if="episodes.length">共 {{ episodes.length }} 集已下载</span>
         </div>
       </div>
@@ -188,7 +189,7 @@ watch(tasks, () => {
           :class="ep.id === curID
             ? 'border-amber-400 bg-amber-500/15 font-medium text-amber-700 dark:text-amber-300'
             : 'border-slate-200 hover:border-slate-300 dark:border-white/10 dark:hover:border-white/25'"
-          :title="`${epLabel(ep)}${ep.size_mb ? ' · ' + ep.size_mb.toFixed(1) + 'MB' : ''}`"
+          :title="`${epLabel(ep)}${ep.size_mb ? ' · ' + fmtMB(ep.size_mb) : ''}`"
           @click="go(ep)"
         >
           {{ epLabel(ep) }}

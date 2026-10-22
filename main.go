@@ -29,6 +29,7 @@ import (
 	"videoDownLoad/internal/imgproc"
 	"videoDownLoad/internal/logx"
 	"videoDownLoad/internal/scheduler"
+	"videoDownLoad/internal/sysinfo"
 	"videoDownLoad/internal/updater"
 	"videoDownLoad/internal/version"
 	"videoDownLoad/internal/web"
@@ -302,6 +303,9 @@ func main() {
 	}, bgStop)
 	// 预热播放地址计数（226 万行的 COUNT 要走 1s+），别让第一个访问者撞上
 	db.WarmupCounts(database, bgStop)
+	// 预热数据目录体积统计：封面几十万小文件，首次遍历要几秒到十几秒，
+	// 先在后台跑完，别让第一个打开「信息」页的请求同步等全盘扫描
+	go sysinfo.DirUsageOf(dataDir)
 
 	// 在线更新器：更新源固定为 Gitee（anglers/video@master），配置里不再保留 update 段。
 	// 匿名下载偶尔被 Gitee 要求验证，可用环境变量 VDL_UPDATE_TOKEN 提供私人令牌。
