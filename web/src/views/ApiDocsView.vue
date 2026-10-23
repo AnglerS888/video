@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue'
+import { markUnauthorized } from '../auth'
 import { toast } from '../toast'
 import { copyText } from '../clipboard'
 import { confirmDialog } from '../confirm'
@@ -8,10 +9,12 @@ import { fmtBytes } from '../format'
 /**
  * 接口文档：把站点自身的 HTTP 接口开放出来，方便脚本/第三方客户端对接。
  *
- * 接口都是同源的 `/api/...`，无鉴权（站点按局域网使用设计）；
+ * 接口都是同源的 `/api/...`，默认无鉴权；在「信息」页 →「运行配置」里设了
+ * 访问密码后，除了 /healthz 与 /api/auth/* 以外的接口都要带密码
+ * （页面登录后的 Cookie，或 X-Access-Password 请求头 / ?password= 参数）。
  * 统一响应：{ ok: true, data: ... } 或 { ok: false, msg: "错误原因" }。
  *
- * 「试一下」直接在本页用 fetch 发同源请求：
+ * 「试一下」直接在本页用 fetch 发同源请求（自动带登录 Cookie）：
  *   - 路径参数（{id} 这类）与查询参数按输入框拼进 URL，发送前校验占位是否填完；
  *   - 写接口可以编辑 JSON 请求体，默认给了示例；
  *   - 返回文件流的接口（视频/图片）不在这里发，改为新窗口打开，避免整段下载进内存。
@@ -46,6 +49,18 @@ type ApiGroup = { title: string; desc?: string; items: ApiItem[] }
 
 const groups: ApiGroup[] = [
   {
+    title: '访问控制（可选）',
+    desc: '站点在「信息」页 →「运行配置」设了访问密码后，其它接口都要带密码；这三个接口本身不需要。',
+    items: [
+      { m: 'GET', p: '/api/auth/status', d: '当前是否启用访问密码、这个浏览器是否已登录（返回 required / authenticated）' },
+      {
+        m: 'POST', p: '/api/auth/login', d: '登录：密码正确后下发 HttpOnly Cookie（30 天）',
+        body: { password: '访问密码' },
+      },
+      { m: 'POST', p: '/api/auth/logout', d: '退出登录（清除 Cookie）' },
+    ],
+  },
+  {
     title: '影视库',
     desc: '列表按「剧名」合并多个来源，同一部剧只出现一次。',
     items: [
@@ -79,7 +94,7 @@ const groups: ApiGroup[] = [
     title: '来源（采集接口）',
     desc: '一个来源就是一个资源站接口（苹果 CMS 的 provide/vod 协议）。',
     items: [
-      { m: 'GET', p: '/api/sources', d: '来源列表（含影片数、连通性、采集进度）' },
+      { m: 'GET', p: '/api/sources', d: '来源列表（名称、地址、启用、自动增量；不含影片统计，大库下避免卡顿）' },
       {
         m: 'POST', p: '/api/sources', d: '添加来源',
         body: { name: '我的接口', api_url: 'https://www.example.com', remark: '', enabled: 1 },
@@ -104,10 +119,11 @@ const groups: ApiGroup[] = [
         params: [{ in: 'path', name: 'id', desc: '来源 id', required: true }],
       },
       {
-        m: 'GET', p: '/api/sources/{id}/sync-logs', d: '增量同步记录（每次手动/自动增量一条汇总，新的在前；含影片明细数）',
+        m: 'GET', p: '/api/sources/{id}/sync-logs', d: '增量同步记录（每次手动/自动增量一条汇总，新的在前；返回 total/page/page_size/items）',
         params: [
           { in: 'path', name: 'id', desc: '来源 id', required: true },
-          { in: 'query', name: 'limit', desc: '返回条数（默认 20，最多 100）', def: '20', example: '20' },
+          { in: 'query', name: 'page', desc: '页码（越界回退最后一页）', def: '1', example: '1' },
+          { in: 'query', name: 'page_size', desc: '每页条数（默认 10，最多 100；兼容旧 limit）', def: '10', example: '10' },
         ],
       },
       {
@@ -134,21 +150,22 @@ const groups: ApiGroup[] = [
     title: '采集',
     items: [
       {
-        m: 'POST', p: '/api/collect/full', d: '全量采集（可随时停止）',
+        m: 'POST', p: '/api/collect/full', d: '全量采集（可随时停止；并发已满时进排队，采完自动接上）',
         params: [
           { in: 'query', name: 'source_id', desc: '不传 = 全部启用来源' },
           { in: 'query', name: 'restart', desc: '1 = 从头重采（忽略断点）', example: '1' },
         ],
       },
       {
-        m: 'POST', p: '/api/collect/incr', d: '增量采集（按更新时间拉最新几页）',
+        m: 'POST', p: '/api/collect/incr', d: '增量采集（按更新时间拉最新几页；并发已满时进排队）',
         params: [{ in: 'query', name: 'source_id', desc: '不传 = 全部启用来源' }],
       },
       {
-        m: 'POST', p: '/api/collect/stop', d: '停止采集',
-        params: [{ in: 'query', name: 'source_id', desc: '不传 = 停止全部' }],
+        m: 'POST', p: '/api/collect/stop', d: '停止采集（排队中的会取消排队）',
+        params: [{ in: 'query', name: 'source_id', desc: '不传 = 停止全部并清空队列' }],
       },
-      { m: 'GET', p: '/api/progress', d: '采集进度（各来源页码 / 已入库数量）' },
+      { m: 'GET', p: '/api/progress', d: '采集进度（各来源页码 / 已入库数量；phase 含 queued = 排队中）' },
+      { m: 'GET', p: '/api/scheduler', d: '定时增量状态（enabled / interval_sec / next_run_unix）' },
     ],
   },
   {
@@ -408,6 +425,8 @@ async function send(it: ApiItem) {
   const t0 = performance.now()
   try {
     const r = await fetch(url, init)
+    // 设了访问密码且 Cookie 无效（改密码 / 过期）：直接切回登录页
+    if (r.status === 401) markUnauthorized()
     const raw = await r.text()
     const ms = Math.round(performance.now() - t0)
     const type = r.headers.get('content-type') ?? ''
@@ -497,16 +516,25 @@ function curlOf(it: ApiItem) {
       <div class="flex flex-wrap items-center gap-2">
         <span class="title">接口</span>
         <span class="chip">同源 /api</span>
-        <span class="chip">无需鉴权</span>
+        <span class="chip">可选访问密码</span>
         <span class="chip chip-on">可直接试</span>
       </div>
       <p class="text-xs muted">
         站点自身的 HTTP 接口，脚本或第三方客户端可以直接调用。统一返回
         <code>{ ok: true, data }</code> 或 <code>{ ok: false, msg }</code>。
-        站点按局域网使用设计，没有登录鉴权，请勿直接暴露到公网。
+        默认按局域网使用设计，没设访问密码时不需要鉴权，请勿直接暴露到公网。
       </p>
       <p class="text-xs muted">
-        每个接口点「试一下」即可填参数直接发请求，响应会显示状态码、耗时与返回内容。
+        在「信息」页 →「运行配置」里设了<strong>访问密码</strong>后，除了
+        <code>/healthz</code> 与 <code>/api/auth/*</code>，所有接口（含 <code>/play/</code>）都要带密码：
+        浏览器登录一次即可（服务端下发 HttpOnly Cookie，30 天有效）；
+        脚本调用请在请求头带 <code>X-Access-Password</code>，或加 <code>?password=</code> 参数
+        （查询参数容易进访问日志，只建议临时使用）。未通过时返回
+        <code>401</code> 与 <code>{ ok: false, code: "auth_required" }</code>；
+        同一 IP 连续输错 5 次会锁定 5 分钟（响应码 429，code=auth_locked）。
+      </p>
+      <p class="text-xs muted">
+        每个接口点「试一下」即可填参数直接发请求（已登录时自动带 Cookie），响应会显示状态码、耗时与返回内容。
       </p>
       <p class="break-all text-[11px] text-slate-400">Base URL：{{ base }}</p>
       <details class="pt-1">

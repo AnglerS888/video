@@ -41,6 +41,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/collect/incr", guard(s.collectIncr))
 	mux.HandleFunc("POST /api/collect/stop", guard(s.stopCollect))
 	mux.HandleFunc("GET /api/progress", s.progress)
+	// 定时增量任务状态（间隔 / 下次触发时间）：来源页倒计时用
+	mux.HandleFunc("GET /api/scheduler", s.schedulerInfo)
 
 	// 视频（按名称合并）/ 详情（多源）
 	mux.HandleFunc("GET /api/videos", s.listVideos)
@@ -104,6 +106,12 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/cover/fix", guard(s.startCoverFix))
 	mux.HandleFunc("POST /api/cover/fix/stop", guard(s.stopCoverFix))
 
+	// 访问密码（存在 ui.yml，信息页 → 运行配置）：登录 / 退出 / 当前状态
+	// 这三个接口本身不需要密码（登录页要用），其余接口与 /play 都受 requireAccess 保护
+	mux.HandleFunc("GET /api/auth/status", s.authStatus)
+	mux.HandleFunc("POST /api/auth/login", s.authLogin)
+	mux.HandleFunc("POST /api/auth/logout", s.authLogout)
+
 	// 配置文件在线查看 / 编辑（保存后重启生效）
 	mux.HandleFunc("GET /api/config", s.configInfo)
 	mux.HandleFunc("PUT /api/config", guard(s.saveConfig))
@@ -119,5 +127,7 @@ func (s *Server) Handler() http.Handler {
 
 	sub, _ := fs.Sub(staticFS, "static")
 	mux.Handle("GET /", spaHandler(sub))
-	return logMiddleware(mux)
+	// requireAccess 套在路由外层：静态页放行（前端据此显示登录页），
+	// /api/* 与 /play/* 没带密码 / 有效 Cookie 一律 401。
+	return logMiddleware(s.requireAccess(mux))
 }

@@ -252,9 +252,9 @@ func main() {
 		if len(srcs) == 0 {
 			return // 所有接口都关了自动增量：不发请求，也不刷日志
 		}
-		started, skipped := col.RunIncremental(srcs, int(incrPages.Load()), "auto")
-		if started > 0 || len(skipped) > 0 {
-			logx.Infof("[scheduler] 定时增量：启动 %d 个接口，跳过 %d 个", started, len(skipped))
+		started, queued, skipped := col.RunIncremental(srcs, int(incrPages.Load()), "auto")
+		if started > 0 || queued > 0 || len(skipped) > 0 {
+			logx.Infof("[scheduler] 定时增量：启动 %d 个接口，排队 %d 个，跳过 %d 个", started, queued, len(skipped))
 		}
 	})
 	sch.Start()
@@ -318,8 +318,12 @@ func main() {
 		Version: version.Version, StartedAt: time.Now(), ConfigPath: cfgPath,
 		VacuumPct: cfg.DB.VacuumPct,
 		Up:        up,
+		Sch:       sch,
 		HotApply:  hotApply,
 	}
+	// 访问密码（ui.yml 里的 auth.password）：空 = 不启用；
+	// 设置后站点要登录，接口要带 Cookie / X-Access-Password / ?password=
+	srv.SetAccessPassword(cfg.Auth.Password)
 	// 显式设置超时：不带超时的裸 ListenAndServe 会让半开连接一直占着 goroutine 和内存
 	// （NAS 上被扫描/移动端切网时很常见）。写超时不设，避免中断大文件播放/下载。
 	httpSrv := &http.Server{

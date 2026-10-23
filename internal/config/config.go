@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gopkg.in/yaml.v3"
 )
@@ -47,6 +48,7 @@ type Config struct {
 	Download   Download `json:"download" yaml:"download"`
 	Cover      Cover    `json:"cover" yaml:"cover"`
 	FFmpeg     FFmpeg   `json:"ffmpeg" yaml:"ffmpeg"`
+	Auth       Auth     `json:"auth" yaml:"auth"`
 	DB         DB       `json:"db" yaml:"db"`
 	dataDirSet bool     // 配置文件里是否显式写了 data_dir
 	path       string   // 实际加载的文件路径
@@ -55,6 +57,12 @@ type Config struct {
 // Server HTTP 服务
 type Server struct {
 	Addr string `json:"addr" yaml:"addr"`
+}
+
+// Auth 访问控制（存在 ui.yml，信息页 → 运行配置可改，保存即生效）。
+// Password 为空表示不启用：站点与接口都不需要密码。
+type Auth struct {
+	Password string `json:"password" yaml:"password"`
 }
 
 // Collect 采集
@@ -259,6 +267,9 @@ func (c *Config) Check() error {
 	if strings.TrimSpace(c.DataDir) == "" {
 		return fmt.Errorf("数据目录不能为空，例如 ./videodata")
 	}
+	if utf8.RuneCountInString(c.Auth.Password) > 128 {
+		return fmt.Errorf("访问密码最长 128 个字符")
+	}
 	return nil
 }
 
@@ -315,6 +326,9 @@ func (c *Config) normalize() {
 	if c.MaxProcs < 0 {
 		c.MaxProcs = 0
 	}
+	// 访问密码：去掉首尾空白（表单里误带的空格会让登录怎么输都不对），
+	// 只去掉空白，不截断——超长由 Check 明确报错，避免静默改掉用户的密码。
+	c.Auth.Password = strings.TrimSpace(c.Auth.Password)
 	// 上限兜底：表单里手输 999 也不至于把机器拖死（正常用法碰不到这些数）
 	c.Collect.Pages = clampInt(c.Collect.Pages, 1, 64)
 	c.Collect.Sources = clampInt(c.Collect.Sources, 1, 64)
@@ -457,7 +471,7 @@ func UIFilePath(dataDir string) string { return filepath.Join(dataDir, UIFileNam
 func LegacyUIFilePath(dataDir string) string { return filepath.Join(dataDir, LegacyUIFileName) }
 
 const uiHeader = `# 页面可改的配置（保存即生效），由「信息」页 →「运行配置」维护。
-# 采集 / 下载 / 封面 / ffmpeg 四段；改完点保存立即生效，不用重启。
+# 采集 / 下载 / 封面 / ffmpeg / 访问密码；改完点保存立即生效，不用重启。
 `
 
 const configHeader = `# 需要重启才生效的配置：端口 / 数据目录 / 日志 / 内存 / 数据库。
@@ -502,7 +516,7 @@ func LoadUI(path string, c *Config) error {
 	return mergeUISections(normalizeInput(string(b)), c)
 }
 
-// mergeUISections 解析 ui 文件（顶层就是 collect/download/cover/ffmpeg）
+// mergeUISections 解析 ui 文件（顶层就是 collect/download/cover/ffmpeg/auth）
 func mergeUISections(text string, c *Config) error {
 	var p uiPatch
 	if err := yaml.Unmarshal([]byte(text), &p); err != nil {
@@ -512,6 +526,7 @@ func mergeUISections(text string, c *Config) error {
 	p.Download.apply(c)
 	p.Cover.apply(c)
 	p.FFmpeg.apply(c)
+	p.Auth.apply(c)
 	return nil
 }
 
@@ -616,6 +631,7 @@ type UISection struct {
 	Download Download `json:"download" yaml:"download"`
 	Cover    Cover    `json:"cover" yaml:"cover"`
 	FFmpeg   FFmpeg   `json:"ffmpeg" yaml:"ffmpeg"`
+	Auth     Auth     `json:"auth" yaml:"auth"`
 }
 
 // AdvancedSection 需要重启才生效的项（存在 config.yml 的 advanced 段）
@@ -631,12 +647,13 @@ type AdvancedSection struct {
 
 // UI 取出页面段
 func (c *Config) UI() UISection {
-	return UISection{Collect: c.Collect, Download: c.Download, Cover: c.Cover, FFmpeg: c.FFmpeg}
+	return UISection{Collect: c.Collect, Download: c.Download, Cover: c.Cover, FFmpeg: c.FFmpeg, Auth: c.Auth}
 }
 
 // ApplyUI 写回页面段
 func (c *Config) ApplyUI(u UISection) {
 	c.Collect, c.Download, c.Cover, c.FFmpeg = u.Collect, u.Download, u.Cover, u.FFmpeg
+	c.Auth = u.Auth
 }
 
 // Advanced 取出高级段
@@ -695,6 +712,10 @@ type dbPatch struct {
 	VacuumPct *int `json:"vacuum_pct" yaml:"vacuum_pct"`
 }
 
+type authPatch struct {
+	Password *string `json:"password" yaml:"password"`
+}
+
 // docPatch 配置文件 / 接口 payload 里可能出现的一切字段（新旧结构都收在一个结构里）
 type docPatch struct {
 	// 新结构：config.yml 的 advanced 段
@@ -712,6 +733,7 @@ type docPatch struct {
 	Download   *downloadPatch `json:"download" yaml:"download"`
 	Cover      *coverPatch    `json:"cover" yaml:"cover"`
 	FFmpeg     *ffmpegPatch   `json:"ffmpeg" yaml:"ffmpeg"`
+	Auth       *authPatch     `json:"auth" yaml:"auth"`
 	DB         *dbPatch       `json:"db" yaml:"db"`
 }
 
@@ -721,6 +743,7 @@ type uiPatch struct {
 	Download *downloadPatch `json:"download" yaml:"download"`
 	Cover    *coverPatch    `json:"cover" yaml:"cover"`
 	FFmpeg   *ffmpegPatch   `json:"ffmpeg" yaml:"ffmpeg"`
+	Auth     *authPatch     `json:"auth" yaml:"auth"`
 }
 
 type advPatch struct {
@@ -828,6 +851,13 @@ func (p *dbPatch) apply(c *Config) {
 	}
 }
 
+// apply 访问密码只存在于 ui.yml，不参与 config.yml 的解析/保存。
+func (p *authPatch) apply(c *Config) {
+	if p != nil && p.Password != nil {
+		c.Auth.Password = *p.Password
+	}
+}
+
 // apply 把补丁合并到 c（只覆盖补丁里出现过的字段）
 func (p *docPatch) apply(c *Config) {
 	if p == nil {
@@ -897,10 +927,10 @@ func ApplyPatch(cfg *Config, data []byte) error {
 	return nil
 }
 
-// 页面可改的分组：只有这四段允许通过接口写入（保存即生效）。
-var uiWritableSections = map[string]bool{"collect": true, "download": true, "cover": true, "ffmpeg": true}
+// 页面可改的分组：只有这几段允许通过接口写入（保存即生效）。
+var uiWritableSections = map[string]bool{"collect": true, "download": true, "cover": true, "ffmpeg": true, "auth": true}
 
-// ApplyUIPatch 只允许修改「页面可改」的四段（collect / download / cover / ffmpeg），
+// ApplyUIPatch 只允许修改「页面可改」的几段（collect / download / cover / ffmpeg / auth），
 // 其余字段（advanced / server / data_dir / log_level / lowmem / mem_limit_mb /
 // max_procs / db）一律拒绝。
 //
@@ -929,11 +959,13 @@ func ApplyUIPatch(cfg *Config, data []byte) error {
 		u.Download.apply(cfg)
 		u.Cover.apply(cfg)
 		u.FFmpeg.apply(cfg)
+		u.Auth.apply(cfg)
 	}
 	p.Collect.apply(cfg)
 	p.Download.apply(cfg)
 	p.Cover.apply(cfg)
 	p.FFmpeg.apply(cfg)
+	p.Auth.apply(cfg)
 	if a := p.Advanced; a != nil && a.Cover != nil {
 		a.Cover.apply(cfg)
 	}

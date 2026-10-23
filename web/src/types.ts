@@ -10,11 +10,6 @@ export interface Source {
   remark: string
   created_at: string
   updated_at: string
-  /** 以下统计由 /api/sources 一并返回（30 秒缓存） */
-  videos?: number
-  names?: number
-  plays?: number
-  last_update?: string
 }
 
 export interface SourceTest {
@@ -95,6 +90,27 @@ export interface SyncLog {
   error: string
   /** 本次新增/更新的影片明细条数（明细最多保存 500 条） */
   items_count: number
+}
+
+/** 同步记录分页结果（GET /api/sources/{id}/sync-logs?page=&page_size=） */
+export interface SyncLogPage {
+  /** 该来源累计的同步记录总数（最多保留 100 条） */
+  total: number
+  /** 当前页（越界时后端会回退到最后一页） */
+  page: number
+  page_size: number
+  /** 当前页记录（新的在前） */
+  items: SyncLog[]
+}
+
+/** 定时增量任务状态（GET /api/scheduler） */
+export interface SchedulerInfo {
+  enabled: boolean
+  /** 采集间隔（秒） */
+  interval_sec: number
+  /** 下次触发时间（unix 秒），0 = 未知 */
+  next_run_unix: number
+  next_run?: string
 }
 
 export interface VideoItem {
@@ -365,6 +381,8 @@ export interface ConfigData {
   download: { workers: number; seg_concurrency: number; seg_budget: number; min_free_mb: number }
   cover: { workers: number; concurrency: number; img_proxy: string }
   ffmpeg: { threads: number; reencode: boolean; verify: boolean }
+  /** 访问密码（存在 ui.yml；留空 = 不启用）：启用后站点要登录，接口要带密码 */
+  auth: { password: string }
   db: { cache_mb: number; mmap_mb: number; conns: number; page_size: number; vacuum_pct: number }
 }
 

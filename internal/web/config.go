@@ -15,7 +15,7 @@ import (
 	"videoDownLoad/internal/config"
 )
 
-// uiPath 页面配置（采集 / 下载 / 封面 / ffmpeg）存放位置：数据目录下的 ui.yml
+// uiPath 页面配置（采集 / 下载 / 封面 / ffmpeg / 访问密码）存放位置：数据目录下的 ui.yml
 func (s *Server) uiPath() string { return config.UIFilePath(s.DataDir) }
 
 // configInfo 读取当前配置（给「信息」页的表单用）。
@@ -98,9 +98,9 @@ type configBody struct {
 	Config json.RawMessage `json:"config"`
 }
 
-// hotSections 保存即生效（写在 ui.yml）的分组：采集 / 下载 / 封面 / 合并转码。
+// hotSections 保存即生效（写在 ui.yml）的分组：采集 / 下载 / 封面 / 合并转码 / 访问密码。
 // 其余项（server、data_dir、log_level、lowmem、内存、数据库）留在 config.yml，改了要重启。
-var hotSections = map[string]bool{"collect": true, "download": true, "cover": true, "ffmpeg": true}
+var hotSections = map[string]bool{"collect": true, "download": true, "cover": true, "ffmpeg": true, "auth": true}
 
 // saveConfig 保存配置（PUT /api/config）。
 // 表单只提交「保存即生效」的分组 → 写进 ui.yml 并立刻热应用，config.yml 不动；
@@ -188,6 +188,17 @@ func (s *Server) saveConfig(w http.ResponseWriter, r *http.Request) {
 	if s.HotApply != nil {
 		applied = s.HotApply(cfg)
 	}
+	// 访问密码：保存后立即生效（不用重启）。
+	// 同时给当前浏览器续上 / 清除 Cookie：刚设完密码就把自己锁在门外很难受，
+	// 而关闭密码后旧 Cookie 留着也没意义。
+	s.SetAccessPassword(cfg.Auth.Password)
+	if cfg.Auth.Password != "" {
+		s.issueAuthCookie(w, r)
+	} else {
+		s.clearAuthCookie(w)
+	}
+	// auth 也是保存即生效的一组（没有可重启的分组时 applied 可能为空，这里如实补上）
+	applied = append(applied, "auth")
 
 	msg := "已保存并立即生效（写在数据目录的 ui.yml）"
 	if needStart {
@@ -236,7 +247,7 @@ func (s *Server) liveConfig() *config.Config {
 	return cfg
 }
 
-// writeUIFile 把页面可改的四段写进 <数据目录>/ui.yml（旧的备份为 ui.yml.bak）
+// writeUIFile 把页面可改的几段写进 <数据目录>/ui.yml（旧的备份为 ui.yml.bak）
 func (s *Server) writeUIFile(cfg *config.Config) error {
 	if strings.TrimSpace(s.DataDir) == "" {
 		return errNoDataDir

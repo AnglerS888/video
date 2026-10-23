@@ -16,6 +16,7 @@ import (
 	"videoDownLoad/internal/collector"
 	"videoDownLoad/internal/config"
 	"videoDownLoad/internal/logx"
+	"videoDownLoad/internal/scheduler"
 	"videoDownLoad/internal/updater"
 )
 
@@ -40,6 +41,13 @@ type Server struct {
 	HotApply func(cfg *config.Config) []string
 	// Up 在线更新器（检查/下载/编译/重启）
 	Up *updater.Updater
+	// Sch 定时增量任务（来源页显示「下次自动采集倒计时」）
+	Sch *scheduler.Scheduler
+
+	// 访问密码（信息页 → 运行配置，存数据目录的 ui.yml；SetAccessPassword 热更新）。
+	// 空串 = 不启用：站点与接口都不需要密码。
+	authMu  sync.RWMutex
+	authPwd string
 
 	listMu    sync.Mutex
 	listCache map[string]listCacheItem
@@ -243,22 +251,6 @@ func maskAbsPaths(msg string) string {
 		return "…" + tail
 	})
 }
-
-// ---- 接口管理 ----
-
-// srcStat 单个采集接口的数据规模
-type srcStat struct {
-	videos int64
-	names  int64
-	plays  int64
-	last   string
-}
-
-var (
-	srcStatMu    sync.Mutex
-	srcStatCache map[int64]srcStat
-	srcStatExp   time.Time
-)
 
 // imageContentType 按魔数判断图片类型，认不出时按 jpeg 处理
 func imageContentType(b []byte) string {

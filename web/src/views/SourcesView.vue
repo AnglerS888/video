@@ -6,7 +6,7 @@ import { toast } from '../toast'
 import type { Source, SourceProgress, SourceTest, SyncLog, SyncLogItem } from '../types'
 
 /**
- * 来源管理：添加（只填域名）+ 列表（数据量 / 连通性 / 采集进度）。
+ * 来源管理：添加（只填域名）+ 列表（连通性 / 采集进度 / 排队状态 / 同步记录）。
  * 列表默认只读展示，点「编辑」才进编辑态 —— 避免在输入框里误改后忘记保存。
  */
 const list = ref<Source[]>([])
@@ -17,10 +17,17 @@ const testing = reactive<Record<number, boolean>>({})
 const logs = reactive<Record<number, SyncLog[] | undefined>>({})
 const logsOpen = reactive<Record<number, boolean>>({})
 const logsLoading = reactive<Record<number, boolean>>({})
+// 同步记录分页：每页 10 条（后端最多保留 100 条/来源），页码与总数按来源分别记录
+const LOG_PAGE_SIZE = 10
+const logPage = reactive<Record<number, number>>({})
+const logTotal = reactive<Record<number, number>>({})
 // 单条记录的影片明细：默认不加载，点开某条记录时按需拉取（最多 500 条）
 const logItems = reactive<Record<number, SyncLogItem[] | undefined>>({})
 const logItemsOpen = reactive<Record<number, boolean>>({})
 const logItemsLoading = reactive<Record<number, boolean>>({})
+// 定时增量任务状态：间隔与下一次触发时间（由 /api/scheduler 轮询）
+const sched = reactive({ enabled: false, interval_sec: 0, next_run_unix: 0 })
+const nowMs = ref(Date.now())
 // 上一次轮询时正在采集的来源：用来在增量刚跑完时自动刷新已展开的记录面板
 const wasRunning = new Set<number>()
 const editing = reactive<Record<number, { name: string; url: string }>>({})
@@ -33,17 +40,43 @@ const probe = ref<SourceTest | null>(null)
 const probeURL = ref('')
 const q = ref('')
 let timer: number | undefined
+let schedTimer: number | undefined
+let tickTimer: number | undefined
 
 const phaseText: Record<string, string> = {
-  pending: '排队中', running: '采集中', stopping: '停止中…', stopped: '已停止',
+  pending: '排队中', queued: '排队中', running: '采集中', stopping: '停止中…', stopped: '已停止',
   done: '已完成', warning: '完成（有警告）', failed: '失败',
 }
 
 const anyRunning = computed(() => Object.values(progress.value).some((p) => p.running))
+// 排队等待采集的来源数（超过「同时采集的接口数」时会排队，采完一个自动接下一个）
+const queuedCount = computed(() => Object.values(progress.value).filter((p) => !p.running && p.phase === 'queued').length)
 const enabledCount = computed(() => list.value.filter((s) => s.enabled === 1).length)
-const totalVideos = computed(() => list.value.reduce((n, s) => n + (s.videos || 0), 0))
 // 会参与定时增量任务的来源数（启用 + 自动增量都打开）
 const autoIncrCount = computed(() => list.value.filter((s) => s.enabled === 1 && s.auto_incr === 1).length)
+
+// 采集间隔文案（10 秒 / 30 分钟 / 1 小时）
+const schedIntervalText = computed(() => {
+  const sec = sched.interval_sec
+  if (!sec) return ''
+  if (sec % 3600 === 0) return `${sec / 3600} 小时`
+  if (sec % 60 === 0) return `${sec / 60} 分钟`
+  return `${sec} 秒`
+})
+
+// 下次自动采集倒计时：本地每秒刷新，触发时间由后端提供
+const countdown = computed(() => {
+  if (!sched.enabled || !sched.next_run_unix) return ''
+  const left = sched.next_run_unix * 1000 - nowMs.value
+  if (left <= 0) return '即将开始'
+  const s = Math.round(left / 1000)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  const mm = String(m).padStart(2, '0')
+  const ss = String(sec).padStart(2, '0')
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`
+})
 
 const filtered = computed(() => {
   const kw = q.value.trim().toLowerCase()
@@ -61,11 +94,6 @@ function hostOf(s: Source): string {
 
 function num(n?: number): string {
   return (n || 0).toLocaleString('zh-CN')
-}
-
-// 后端时间戳是 SQLite CURRENT_TIMESTAMP（UTC），这里只做展示截断
-function when(v?: string): string {
-  return v && v.length >= 16 ? v.slice(5, 16) : '—'
 }
 
 const logStatusText: Record<string, string> = {
@@ -105,13 +133,37 @@ function srcTime(v?: string): string {
 
 async function loadLogs(id: number) {
   logsLoading[id] = true
-  const r = await api.syncLogs(id, 20)
+  const page = logPage[id] || 1
+  const r = await api.syncLogs(id, page, LOG_PAGE_SIZE)
   logsLoading[id] = false
-  if (!r.ok) {
+  if (!r.ok || !r.data) {
     toast(r.msg || '同步记录读取失败', 'err', 2400)
     return
   }
-  logs[id] = r.data || []
+  logs[id] = r.data.items || []
+  logTotal[id] = r.data.total || 0
+  // 后端在页码越界时会回退到最后一页，这里同步过来
+  if (r.data.page && r.data.page !== page) logPage[id] = r.data.page
+}
+
+// 同步记录总页数（每页 LOG_PAGE_SIZE 条，最少 1 页）
+function logPages(id: number): number {
+  return Math.max(1, Math.ceil((logTotal[id] || 0) / LOG_PAGE_SIZE))
+}
+
+async function gotoLogPage(id: number, p: number) {
+  const next = Math.min(logPages(id), Math.max(1, p))
+  if (next === (logPage[id] || 1)) return
+  logPage[id] = next
+  await loadLogs(id)
+}
+
+async function loadSched() {
+  const r = await api.scheduler()
+  if (!r.ok || !r.data) return
+  sched.enabled = !!r.data.enabled
+  sched.interval_sec = r.data.interval_sec || 0
+  sched.next_run_unix = r.data.next_run_unix || 0
 }
 
 async function toggleLogs(s: Source) {
@@ -159,6 +211,8 @@ async function loadProgress() {
       loadLogs(p.source_id)
     }
   }
+  // 开始了一轮新的采集（可能是定时任务）→ 刷新下次触发时间
+  if (nowRunning.size > 0 && wasRunning.size === 0) loadSched()
   wasRunning.clear()
   for (const id of nowRunning) wasRunning.add(id)
   progress.value = m
@@ -250,10 +304,9 @@ async function toggleAutoIncr(s: Source) {
 }
 
 async function remove(s: Source) {
-  const detail = s.videos ? `该来源现有 ${num(s.videos)} 部影片、${num(s.plays)} 条播放地址，` : '该来源还没有采集数据，'
   const okc = await confirmDialog({
     title: '删除来源',
-    message: `删除来源「${s.name}」？\n\n${detail}删除后会一并清空：\n` +
+    message: `删除来源「${s.name}」？\n\n删除后会一并清空：\n` +
       `· 影片记录、播放地址\n· 下载记录与已下载文件\n· 封面缓存\n· 采集断点与增量同步记录\n\n该操作不可恢复。`,
     okText: '删除',
     danger: true,
@@ -358,10 +411,16 @@ async function stopAll() {
 onMounted(async () => {
   await load()
   await loadProgress()
+  await loadSched()
   timer = window.setInterval(loadProgress, 3000)
+  schedTimer = window.setInterval(loadSched, 10000)
+  // 倒计时每秒走一格（只算本地剩余时间，不打接口）
+  tickTimer = window.setInterval(() => { nowMs.value = Date.now() }, 1000)
 })
 onBeforeUnmount(() => {
   if (timer) window.clearInterval(timer)
+  if (schedTimer) window.clearInterval(schedTimer)
+  if (tickTimer) window.clearInterval(tickTimer)
 })
 </script>
 
@@ -428,14 +487,19 @@ onBeforeUnmount(() => {
       <div class="flex flex-wrap items-center gap-2">
         <span class="title">来源列表</span>
         <span class="chip">{{ list.length }} 个 · 启用 {{ enabledCount }}</span>
-        <span class="chip">共 {{ num(totalVideos) }} 部影片</span>
         <span
           v-if="enabledCount > 0"
           class="chip"
           :class="autoIncrCount < enabledCount ? 'chip-on' : ''"
           :title="`定时增量任务会采集 ${autoIncrCount} 个来源（启用 ${enabledCount} 个）`"
         >自动增量 {{ autoIncrCount }}/{{ enabledCount }}</span>
+        <span
+          v-if="autoIncrCount > 0 && sched.enabled && countdown"
+          class="chip"
+          :title="`定时任务每 ${schedIntervalText}自动采集一次（启用且打开自动增量的来源）`"
+        >下次自动采集 <b class="font-semibold tabular-nums">{{ countdown }}</b></span>
         <span v-if="anyRunning" class="chip chip-on">采集进行中…</span>
+        <span v-if="queuedCount > 0" class="chip">排队中 {{ queuedCount }}</span>
 
         <div class="relative ml-auto w-full sm:w-64">
           <svg viewBox="0 0 24 24" class="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" fill="none" stroke="currentColor" stroke-width="2">
@@ -451,7 +515,7 @@ onBeforeUnmount(() => {
         </button>
         <button class="btn btn-ghost btn-sm" @click="collectAll(false)">全部增量</button>
         <button class="btn btn-ghost btn-sm" @click="collectAll(true)">全部全量</button>
-        <button v-if="anyRunning" class="btn btn-warn btn-sm" @click="stopAll">停止全部采集</button>
+        <button v-if="anyRunning || queuedCount > 0" class="btn btn-warn btn-sm" @click="stopAll">停止全部采集</button>
         <!-- 换机/重装迁移：导出 JSON，导入时按地址去重 -->
         <button class="btn btn-ghost btn-sm" :disabled="!list.length" @click="api.exportSources()">导出</button>
         <button class="btn btn-ghost btn-sm" :disabled="importing" @click="importInput?.click()">
@@ -493,10 +557,11 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-slate-500 dark:text-slate-400">
-              <span>影片 <b class="font-semibold text-slate-700 dark:text-slate-200">{{ num(s.videos) }}</b></span>
-              <span>剧名 <b class="font-semibold text-slate-700 dark:text-slate-200">{{ num(s.names) }}</b></span>
-              <span>播放地址 <b class="font-semibold text-slate-700 dark:text-slate-200">{{ num(s.plays) }}</b></span>
-              <span>最后更新 {{ when(s.last_update) }}</span>
+              <span
+                v-if="s.enabled === 1 && autoOn(s) && sched.enabled"
+                class="text-sky-600 dark:text-sky-400"
+                :title="`定时任务每 ${schedIntervalText}自动采集一次`"
+              >下次自动 {{ countdown || '—' }}</span>
             </div>
             <div class="mt-0.5 hidden truncate text-[11px] text-slate-400 sm:block" :title="s.api_url">{{ s.api_url }}</div>
           </div>
@@ -521,12 +586,12 @@ onBeforeUnmount(() => {
           </button>
           <button
             class="btn btn-primary btn-sm"
-            :disabled="progress[s.id]?.running"
+            :disabled="progress[s.id]?.running || progress[s.id]?.phase === 'queued'"
             @click="collect(s, true)"
           >全量采集</button>
           <button
             class="btn btn-ghost btn-sm"
-            :disabled="progress[s.id]?.running"
+            :disabled="progress[s.id]?.running || progress[s.id]?.phase === 'queued'"
             @click="collect(s, false)"
           >增量采集</button>
           <button
@@ -556,6 +621,12 @@ onBeforeUnmount(() => {
             :disabled="progress[s.id]?.phase === 'stopping'"
             @click="stop(s)"
           >{{ progress[s.id]?.phase === 'stopping' ? '停止中…' : '停止采集' }}</button>
+          <button
+            v-else-if="progress[s.id]?.phase === 'queued'"
+            class="btn btn-ghost btn-sm"
+            title="从排队中移除，不会再自动开始采集"
+            @click="stop(s)"
+          >取消排队</button>
 
           <template v-if="editing[s.id]">
             <button class="btn btn-ghost btn-sm" @click="save(s)">保存</button>
@@ -612,17 +683,18 @@ onBeforeUnmount(() => {
             >
               {{ phaseText[progress[s.id].phase] || progress[s.id].phase }}
             </span>
-            <span class="text-slate-400">
+            <span v-if="progress[s.id].phase !== 'queued'" class="text-slate-400">
               页 {{ progress[s.id].page }}/{{ progress[s.id].page_count || '?' }}
               · 取得 {{ num(progress[s.id].fetched) }}
               · 新增 {{ num(progress[s.id].added) }}
               · 更新 {{ num(progress[s.id].updated) }}
             </span>
+            <span v-else class="text-slate-400">等待前面的来源采完，会自动开始</span>
             <span v-if="progress[s.id].running" class="ml-auto text-[11px] text-slate-400">
               {{ progress[s.id].mode === 'full' ? '全量' : '增量' }}
             </span>
           </div>
-          <div class="mt-1.5">
+          <div v-if="progress[s.id].phase !== 'queued'" class="mt-1.5">
             <div class="bar">
               <i :style="{ width: (progress[s.id].page_count ? Math.min(100, Math.round(progress[s.id].page * 100 / progress[s.id].page_count)) : (progress[s.id].running ? 30 : 100)) + '%' }"></i>
             </div>
@@ -633,11 +705,12 @@ onBeforeUnmount(() => {
           </p>
         </div>
 
-        <!-- 增量同步记录：每次手动/定时增量一条汇总（新的在前） -->
+        <!-- 增量同步记录：每次手动/定时增量一条汇总（新的在前），分页展示 -->
         <div v-if="logsOpen[s.id]" class="mt-2 rounded-xl bg-slate-50 px-2.5 py-2 text-xs dark:bg-white/5">
           <div class="flex flex-wrap items-center gap-2">
             <span class="font-medium">同步记录</span>
-            <span class="chip">仅增量 · 保留最近 {{ (logs[s.id] || []).length }} 条</span>
+            <span class="chip" title="每个来源最多保留 100 条">仅增量 · 共 {{ num(logTotal[s.id]) }} 条</span>
+            <span v-if="logPages(s.id) > 1" class="chip">第 {{ logPage[s.id] || 1 }}/{{ logPages(s.id) }} 页</span>
             <button class="btn btn-ghost btn-sm ml-auto" :disabled="logsLoading[s.id]" @click="loadLogs(s.id)">
               {{ logsLoading[s.id] ? '刷新中…' : '刷新' }}
             </button>
@@ -648,54 +721,76 @@ onBeforeUnmount(() => {
           <p v-else-if="!logs[s.id]?.length" class="mt-1.5 text-slate-400">
             还没有同步记录：点「增量采集」或等定时任务跑一次（全量采集不记录）。
           </p>
-          <ul v-else class="mt-1.5 space-y-1.5">
-            <li
-              v-for="g in logs[s.id]" :key="g.id"
-              class="border-t border-slate-100 pt-1.5 first:border-0 first:pt-0 dark:border-white/5"
-            >
-              <div class="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-                <span class="tabular-nums text-slate-400">{{ logTime(g.started_at) }}</span>
-                <span class="chip">{{ g.trigger === 'auto' ? '自动增量' : '手动增量' }}</span>
-                <span class="font-medium" :class="logStatusClass(g.status)">{{ logStatusText[g.status] || g.status }}</span>
-                <span class="text-slate-500 dark:text-slate-400">
-                  抓取 {{ num(g.fetched) }} · 新增 {{ num(g.added) }} · 更新 {{ num(g.updated) }} · 耗时 {{ logDur(g.duration_ms) }}
-                </span>
+          <template v-else>
+            <ul class="mt-1 divide-y divide-slate-100 dark:divide-white/5">
+              <li v-for="g in logs[s.id]" :key="g.id" class="py-1.5 first:pt-0 last:pb-0">
+                <div class="flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span class="shrink-0 tabular-nums text-slate-400">{{ logTime(g.started_at) }}</span>
+                  <span class="shrink-0 rounded bg-slate-200/70 px-1 text-[10px] text-slate-500 dark:bg-white/10 dark:text-slate-300">
+                    {{ g.trigger === 'auto' ? '自动' : '手动' }}
+                  </span>
+                  <span class="shrink-0 font-medium" :class="logStatusClass(g.status)">{{ logStatusText[g.status] || g.status }}</span>
+                  <span class="text-slate-500 dark:text-slate-400">
+                    抓取 <b class="font-medium text-slate-700 dark:text-slate-200">{{ num(g.fetched) }}</b>
+                    · 新增 <b class="font-medium text-emerald-600 dark:text-emerald-400">{{ num(g.added) }}</b>
+                    · 更新 <b class="font-medium text-amber-600 dark:text-amber-400">{{ num(g.updated) }}</b>
+                    · 耗时 {{ logDur(g.duration_ms) }}
+                  </span>
+                  <button
+                    v-if="g.items_count > 0"
+                    class="ml-auto shrink-0 text-[11px] text-sky-600 hover:underline dark:text-sky-400"
+                    @click="toggleLogItems(s, g)"
+                  >{{ logItemsOpen[g.id] ? '收起影片' : `影片 ${num(g.items_count)} 部` }}</button>
+                </div>
+                <p v-if="g.error" class="mt-0.5 break-all text-rose-500">{{ g.error }}</p>
+                <!-- 本次新增/更新的影片明细（点开才加载） -->
+                <div v-if="logItemsOpen[g.id]" class="mt-1 rounded-lg bg-white px-2 py-1 dark:bg-black/20">
+                  <p v-if="logItemsLoading[g.id]" class="text-slate-400">加载中…</p>
+                  <template v-else>
+                    <div
+                      v-for="it in logItems[g.id] || []" :key="it.action + '-' + it.vod_id"
+                      class="flex flex-wrap items-baseline gap-x-1.5 border-b border-slate-100 py-0.5 last:border-0 dark:border-white/5"
+                    >
+                      <span
+                        class="rounded px-1 text-[10px]"
+                        :class="it.action === 'new'
+                          ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                          : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'"
+                      >{{ it.action === 'new' ? '新增' : '更新' }}</span>
+                      <span class="min-w-0 truncate font-medium">{{ it.name }}</span>
+                      <span v-if="it.remarks" class="truncate text-slate-400">{{ it.remarks }}</span>
+                      <span v-if="it.src_time" class="ml-auto shrink-0 tabular-nums text-slate-400">源站更新 {{ srcTime(it.src_time) }}</span>
+                    </div>
+                    <p v-if="logItems[g.id]?.length === 0" class="text-slate-400">本次没有新增或更新的影片</p>
+                    <p v-if="g.added + g.updated > (logItems[g.id] || []).length" class="pt-0.5 text-slate-400">
+                      仅显示前 {{ (logItems[g.id] || []).length }} 部，本次共 {{ num(g.added + g.updated) }} 部
+                    </p>
+                  </template>
+                </div>
+              </li>
+            </ul>
+            <!-- 分页：每页 10 条，记录多了在面板内翻页 -->
+            <div class="mt-1.5 flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-1.5 dark:border-white/5">
+              <span class="text-[11px] text-slate-400">
+                第 {{ logPage[s.id] || 1 }} / {{ logPages(s.id) }} 页 · 共 {{ num(logTotal[s.id]) }} 条
+              </span>
+              <div class="flex items-center gap-1">
                 <button
-                  v-if="g.items_count > 0"
-                  class="ml-auto text-[11px] text-sky-600 hover:underline dark:text-sky-400"
-                  @click="toggleLogItems(s, g)"
-                >{{ logItemsOpen[g.id] ? '收起影片' : `影片 ${num(g.items_count)} 部` }}</button>
+                  class="btn btn-ghost btn-sm"
+                  :disabled="(logPage[s.id] || 1) <= 1 || logsLoading[s.id]"
+                  @click="gotoLogPage(s.id, (logPage[s.id] || 1) - 1)"
+                >上一页</button>
+                <button
+                  class="btn btn-ghost btn-sm"
+                  :disabled="(logPage[s.id] || 1) >= logPages(s.id) || logsLoading[s.id]"
+                  @click="gotoLogPage(s.id, (logPage[s.id] || 1) + 1)"
+                >下一页</button>
               </div>
-              <p v-if="g.error" class="break-all text-rose-500">{{ g.error }}</p>
-              <!-- 本次新增/更新的影片明细（点开才加载） -->
-              <div v-if="logItemsOpen[g.id]" class="mt-1 rounded-lg bg-white px-2 py-1 dark:bg-black/20">
-                <p v-if="logItemsLoading[g.id]" class="text-slate-400">加载中…</p>
-                <template v-else>
-                  <div
-                    v-for="it in logItems[g.id] || []" :key="it.action + '-' + it.vod_id"
-                    class="flex flex-wrap items-baseline gap-x-1.5 border-b border-slate-100 py-0.5 last:border-0 dark:border-white/5"
-                  >
-                    <span
-                      class="rounded px-1 text-[10px]"
-                      :class="it.action === 'new'
-                        ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
-                        : 'bg-amber-500/15 text-amber-600 dark:text-amber-400'"
-                    >{{ it.action === 'new' ? '新增' : '更新' }}</span>
-                    <span class="min-w-0 truncate font-medium">{{ it.name }}</span>
-                    <span v-if="it.remarks" class="truncate text-slate-400">{{ it.remarks }}</span>
-                    <span v-if="it.src_time" class="ml-auto shrink-0 tabular-nums text-slate-400">源站更新 {{ srcTime(it.src_time) }}</span>
-                  </div>
-                  <p v-if="logItems[g.id]?.length === 0" class="text-slate-400">本次没有新增或更新的影片</p>
-                  <p v-if="g.added + g.updated > (logItems[g.id] || []).length" class="pt-0.5 text-slate-400">
-                    仅显示前 {{ (logItems[g.id] || []).length }} 部，本次共 {{ num(g.added + g.updated) }} 部
-                  </p>
-                </template>
-              </div>
-            </li>
-          </ul>
-          <p v-if="logs[s.id]?.length" class="mt-1 text-[11px] text-slate-400">
-            点记录里的「影片 N 部」可看本次新增/更新的影片与源站更新时间。
-          </p>
+            </div>
+            <p class="mt-1 text-[11px] text-slate-400">
+              点记录里的「影片 N 部」可看本次新增/更新的影片与源站更新时间。
+            </p>
+          </template>
         </div>
       </div>
     </section>

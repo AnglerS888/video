@@ -18,61 +18,12 @@ import (
 	"videoDownLoad/internal/netguard"
 )
 
-// invalidateSourceStats 接口增删改后清缓存，避免统计数字滞后
-func invalidateSourceStats() {
-	srcStatMu.Lock()
-	srcStatCache, srcStatExp = nil, time.Time{}
-	srcStatMu.Unlock()
-}
-
-// sourceStats 统计每个接口的数据量。
-// 影片/剧名/最后更新走 vod_info 的 (source_id, ...) 索引，很快；
-// 播放地址数要遍历 vod_play（449 万行，走 vod_id 主键前缀，无 source_id 冗余列），
-// 弱 CPU 上要秒级 —— 所以整体缓存 10 分钟，且接口增删改时主动失效。
-func (s *Server) sourceStats() map[int64]srcStat {
-	srcStatMu.Lock()
-	if srcStatCache != nil && time.Now().Before(srcStatExp) {
-		c := srcStatCache
-		srcStatMu.Unlock()
-		return c
-	}
-	srcStatMu.Unlock()
-
-	out := map[int64]srcStat{}
-	if rows, err := s.DB.Query(`SELECT source_id, COUNT(*), COUNT(DISTINCT vod_name),
-		COALESCE(MAX(updated_at),'') FROM vod_info GROUP BY source_id`); err == nil {
-		for rows.Next() {
-			var id int64
-			var st srcStat
-			if rows.Scan(&id, &st.videos, &st.names, &st.last) == nil {
-				out[id] = st
-			}
-		}
-		rows.Close()
-	}
-	if rows, err := s.DB.Query(`SELECT v.source_id, COUNT(*)
-		FROM vod_info v JOIN vod_play p ON p.vod_id=v.id GROUP BY v.source_id`); err == nil {
-		for rows.Next() {
-			var id, n int64
-			if rows.Scan(&id, &n) == nil {
-				st := out[id]
-				st.plays = n
-				out[id] = st
-			}
-		}
-		rows.Close()
-	}
-	srcStatMu.Lock()
-	srcStatCache, srcStatExp = out, time.Now().Add(10*time.Minute)
-	srcStatMu.Unlock()
-	return out
-}
-
+// listSources 来源列表。
+//
+// 故意不返回每个来源的影片数 / 剧名数 / 播放地址数：统计播放地址要扫 vod_play
+// （百万行级），大库下每次打开来源页都要秒级耗时，页面也因一堆大数字变卡。
+// 需要总量看「网站信息」页（/api/sysinfo 有缓存）。
 func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
-	// 必须先算统计再开 rows：持有 rows 时同一条连接上再发查询会阻塞，
-	// rows 没遍历完就发新查询会永远等不到连接（表现为接口卡死、页面打不开）。
-	// 统计结果有 30 秒缓存，放前面不增加开销。
-	stats := s.sourceStats()
 	rows, err := s.DB.Query(`SELECT id, name, api_url, enabled, auto_incr, remark, created_at, updated_at
 		FROM vod_source ORDER BY id`)
 	if err != nil {
@@ -85,11 +36,9 @@ func (s *Server) listSources(w http.ResponseWriter, r *http.Request) {
 		var id, en, ai int64
 		var name, url, remark, ca, ua string
 		rows.Scan(&id, &name, &url, &en, &ai, &remark, &ca, &ua)
-		st := stats[id]
 		out = append(out, map[string]any{"id": id, "name": name, "api_url": url, "enabled": en,
 			"auto_incr": ai,
-			"videos":    st.videos, "names": st.names, "plays": st.plays, "last_update": st.last,
-			"remark": remark, "created_at": ca, "updated_at": ua})
+			"remark":    remark, "created_at": ca, "updated_at": ua})
 	}
 	ok(w, out)
 }
@@ -399,9 +348,14 @@ func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
 		fail(w, "接口不存在（可能已被删除）")
 		return
 	}
-	// 采集中的接口不能删：爬虫还会继续写库，删完又冒出来
+	// 采集中的接口不能删：爬虫还会继续写库，删完又冒出来。
+	// 排队中的也一样：马上就会开始采，得先取消排队（接口页点「取消排队」）。
 	if collector.GlobalProgress.IsRunning(id) {
 		fail(w, "该接口正在采集中，请等采集结束或先停用后再删除")
+		return
+	}
+	if s.Col.IsQueued(id) {
+		fail(w, "该接口正在排队等待采集，请先取消排队再删除")
 		return
 	}
 
@@ -489,7 +443,6 @@ func (s *Server) deleteSource(w http.ResponseWriter, r *http.Request) {
 	phase("删除数据库记录", tTx)
 
 	s.invalidateListCache()
-	invalidateSourceStats()
 	s.srcMu.Lock()
 	s.srcNameCache = nil
 	s.srcMu.Unlock()
@@ -581,7 +534,22 @@ func (s *Server) testSource(w http.ResponseWriter, r *http.Request) {
 	ok(w, s.Col.Test(id))
 }
 
-// syncLogs 返回某个接口最近的增量同步记录（新的在前）。
+// schedulerInfo 定时增量任务状态：间隔与下一次触发时间（来源页显示倒计时用）。
+// 没注入调度器（测试/精简启动）时返回 enabled=false。
+func (s *Server) schedulerInfo(w http.ResponseWriter, r *http.Request) {
+	resp := map[string]any{"enabled": false, "interval_sec": 0, "next_run_unix": 0, "next_run": ""}
+	if s.Sch != nil {
+		resp["enabled"] = true
+		resp["interval_sec"] = int64(s.Sch.Interval().Seconds())
+		if next := s.Sch.Next(); !next.IsZero() {
+			resp["next_run_unix"] = next.Unix()
+			resp["next_run"] = next.UTC().Format(time.RFC3339)
+		}
+	}
+	ok(w, resp)
+}
+
+// syncLogs 分页返回某个接口的增量同步记录（新的在前），总数一并返回供页面翻页。
 // 只记录增量采集；全量采集不写记录。每个接口最多保留 100 条（写入时清理）。
 func (s *Server) syncLogs(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseInt(r.PathValue("id"), 10, 64)
@@ -589,16 +557,35 @@ func (s *Server) syncLogs(w http.ResponseWriter, r *http.Request) {
 		fail(w, "参数错误")
 		return
 	}
-	limit := 20
-	if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 {
-		limit = v
+	page, size := 1, 10
+	if v, err := strconv.Atoi(r.URL.Query().Get("page")); err == nil && v > 0 {
+		page = v
 	}
-	if limit > 100 {
-		limit = 100
+	if v, err := strconv.Atoi(r.URL.Query().Get("page_size")); err == nil && v > 0 {
+		size = v
+	} else if v, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && v > 0 {
+		size = v // 兼容旧参数
+	}
+	if size > 100 {
+		size = 100
+	}
+	var total int64
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM vod_sync_log WHERE source_id=?`, id).Scan(&total); err != nil {
+		fail(w, publicErr(err))
+		return
+	}
+	// 页码越界时回退到最后一页：记录会被自动清理，旧链接可能已经超出范围
+	lastPage := int((total + int64(size) - 1) / int64(size))
+	if lastPage < 1 {
+		lastPage = 1
+	}
+	if page > lastPage {
+		page = lastPage
 	}
 	rows, err := s.DB.Query(`SELECT id, source_id, trigger_type, started_at, finished_at,
 		duration_ms, fetched, added, updated, details, status, error, items
-		FROM vod_sync_log WHERE source_id=? ORDER BY id DESC LIMIT ?`, id, limit)
+		FROM vod_sync_log WHERE source_id=? ORDER BY id DESC LIMIT ? OFFSET ?`,
+		id, size, (page-1)*size)
 	if err != nil {
 		fail(w, publicErr(err))
 		return
@@ -612,7 +599,7 @@ func (s *Server) syncLogs(w http.ResponseWriter, r *http.Request) {
 			&fetched, &added, &updated, &details, &status, &msg, &itemsRaw) != nil {
 			continue
 		}
-		// 列表只给明细条数，具体影片按需走 syncLogDetail 加载（避免 20 条 × 500 部一次传太大）
+		// 列表只给明细条数，具体影片按需走 syncLogDetail 加载（避免整页 × 500 部一次传太大）
 		itemCount := 0
 		if itemsRaw != "" {
 			var list []collector.SyncItem
@@ -627,7 +614,7 @@ func (s *Server) syncLogs(w http.ResponseWriter, r *http.Request) {
 			"status": status, "error": msg, "items_count": itemCount,
 		})
 	}
-	ok(w, out)
+	ok(w, map[string]any{"total": total, "page": page, "page_size": size, "items": out})
 }
 
 // syncLogDetail 单条同步记录的影片明细（哪部片新增/更新、源站更新时间）。
@@ -762,7 +749,6 @@ func (s *Server) importSources(w http.ResponseWriter, r *http.Request) {
 		added++
 	}
 	if added > 0 {
-		invalidateSourceStats()
 		s.srcMu.Lock()
 		s.srcNameCache = nil
 		s.srcMu.Unlock()

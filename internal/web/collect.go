@@ -31,8 +31,8 @@ func (s *Server) collectFull(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	restart := r.URL.Query().Get("restart") == "1"
-	started, skipped := s.Col.RunFull(srcs, restart)
-	if started == 0 {
+	started, queued, skipped := s.Col.RunFull(srcs, restart)
+	if started+queued == 0 {
 		fail(w, "已在采集中："+strings.Join(skipped, "、"))
 		return
 	}
@@ -40,6 +40,7 @@ func (s *Server) collectFull(w http.ResponseWriter, r *http.Request) {
 	if restart {
 		msg = fmt.Sprintf("已从头启动 %d 个接口的全量采集", started)
 	}
+	msg += queuedMsg(queued, s.Col.SourceWorkersCount())
 	if len(skipped) > 0 {
 		msg += "；跳过：" + strings.Join(skipped, "、")
 	}
@@ -53,24 +54,34 @@ func (s *Server) collectIncr(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 手动增量：不限页数（仍按 24 小时过滤）；定时任务才限制前 5 页
-	started, skipped := s.Col.RunIncremental(srcs, 0, "manual")
-	if started == 0 {
+	started, queued, skipped := s.Col.RunIncremental(srcs, 0, "manual")
+	if started+queued == 0 {
 		fail(w, "已在采集中："+strings.Join(skipped, "、"))
 		return
 	}
 	msg := fmt.Sprintf("已启动 %d 个接口的增量采集", started)
+	msg += queuedMsg(queued, s.Col.SourceWorkersCount())
 	if len(skipped) > 0 {
 		msg += "；跳过：" + strings.Join(skipped, "、")
 	}
 	ok(w, msg)
 }
 
+// queuedMsg 超过同时采集上限时，说明其余接口会排队逐个采集（而不是被跳过）
+func queuedMsg(queued, limit int) string {
+	if queued <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("，%d 个排队中（同时采集上限 %d 个，采完自动接上）", queued, limit)
+}
+
 func (s *Server) progress(w http.ResponseWriter, r *http.Request) {
 	ok(w, collector.GlobalProgress.Snapshot())
 }
 
-// stopCollect 停止采集：?source_id=N 只停该接口，不传则停掉全部正在采集的接口。
-// 只是发信号，采集协程会在当前这一页处理完后退出（进度里会出现 stopping → stopped）。
+// stopCollect 停止采集：?source_id=N 只停该接口，不传则停掉全部正在采集与排队中的接口。
+// 正在采集的只是发信号，采集协程会在当前这一页处理完后退出（进度里会出现 stopping → stopped）；
+// 排队中的则直接从队列移除，不会再开始。
 func (s *Server) stopCollect(w http.ResponseWriter, r *http.Request) {
 	if idStr := r.URL.Query().Get("source_id"); idStr != "" {
 		id, err := strconv.ParseInt(idStr, 10, 64)
@@ -79,6 +90,10 @@ func (s *Server) stopCollect(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !collector.GlobalProgress.Stop(id) {
+			if s.Col.CancelQueued(id) {
+				ok(w, "已取消排队，该接口不会再开始采集")
+				return
+			}
 			fail(w, "该接口当前没有在采集")
 			return
 		}
@@ -86,9 +101,14 @@ func (s *Server) stopCollect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	n := collector.GlobalProgress.StopAll()
-	if n == 0 {
+	m := s.Col.ClearQueue()
+	if n == 0 && m == 0 {
 		fail(w, "当前没有正在进行的采集")
 		return
 	}
-	ok(w, fmt.Sprintf("已停止 %d 个接口的采集（正在收尾）", n))
+	msg := fmt.Sprintf("已停止 %d 个接口的采集（正在收尾）", n)
+	if m > 0 {
+		msg += fmt.Sprintf("，取消排队 %d 个", m)
+	}
+	ok(w, msg)
 }

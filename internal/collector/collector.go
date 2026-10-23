@@ -319,6 +319,36 @@ func (p *Progress) end(id int64) {
 	delete(p.cancels, id)
 }
 
+// markQueued 标记某接口在排队等待采集（还没真正开始，Running=false）。
+// 页面据此显示「排队中」，并且可以在排队阶段就取消，不必等它开始。
+func (p *Progress) markQueued(src Source, mode string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	sp, ok := p.sources[src.ID]
+	if !ok {
+		sp = &SourceProgress{SourceID: src.ID}
+		p.sources[src.ID] = sp
+		p.order = append(p.order, src.ID)
+	}
+	sp.Name, sp.Mode = src.Name, mode
+	sp.Phase, sp.Running = "queued", false
+	sp.Page, sp.PageCount = 0, 0
+	sp.Fetched, sp.Added, sp.Updated, sp.Details = 0, 0, 0, 0
+	sp.StartedAt = time.Now().Format(timeLayout)
+	sp.Finished, sp.Error = "", ""
+}
+
+// cancelQueued 排队任务被取消：标记为已停止（从未真正开始采集）
+func (p *Progress) cancelQueued(id int64, msg string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if sp, ok := p.sources[id]; ok && !sp.Running && sp.Phase == "queued" {
+		sp.Phase = "stopped"
+		sp.Error = msg
+		sp.Finished = time.Now().Format(timeLayout)
+	}
+}
+
 // Stop 请求停止某个接口的采集：向该接口的取消通道发信号并标记为「停止中」。
 // 真正退出由采集协程在下一个检查点完成（可能还需要等当前这一页抓完）。
 // 返回 false 表示该接口本来就没在采集。
@@ -461,6 +491,13 @@ type Collector struct {
 	// 全量采集不初始化，appendSyncItem 会直接跳过。
 	syncMu    sync.Mutex
 	syncItems map[int64][]SyncItem
+
+	// 采集任务队列：同时采集的接口数有上限（collect.sources），超出的按提交顺序排队，
+	// 每采完一个自动接上下一个 —— 配置 1 个并发、5 个来源时就是一个一个采完。
+	jobMu      sync.Mutex
+	jobQueue   []pendingJob
+	queuedIDs  map[int64]bool
+	dispatchMu sync.Mutex // 串行化「取任务 + 起协程」，避免并发接力时超出并发上限
 }
 
 func New(db *sql.DB) *Collector {
@@ -1057,16 +1094,17 @@ const (
 )
 
 // RunFull 全量采集。restart=false 时若上次未跑完则从断点续采。
-// 每个接口独立起一个 goroutine，因此可以同时启动多个接口的全量采集；
-// 已在采集的接口会被跳过（返回在 skipped 里）。
-func (c *Collector) RunFull(sources []Source, restart bool) (started int, skipped []string) {
+// 每个接口独立起一个 goroutine；超过同时采集上限的接口排队等待，
+// 每采完一个自动接上下一个（started=已开始，queued=排队中）。
+func (c *Collector) RunFull(sources []Source, restart bool) (started, queued int, skipped []string) {
 	return c.startJobs(sources, "full", 0, restart, "")
 }
 
 // RunIncremental 增量采集：只取各接口当天（24 小时内）有更新的数据；
 // limitPages > 0 时只同步前 N 页（定时任务用，避免每次跑全量）。
 // trigger 写入同步记录：manual=手动点「增量采集」，auto=定时任务。
-func (c *Collector) RunIncremental(sources []Source, limitPages int, trigger string) (started int, skipped []string) {
+// 超过同时采集上限的接口排队等待，不会像旧实现那样被直接跳过。
+func (c *Collector) RunIncremental(sources []Source, limitPages int, trigger string) (started, queued int, skipped []string) {
 	return c.startJobs(sources, "incr", limitPages, false, trigger)
 }
 
@@ -1085,56 +1123,168 @@ func (c *Collector) sourceLimit() int {
 	return n
 }
 
-// startJobs 为每个接口起独立采集协程（非阻塞，立即返回）
-func (c *Collector) startJobs(sources []Source, mode string, limitPages int, restart bool, trigger string) (int, []string) {
-	var skipped []string
-	started := 0
-	limit := c.sourceLimit()
+// pendingJob 排队等待采集的接口任务
+type pendingJob struct {
+	src        Source
+	mode       string
+	limitPages int
+	restart    bool
+	trigger    string
+}
+
+// startJobs 把接口的采集任务放进队列（非阻塞，立即返回）。
+//
+// 同时采集的接口数受 collect.sources 限制，超出的按提交顺序排队，
+// 每采完一个就自动接上下一个。旧实现是「超过上限直接跳过」，
+// 配置 1 个并发却加 5 个来源时，点一次「全部增量」只有 1 个会真的采。
+func (c *Collector) startJobs(sources []Source, mode string, limitPages int, restart bool, trigger string) (started, queued int, skipped []string) {
+	accepted := make([]int64, 0, len(sources))
 	for _, src := range sources {
-		if len(GlobalProgress.RunningIDs()) >= limit {
-			skipped = append(skipped, src.Name+"（同时采集的接口已达上限 "+strconv.Itoa(limit)+" 个）")
-			continue
-		}
-		if !GlobalProgress.start(src, mode) {
+		if GlobalProgress.IsRunning(src.ID) {
 			skipped = append(skipped, src.Name+"（正在采集中）")
 			continue
 		}
-		started++
-		if mode == "full" && restart {
-			// 只重置该接口的断点，不影响其他接口
-			c.DB.Exec(`UPDATE vod_sync_state SET last_page=0, completed=0 WHERE mode='full' AND source_id=?`, src.ID)
+		c.jobMu.Lock()
+		if c.queuedIDs[src.ID] {
+			c.jobMu.Unlock()
+			skipped = append(skipped, src.Name+"（已在排队）")
+			continue
 		}
-		go func(src Source) {
-			startedAt := time.Now()
-			logID := int64(0)
-			if mode == "incr" {
-				logID = c.startSyncLog(src, trigger, startedAt)
-				if logID > 0 {
-					c.beginSyncItems(src.ID)
-				}
-			}
-			defer func() {
-				if r := recover(); r != nil {
-					logx.Printf("[collect] %s panic: %v", src.Name, r)
-					GlobalProgress.update(src.ID, func(sp *SourceProgress) {
-						sp.Phase, sp.Error = "failed", fmt.Sprintf("内部错误: %v", r)
-					})
-				}
-				if logID > 0 {
-					// 必须在 end 之前取最终统计：end 只改 Running/Finished，不影响计数
-					sp, _ := GlobalProgress.get(src.ID)
-					c.finishSyncLog(logID, src.ID, sp, startedAt, c.takeSyncItems(src.ID))
-				}
-				GlobalProgress.end(src.ID)
-			}()
-			if mode == "incr" {
-				c.crawl(src, 24, limitPages)
-			} else {
-				c.crawl(src, 0, 0)
-			}
-		}(src)
+		if c.queuedIDs == nil {
+			c.queuedIDs = map[int64]bool{}
+		}
+		c.queuedIDs[src.ID] = true
+		c.jobQueue = append(c.jobQueue, pendingJob{
+			src: src, mode: mode, limitPages: limitPages, restart: restart, trigger: trigger,
+		})
+		c.jobMu.Unlock()
+		accepted = append(accepted, src.ID)
+		// 先上报「排队中」：页面能看到在等的接口，也能在排队阶段直接取消
+		GlobalProgress.markQueued(src, mode)
 	}
-	return started, skipped
+	c.dispatch()
+	for _, id := range accepted {
+		if c.IsQueued(id) {
+			queued++
+		} else {
+			started++
+		}
+	}
+	return started, queued, skipped
+}
+
+// dispatch 按并发上限从队列里放出任务，直到跑满或队列为空。
+// 每个采集协程结束时都会调用一次接力，因此同时采集数始终不超过 collect.sources。
+func (c *Collector) dispatch() {
+	c.dispatchMu.Lock()
+	defer c.dispatchMu.Unlock()
+	for {
+		if len(GlobalProgress.RunningIDs()) >= c.sourceLimit() {
+			return
+		}
+		c.jobMu.Lock()
+		if len(c.jobQueue) == 0 {
+			c.jobMu.Unlock()
+			return
+		}
+		job := c.jobQueue[0]
+		c.jobQueue = c.jobQueue[1:]
+		delete(c.queuedIDs, job.src.ID)
+		c.jobMu.Unlock()
+
+		if !GlobalProgress.start(job.src, job.mode) {
+			continue // 已在采集（排队期间又被单独触发）：跳过这个任务
+		}
+		if job.mode == "full" && job.restart {
+			// 只重置该接口的断点，不影响其他接口。放到真正开始时做：
+			// 排队中被取消时断点不能被清掉。
+			c.DB.Exec(`UPDATE vod_sync_state SET last_page=0, completed=0 WHERE mode='full' AND source_id=?`, job.src.ID)
+		}
+		go c.runJob(job)
+	}
+}
+
+// runJob 执行一个采集任务（含增量同步记录），结束后让排队中的下一个接上。
+func (c *Collector) runJob(job pendingJob) {
+	src := job.src
+	startedAt := time.Now()
+	logID := int64(0)
+	if job.mode == "incr" {
+		logID = c.startSyncLog(src, job.trigger, startedAt)
+		if logID > 0 {
+			c.beginSyncItems(src.ID)
+		}
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			logx.Printf("[collect] %s panic: %v", src.Name, r)
+			GlobalProgress.update(src.ID, func(sp *SourceProgress) {
+				sp.Phase, sp.Error = "failed", fmt.Sprintf("内部错误: %v", r)
+			})
+		}
+		if logID > 0 {
+			// 必须在 end 之前取最终统计：end 只改 Running/Finished，不影响计数
+			sp, _ := GlobalProgress.get(src.ID)
+			c.finishSyncLog(logID, src.ID, sp, startedAt, c.takeSyncItems(src.ID))
+		}
+		GlobalProgress.end(src.ID)
+		c.dispatch() // 队列里还有排队的接口就接着采
+	}()
+	if job.mode == "incr" {
+		c.crawl(src, 24, job.limitPages)
+	} else {
+		c.crawl(src, 0, 0)
+	}
+}
+
+// IsQueued 该接口是否在排队等待采集
+func (c *Collector) IsQueued(id int64) bool {
+	c.jobMu.Lock()
+	defer c.jobMu.Unlock()
+	return c.queuedIDs[id]
+}
+
+// CancelQueued 取消还没开始采集的排队任务（用户点「取消排队 / 停止采集」时用）。
+// 返回 false 表示该接口不在队列里。
+func (c *Collector) CancelQueued(id int64) bool {
+	c.jobMu.Lock()
+	if !c.queuedIDs[id] {
+		c.jobMu.Unlock()
+		return false
+	}
+	delete(c.queuedIDs, id)
+	for i := range c.jobQueue {
+		if c.jobQueue[i].src.ID == id {
+			c.jobQueue = append(c.jobQueue[:i], c.jobQueue[i+1:]...)
+			break
+		}
+	}
+	c.jobMu.Unlock()
+	GlobalProgress.cancelQueued(id, "已取消排队")
+	return true
+}
+
+// ClearQueue 取消所有排队中的任务，返回取消的数量（「停止全部采集」用）。
+func (c *Collector) ClearQueue() int {
+	c.jobMu.Lock()
+	ids := make([]int64, 0, len(c.queuedIDs))
+	for id := range c.queuedIDs {
+		ids = append(ids, id)
+	}
+	c.jobQueue = nil
+	c.queuedIDs = map[int64]bool{}
+	c.jobMu.Unlock()
+	for _, id := range ids {
+		GlobalProgress.cancelQueued(id, "已取消排队")
+	}
+	return len(ids)
+}
+
+// QueuedCount 当前排队等待采集的接口数（日志/页面展示用）
+func (c *Collector) QueuedCount() int {
+	c.jobMu.Lock()
+	defer c.jobMu.Unlock()
+	return len(c.queuedIDs)
 }
 
 // beginSyncItems 开始收集某接口本次增量的影片明细（全量采集不调用）。

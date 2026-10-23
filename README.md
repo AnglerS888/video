@@ -21,7 +21,9 @@ curl -fsSL https://gitee.com/anglers/video/raw/master/deploy.sh | bash
 ## 功能
 
 - **多接口采集** —— 添加任意数量的影视接口，只填域名，按域名自动补全接口路径
-- **全量 / 增量同步** —— 全量可随时停止、断点续采；定时增量每小时只抓每个源最新的几页
+- **全量 / 增量同步** —— 全量可随时停止、断点续采；定时增量每小时只抓每个源最新的几页，来源卡片显示下次自动采集倒计时
+- **排队采集** —— 超出「同时采集的接口数」的来源自动排队，前一个采完自动接上，也可以取消排队
+- **同步记录** —— 每次增量留一条汇总，可按页翻看（每页 10 条），点开还能看新增/更新的影片明细
 - **同名多源合并** —— 同一个剧名在多个源都有时合成一条，详情页里按线路分组展示
 - **在线播放** —— HLS 代理改写 m3u8 并转发分片，绕开源站无 CORS / 防盗链 / 伪装分片
 - **下载** —— m3u8 分片并发拉取，ffmpeg 合并为 mp4，带进度、速度、暂停与续传
@@ -30,6 +32,9 @@ curl -fsSL https://gitee.com/anglers/video/raw/master/deploy.sh | bash
 - **分享** —— 生成局域网「分享页」链接与二维码；链接带随机令牌、永久有效，
   对方打开的是页面，可自行播放/下载，不会直接拿到视频文件地址
 - **封面本地化** —— 抓取并压缩封面存到本地，页面只读本地文件；确实拉不到时显示内置占位图
+- **访问密码（可选）** —— 「信息」页 →「运行配置」里设一个密码，之后打开网站要先登录，
+  所有接口调用也要带密码（浏览器用登录 Cookie，脚本用 `X-Access-Password` 头或 `?password=`
+  参数）；留空 = 不启用，改完保存立即生效
 - 搜索可按**片名 / 演员**切换范围（默认全部）
 - 「接口文档」页把站点自身的 HTTP 接口列出来，可复制 curl
 
@@ -58,7 +63,7 @@ make build                    # 产出 bin/videodl.exe（当前平台）
 ./bin/videodl                 # 首次运行会在当前目录生成 config.yml
 ```
 
-打开 <http://localhost:5200>。端口、数据目录、数据库等在 `config.yml`，采集/下载/封面/ffmpeg 在「信息」页改（存到数据目录的 `ui.yml`）：
+打开 <http://localhost:5200>。端口、数据目录、数据库等在 `config.yml`，采集/下载/封面/ffmpeg/访问密码在「信息」页改（存到数据目录的 `ui.yml`）：
 
 ```bash
 cp config.example.yml config.yml   # 精简模板：默认值与低配/标准预设都在代码里
@@ -202,9 +207,9 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct -t videodl:late
 | 在线播放 | `/online/:vid` | 直接播源站 m3u8，不占磁盘；可换线路 |
 | 分享页 | `/s/:token` | 发给别人的独立页面（无站点导航），可播放/下载，同剧其它集可直接切换；令牌永久有效（删除下载记录时失效；旧数字 id 链接仅本机可打开） |
 | 收藏 | `/favorites` | 按剧名收藏，提示源站是否有更新 |
-| 来源 | `/sources` | 接口增删改、连通性测试、全量/增量/停止、自动增量开关、增量同步记录（含影片明细） |
+| 来源 | `/sources` | 接口增删改、连通性测试、全量/增量/排队/取消排队/停止、自动增量开关、下次自动采集倒计时、增量同步记录（分页 + 影片明细） |
 | 接口文档 | `/api-docs` | 站点自身 HTTP 接口一览（方法、路径、参数），可复制 curl |
-| 网站信息 | `/info` | 版本与在线更新、运行环境、数据占用、磁盘、内存、数据库空闲页、ffmpeg 安装、封面缓存检查 |
+| 网站信息 | `/info` | 版本与在线更新、运行环境、数据占用、磁盘、内存、数据库空闲页、ffmpeg 安装、封面缓存检查；「运行配置」含采集 / 下载 / 封面 / ffmpeg / 访问密码 |
 
 ### 采集策略
 
@@ -214,6 +219,10 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct -t videodl:late
   - 计数按「轮」不按「次」：一批并发请求同时失败只算一轮
   - 等待期间进度区显示「第 N 页抓取失败，180 秒后重试（连续 1/3 轮）」；恢复后提示自动消失
 - **断点续采**：中途停止或失败，再点「全量采集」从断点继续；已完整跑完（`completed=1`）时则从第 1 页重新开始
+- **超过并发就排队**：「同时采集的接口数」满了之后再触发的来源不会跳过，而是进排队（`phase=queued`），
+  前一个采完自动接上；卡片上可点「取消排队」移出，点「停止全部采集」会一并清空队列
+- **下次自动采集倒计时**：来源页从 `/api/scheduler` 读采集间隔与下次触发时间，工具栏和卡片上显示 `mm:ss` 倒计时，
+  到点自动开始后倒计时重新计算
 - **JSON / XML 都支持**：按响应内容自动识别（看 `<?xml`/`<rss`/`<list>` 开头），无需选择格式；
   XML 站点填完整接口地址即可（如 `https://域名/api.php/provide/vod/at/xml/`，
   地址里的 `at/xml` 子路径会被保留，不会被改回 JSON）；声明为 GBK/GB2312 的 XML 会自动转 UTF-8
@@ -228,7 +237,7 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct -t videodl:late
 - **两个开关别混**：接口「启用」= 是否参与任何采集；「自动增量」= 只控每小时定时任务，关掉后仍可手动增量/全量
 - **增量留痕**：每次增量采集（手动或定时）给每个来源写一条同步记录（手动增量/自动增量、时间、
   抓取/新增/更新数、耗时、状态与错误），并记下本次新增/更新的影片（片名、备注、源站更新时间）；
-  来源卡片点「同步记录」→「影片 N 部」即可回看；每个来源只保留最近 100 条，全量采集不记录
+  来源卡片点「同步记录」即可回看，列表每页 10 条可翻页；每个来源只保留最近 100 条，全量采集不记录
 
 ### 在线播放原理
 
@@ -256,6 +265,7 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct -t videodl:late
 - 本地播放页（`/watch/:id`）点分享，生成 `/s/{token}` 分享页链接与二维码；首页与详情页的二维码分享的是页面本身
 - 分享链接**永久有效**：令牌随下载记录生存，删除该下载记录（或删除来源）时一并失效
 - 分享页不直接暴露视频文件地址，只给播放/下载按钮；同剧其它已下载集可直接切换
+- 设了访问密码时，分享页与接口同样需要密码（收到链接的人要先输入密码）
 - 本地播放走短期播放令牌（`/api/play-token`，6 小时，进程内存态），刷新页面会自动重新获取
 
 ### 多源标注
@@ -366,7 +376,7 @@ docker compose build && docker compose up -d
 videodata/
 ├── videodl.db              # SQLite 库（影片、播放地址、下载记录、观看历史、收藏、分享令牌、增量同步记录）
 ├── videodl.db-wal          # WAL（运行中才有）
-├── ui.yml                  # 页面可改的运行配置（采集 / 下载 / 封面 / ffmpeg）
+├── ui.yml                  # 页面可改的运行配置（采集 / 下载 / 封面 / ffmpeg / 访问密码）
 ├── img/                    # 封面缓存，按哈希分片：img/3f/3fa2...9c.jpg
 ├── videos/                 # 下载好的 mp4
 ├── bin/                    # 按需下载的 ffmpeg（信息页点「下载」后才有，约 80MB 解压后）
@@ -383,7 +393,7 @@ videodata/
 | 文件 | 位置 | 内容 | 生效方式 |
 |---|---|---|---|
 | `config.yml` | 见下方查找顺序 | `advanced` 段：端口、数据目录、日志、内存、数据库 | 改完**重启** |
-| `ui.yml` | **数据目录**（`<data_dir>/ui.yml`） | 采集 / 下载 / 封面 / ffmpeg | 「信息」页改，**保存即生效** |
+| `ui.yml` | **数据目录**（`<data_dir>/ui.yml`） | 采集 / 下载 / 封面 / ffmpeg / 访问密码 | 「信息」页改，**保存即生效** |
 
 `ui.yml` 跟着数据走：换机器、换容器只要带上数据目录，并发设置就跟过去了；
 第一次运行没有它会按当前生效值自动生成一份。
@@ -452,6 +462,9 @@ ffmpeg:
   threads: 0             # 0=默认；NAS 建议 1~2
   reencode: true
   verify: true
+
+auth:
+  password: ""           # 访问密码；留空 = 不启用，设置后站点与接口都要密码
 ```
 
 > 旧版结构（全部平铺在一个 `config.yml` 里，或 `ui`/`advanced` 两段写在同一个文件）
@@ -459,7 +472,7 @@ ffmpeg:
 
 ### 字段说明
 
-下表里 `collect.*` / `download.*` / `cover.*` / `ffmpeg.*` 在 **`ui.yml`**（页面可改、保存即生效），
+下表里 `collect.*` / `download.*` / `cover.*` / `ffmpeg.*` / `auth.*` 在 **`ui.yml`**（页面可改、保存即生效），
 其余（`server.*` / `data_dir` / `log_level` / `lowmem` / `mem_limit_mb` / `max_procs` / `db.*`）
 在 **`config.yml` 的 `advanced` 段**（改完重启）。
 
@@ -485,6 +498,7 @@ ffmpeg:
 | `ffmpeg.threads` | `0` | ffmpeg 线程数，0=默认；NAS 建议 1~2 |
 | `ffmpeg.reencode` | `true` | 音画不同步时是否全量重编码（弱 CPU 上很慢，可关） |
 | `ffmpeg.verify` | `true` | 合并后是否做音画同步自检 |
+| `auth.password` | 空 | 访问密码（最多 128 个字符）：设置后打开网站要登录，接口要带 Cookie / `X-Access-Password` / `?password=`；留空 = 不启用 |
 | `db.cache_mb` | `64` | SQLite 每连接页缓存（MiB）；4G 内存建议 `lowmem`（24） |
 | `db.mmap_mb` | `1024` | 内存映射大小（MiB，0 关闭）；网络盘建议 0 |
 | `db.conns` | `4` | SQLite 最大连接数（WAL 一写多读） |
@@ -493,7 +507,7 @@ ffmpeg:
 
 ### 在线调整（表单，保存即生效）
 
-「信息」页的**运行配置**卡片只放**不用重启**的四组：
+「信息」页的**运行配置**卡片只放**不用重启**的五组：
 
 | 分组 | 项 | 生效时机 |
 |---|---|---|
@@ -501,6 +515,7 @@ ffmpeg:
 | 下载 | `download.workers` / `seg_concurrency` / `seg_budget` / `min_free_mb` | 下一集开始下载 |
 | 封面 | `cover.workers` / `concurrency` / `img_proxy` | 立即 |
 | 合并转码 | `ffmpeg.threads` / `reencode` / `verify` | 下一次合并 |
+| 访问控制 | `auth.password` | 立即（保存后当前浏览器保持登录，其它已登录设备需重新输入） |
 
 都是输入框 / 开关，不用写 JSON；顶部还有「标准预设」「低配预设」一键套用。点保存后
 **立即热应用到运行中的组件**（正在跑的采集轮次、正在下的那一集不受影响），
@@ -512,7 +527,7 @@ ffmpeg:
 
 也可以走接口：`GET /api/config` 读取（合并 config.yml + ui.yml，返回 `config`、`path`、`ui_path`
 与两套 `presets`）、`PUT /api/config` 保存 —— body 传 `{"config":{...}}`（缺省字段保持原值；
-只含上面四组时写 `ui.yml` 并返回 `restart_required:false`，带上其它分组则同时写 `config.yml` 并返回 `true`）；
+只含上面五组时写 `ui.yml` 并返回 `restart_required:false`，带上其它分组则同时写 `config.yml` 并返回 `true`）；
 `{"text":"..."}` 仍然支持，用于整段原文写入（一律按需重启处理）。
 
 ### 低配模式怎么生效
@@ -649,32 +664,52 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 
 所有接口返回 `{"ok": true, "data": ...}` 或 `{"ok": false, "msg": "..."}`。
 
+### 访问密码（可选）
+
+在「信息」页 →「运行配置」→「访问控制」里设 `auth.password`（存在数据目录的 `ui.yml`，
+**保存即生效**，不用重启）。留空 = 不启用；设置后：
+
+- 打开网站先显示登录页，密码正确后服务端下发 HttpOnly Cookie（30 天，同源自动携带）；
+- **所有接口调用都要带密码**（`/api/*` 与 `/play/*`），三种方式任选：
+  登录后的 Cookie、请求头 `X-Access-Password: <密码>`、查询参数 `?password=<密码>`
+  （查询参数容易进访问日志，只建议临时用）；
+- 只有 `/healthz` 与 `/api/auth/*` 不需要密码（登录页与容器健康检查）；
+- 未通过时 `401` + `{"ok":false,"code":"auth_required","msg":"需要访问密码"}`；
+  同一 IP 连续输错 5 次锁 5 分钟，期间返回 `429` + `code:"auth_locked"`；
+- Cookie 签名密钥由密码派生：**改密码后所有已登录设备自动失效**，需要重新登录。
+
+```bash
+# 脚本调用示例
+curl -H 'X-Access-Password: 你的密码' http://localhost:5200/api/videos
+```
+
 **写接口防护**（`POST/PUT/DELETE` 统一由 `guard()` 处理）：
 
 - 设了 `VDL_ADMIN_TOKEN` 时，必须带 `X-Admin-Token` 头或 `?token=`；
 - 跨站 `Origin` 直接拒绝（CSRF）；
 - 带请求体时 `Content-Type` 必须是 `application/json`；
-- 请求体上限 1MB，批量数组最多 500 项。读接口不鉴权。
+- 请求体上限 1MB，批量数组最多 500 项。读接口在设了访问密码时也要密码（见上）。
 
 ### 接口管理 / 采集
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/sources` | 接口列表（含每个源的影片数 / 剧名数 / 播放地址数 / 最近更新） |
+| GET | `/api/sources` | 接口列表（名称、地址、启用、自动增量）。大库下不再返回影片/剧名/播放地址统计——那要扫百万行 `vod_play`，列表会卡；总量看 `/api/sysinfo` |
 | POST | `/api/sources` | 添加接口（只填域名即可） |
 | PUT | `/api/sources/{id}` | 修改接口 |
 | DELETE | `/api/sources/{id}` | 删除接口，**连带清空该源所有影片、播放地址、下载文件与封面** |
 | GET | `/api/sources/{id}/test` | 测试连通性与分页 |
-| GET | `/api/sources/{id}/sync-logs` | 增量同步记录（`?limit=20`，最多 100 条，新的在前；含 `items_count`） |
+| GET | `/api/sources/{id}/sync-logs` | 增量同步记录（`?page=1&page_size=10`，默认 10、上限 100，兼容旧 `?limit=`；返回 `{total,page,page_size,items}`，页码越界回退最后一页，新的在前） |
 | GET | `/api/sources/{id}/sync-logs/{logID}` | 单条同步记录的影片明细（新增/更新、片名、备注、源站更新时间） |
 | POST | `/api/sources/probe` | 添加前预检（填域名，自动试 4 种地址，不写库）`{"url":"…"}` |
 | POST | `/api/sources/{id}/auto-incr` | 开关「自动增量」`{"on":0\|1}` |
 | GET | `/api/sources/export` | 导出全部接口为 JSON（换机/重装备份） |
 | POST | `/api/sources/import` | 导入接口 JSON（按 `api_url` 去重） |
-| POST | `/api/collect/full` | 全量采集（`?source_id=N` 单个，`?restart=1` 从头） |
-| POST | `/api/collect/incr` | 增量采集 |
-| POST | `/api/collect/stop` | 停止采集（`?source_id=N` 停单个，不传停全部） |
-| GET | `/api/progress` | 采集进度 |
+| POST | `/api/collect/full` | 全量采集（`?source_id=N` 单个，`?restart=1` 从头）；并发已满时进排队 |
+| POST | `/api/collect/incr` | 增量采集（`?source_id=N` 单个）；并发已满时进排队 |
+| POST | `/api/collect/stop` | 停止采集，排队中的会取消排队（`?source_id=N` 停单个，不传停全部并清空队列） |
+| GET | `/api/progress` | 采集进度（`phase` 含 `queued` = 排队中） |
+| GET | `/api/scheduler` | 定时增量状态（`enabled` / `interval_sec` / `next_run_unix`，来源页倒计时用） |
 
 ### 影片 / 封面 / 播放
 
@@ -686,7 +721,7 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 | GET | `/api/img` | 封面图（只返回本地已缓存，没有则 `204`） |
 | GET | `/api/live` | HLS 播放代理（改写 m3u8 + 转发分片） |
 | GET | `/api/play-token` | 签发本地播放令牌（6 小时，内存态，重启失效） |
-| GET | `/play/{id}` | 播放已下载的 mp4，支持 Range；本地播放要带 `?t=<播放令牌>`（或管理口令），`?dl=1` 作为附件下载；也接受分享令牌 `/play/{token}` |
+| GET | `/play/{id}` | 播放已下载的 mp4，支持 Range；本地播放要带 `?t=<播放令牌>`（或管理口令），`?dl=1` 作为附件下载；也接受分享令牌 `/play/{token}`；设了访问密码时同样要带密码 |
 | GET | `/api/downloads/{id}/share` | 生成分享页链接（`/s/{token}`）+ 直链，永久有效 |
 | GET | `/api/share/base` | 分享用的站点根地址（本机访问时换成局域网 IP） |
 | GET | `/api/share/{token}` | 分享页数据：封面、集数、同剧其它已下载集（旧数字 id 链接仅本机可打开） |
@@ -716,6 +751,9 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 | POST | `/api/favs` | 添加收藏 |
 | DELETE | `/api/favs` | 取消收藏 |
 | POST | `/api/favs/seen` | 标记收藏已查看（记录当时的更新备注） |
+| GET | `/api/auth/status` | 是否启用访问密码、当前浏览器是否已登录（不需要密码） |
+| POST | `/api/auth/login` | 登录 `{"password":"…"}`，成功后下发 HttpOnly Cookie（不需要密码） |
+| POST | `/api/auth/logout` | 退出登录（清 Cookie）（不需要密码） |
 | GET | `/api/system` | 轻量统计（兼容保留） |
 | GET | `/api/sysinfo` | 运行环境、数据占用、磁盘、内存、记录数（`?fresh=1` 绕过 10s 缓存） |
 | POST | `/api/system/vacuum` | 手动整理数据库 |
@@ -749,29 +787,31 @@ sqlite3 videodata/videodl.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 │   ├── sysinfo/             # 磁盘/内存/目录占用（分平台实现）
 │   ├── updater/             # 在线更新（下载源码、容器内编译、原子替换）
 │   ├── version/             # 版本信息（VERSION + 提交 + 构建时间）
-│   └── web/                 # HTTP 服务：路由 + 各业务 handler + 内嵌前端产物
-│       ├── routes.go        #   路由注册（接口契约一览）
-│       ├── guard.go         #   写接口守卫（管理口令 / CSRF / 请求体限额）
-│       ├── playtoken.go     #   本地播放令牌
-│       ├── web.go           #   Server 结构、列表缓存、中间件、通用响应
-│       ├── config.go        #   配置读取 / 保存（config.yml + ui.yml）
-│       ├── sources.go       #   接口管理与连通性测试
-│       ├── collect.go       #   采集触发、停止、进度
-│       ├── videos.go        #   影片列表 / 详情 / 筛选 / 封面代理
-│       ├── favs.go          #   收藏
-│       ├── downloads.go     #   下载任务、播放、分享
-│       ├── watch.go         #   观看进度与历史
-│       ├── system.go        #   系统信息、数据库整理、健康检查
-│       ├── update.go        #   版本检查与在线更新
-│       ├── live.go          #   HLS 在线播放代理（改写 m3u8 + 转发分片）
-│       └── static/          #   前端构建产物（go:embed 打包）
+│   ├── web/                 # HTTP 服务：路由 + 各业务 handler + 内嵌前端产物
+│   │   ├── routes.go        #   路由注册（接口契约一览）
+│   │   ├── auth.go          #   访问密码（Cookie 登录 / 接口密码 / 401 守卫 / 登录限流）
+│   │   ├── guard.go         #   写接口守卫（管理口令 / CSRF / 请求体限额）
+│   │   ├── playtoken.go     #   本地播放令牌
+│   │   ├── web.go           #   Server 结构、列表缓存、中间件、通用响应
+│   │   ├── config.go        #   配置读取 / 保存（config.yml + ui.yml）
+│   │   ├── sources.go       #   接口管理与连通性测试
+│   │   ├── collect.go       #   采集触发、停止、进度
+│   │   ├── videos.go        #   影片列表 / 详情 / 筛选 / 封面代理
+│   │   ├── favs.go          #   收藏
+│   │   ├── downloads.go     #   下载任务、播放、分享
+│   │   ├── watch.go         #   观看进度与历史
+│   │   ├── system.go        #   系统信息、数据库整理、健康检查
+│   │   ├── update.go        #   版本检查与在线更新
+│   │   ├── live.go          #   HLS 在线播放代理（改写 m3u8 + 转发分片）
+│   │   └── static/          #   前端构建产物（go:embed 打包）
 ├── web/                     # Vue 前端源码
 │   ├── src/components/      #   CoverImg / Pager / ShareDialog / QrShareDialog
-│   │                        #   VideoCard / VideoPlayer / ConfirmDialog
+│   │                        #   VideoCard / VideoPlayer / ConfirmDialog / LoginPanel
 │   ├── src/views/           #   LibraryView / DetailView / LocalView / DownloadsView
 │   │                        #   PlayerView / OnlineView / FavoritesView / HistoryView
 │   │                        #   ShareView / SourcesView / ApiDocsView / InfoView
-│   ├── src/api.ts           #   HTTP 封装（写接口自动带 JSON Content-Type）
+│   ├── src/api.ts           #   HTTP 封装（写接口自动带 JSON Content-Type，401 回登录页）
+│   ├── src/auth.ts          #   访问密码状态（登录 / 退出 / 检查）
 │   ├── src/confirm.ts       #   全局确认弹窗（替代浏览器原生 confirm）
 │   └── src/toast.ts         #   轻提示
 ├── migrations/              # 1.4.1 数据库升级 SQL（同时提供 Go 工具）
@@ -807,6 +847,12 @@ make clean                       # 只清 bin/，绝不删 videodata/
   `/api/sources`）并打开 SPA 深链接（如 `/sources`、`/online/1`）
 
 ## 常见问题
+
+**忘记访问密码 / 被锁在门外**
+直接编辑数据目录的 `ui.yml`，把 `auth.password` 改成新密码或留空（`password: ""`），
+保存后下次请求即生效（服务不用重启；已登录的浏览器会因签名密钥变化而失效），
+然后刷新页面重新输入。也可以登录后到「信息」页 →「运行配置」→「访问控制」修改。
+同一 IP 连续输错 5 次会锁 5 分钟，等一会儿再试。
 
 **封面不显示**
 页面会先显示内置占位图，说明本地还没有这张缓存。源站封面 CDN 可能有防盗链或被网络阻断，

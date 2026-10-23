@@ -1,11 +1,18 @@
 import type {
   ApiResp, CoverFixStatus, Downloads, FavItem, FfmpegStatus, Filters, Progress, ShareInfo, SharePage, Source, SourceTest,
-  ConfigData, ConfigInfo, SyncLog, SyncLogItem, SysInfo, UpdateInfo, UpdateStatus, VersionResp, VideoDetail, VideoList, WatchHistoryItem,
+  ConfigData, ConfigInfo, SchedulerInfo, SyncLogItem, SyncLogPage, SysInfo, UpdateInfo, UpdateStatus, VersionResp, VideoDetail, VideoList, WatchHistoryItem,
 } from './types'
+import { markUnauthorized } from './auth'
 
 async function req<T>(path: string, init?: RequestInit): Promise<ApiResp<T>> {
   try {
     const r = await fetch(path, init)
+    // 401 只会来自访问密码守卫（写接口的管理口令是 200 + ok:false）：
+    // 切回登录页，下次登录后各页面会重新拉数据。
+    if (r.status === 401) {
+      markUnauthorized()
+      return { ok: false, msg: '需要访问密码' }
+    }
     if (!r.ok && r.headers.get('content-type')?.includes('json') === false) {
       return { ok: false, msg: `HTTP ${r.status}` }
     }
@@ -140,9 +147,9 @@ export const api = {
   testSource(id: number) {
     return req<SourceTest>(`/api/sources/${id}/test`)
   },
-  /** 增量同步记录：每次手动/定时增量一条汇总（新的在前） */
-  syncLogs(id: number, limit = 20) {
-    return req<SyncLog[]>(`/api/sources/${id}/sync-logs?limit=${limit}`)
+  /** 增量同步记录（分页）：每次手动/定时增量一条汇总，新的在前 */
+  syncLogs(id: number, page = 1, pageSize = 10) {
+    return req<SyncLogPage>(`/api/sources/${id}/sync-logs?page=${page}&page_size=${pageSize}`)
   },
   /** 单条同步记录的影片明细（展开某条记录时按需加载） */
   syncLogItems(id: number, logId: number) {
@@ -182,6 +189,10 @@ export const api = {
   },
   progress() {
     return req<Progress>('/api/progress')
+  },
+  /** 定时增量任务状态：采集间隔与下一次触发时间（来源页倒计时用） */
+  scheduler() {
+    return req<SchedulerInfo>('/api/scheduler')
   },
   // 停止采集：不传 sourceId 则停止全部正在采集的接口
   stopCollect(sourceId?: number) {

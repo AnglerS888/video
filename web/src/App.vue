@@ -1,8 +1,10 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from './api'
+import { auth, checkAuth, logout } from './auth'
 import ConfirmDialog from './components/ConfirmDialog.vue'
+import LoginPanel from './components/LoginPanel.vue'
 import QrShareDialog from './components/QrShareDialog.vue'
 import { isDark, toggleTheme } from './theme'
 import { toast, toasts } from './toast'
@@ -26,6 +28,10 @@ const title = computed(() => (route.meta.title as string) || '影视库')
 const isDetail = computed(() => route.name === 'detail')
 // 分享页（/s/:id）独立成页：不显示站点导航，避免收到链接的人被带进后台
 const bare = computed(() => route.meta.bare === true)
+// 设了访问密码且当前浏览器还没验证：整站只显示登录卡片
+const gated = computed(() => auth.required && !auth.authed)
+// 顶部 / 底部导航只在「正常页面」显示（分享页、登录页都不显示）
+const chrome = computed(() => !bare.value && !gated.value)
 // 首页二维码分享：放在导航栏右侧（只在首页显示）
 const isHome = computed(() => route.path === '/')
 const shareURL = ref('')
@@ -44,7 +50,7 @@ const verPrint = ref('')
 let verTimer: number | undefined
 
 async function pollVersion() {
-  if (document.hidden) return
+  if (document.hidden || gated.value) return
   const r = await api.version()
   const info = r.ok ? r.data?.info : null
   if (!info) return
@@ -65,22 +71,44 @@ function onVisible() {
   if (!document.hidden) pollVersion()
 }
 
-onMounted(() => {
+// 版本轮询只在通过访问密码后才启动（登录页上不必反复打接口）
+let verStarted = false
+function startVersionWatch() {
+  if (verStarted) return
+  verStarted = true
   pollVersion()
   verTimer = window.setInterval(pollVersion, 60_000)
   document.addEventListener('visibilitychange', onVisible)
+}
+
+onMounted(async () => {
+  // 先问服务端：需不需要访问密码、这个浏览器是否已登录
+  await checkAuth()
+  if (!gated.value) startVersionWatch()
 })
+
+// 登录成功后（gated 变 false）再补上版本轮询
+watch(gated, (g) => {
+  if (!g) startVersionWatch()
+})
+
 onBeforeUnmount(() => {
   if (verTimer) window.clearInterval(verTimer)
   document.removeEventListener('visibilitychange', onVisible)
 })
+
+// 退出登录（页脚「锁定」）：清 Cookie 并切回登录页
+async function lockSite() {
+  await logout()
+  toast('已退出登录，下次打开需要重新输入访问密码', 'ok', 3000)
+}
 </script>
 
 <template>
   <div class="flex min-h-dvh flex-col">
-    <!-- 顶部导航：大屏横向 / 小屏标题栏；分享页不显示 -->
+    <!-- 顶部导航：大屏横向 / 小屏标题栏；分享页与登录页不显示 -->
     <header
-      v-if="!bare"
+      v-if="chrome"
       class="safe-top sticky top-0 z-30 border-b border-slate-200 bg-white/80 backdrop-blur
         dark:border-white/10 dark:bg-[#0b0f17]/85"
     >
@@ -186,7 +214,11 @@ onBeforeUnmount(() => {
       class="mx-auto w-full max-w-[1680px] flex-1 px-3 sm:px-4 lg:px-6"
       :class="bare ? 'py-3 lg:py-6' : 'pb-2 pt-3 lg:pb-3 lg:pt-5'"
     >
-      <RouterView />
+      <!-- 首次检查访问权限：短暂显示，避免没设密码的站点闪一下登录页 -->
+      <div v-if="auth.checking" class="py-24 text-center text-sm muted">正在检查访问权限…</div>
+      <!-- 设了访问密码且未登录：只显示登录卡片，不渲染任何页面内容 -->
+      <LoginPanel v-else-if="gated" />
+      <RouterView v-else />
     </main>
 
     <!-- 页脚：放「接口文档」超链接（原本是导航栏第 8 项，用户要求挪到这里）。
@@ -200,7 +232,7 @@ onBeforeUnmount(() => {
          `@media (pointer: coarse), (max-width:639px)` 下生效，
          桌面端鼠标环境下不触发，实测只有 16px 高（纯文字行高），太难点。 -->
     <footer
-      v-if="!bare"
+      v-if="chrome"
       class="mx-auto w-full max-w-[1680px] px-3 text-center text-xs muted sm:px-4 lg:px-6
         pb-28 pt-2 lg:pb-8"
     >
@@ -222,16 +254,31 @@ onBeforeUnmount(() => {
           <span class="mx-1" aria-hidden="true">·</span>
           <span class="inline-flex min-h-8 items-center px-1">{{ appVersion }}</span>
         </template>
+        <!-- 设了访问密码时给个主动锁定的入口（清 Cookie 后需重新输入密码） -->
+        <template v-if="auth.required && auth.authed">
+          <span class="mx-1" aria-hidden="true">·</span>
+          <button
+            class="tap-sm inline-flex min-h-8 items-center gap-1.5 rounded-lg px-2.5 hover:text-amber-500"
+            title="退出登录（下次打开需要重新输入访问密码）"
+            @click="lockSite"
+          >
+            <svg viewBox="0 0 24 24" class="h-3.5 w-3.5 shrink-0" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4.5" y="10.5" width="15" height="10" rx="2" />
+              <path d="M8 10.5V7.5a4 4 0 0 1 8 0v3" />
+            </svg>
+            锁定
+          </button>
+        </template>
       </div>
     </footer>
 
-    <!-- 底部导航（手机 / 平板）；分享页不显示。
+    <!-- 底部导航（手机 / 平板）；分享页与登录页不显示。
          一共 7 项（影视库/本地/下载/历史/收藏/来源/信息），
          所以是 grid-cols-7：nav 加减项必须同步改这里，
          否则多的那项换到第二行、少的留下空位。
          360px 宽下每项 51px，图标 18px + 10px 文字，整项高 ≥56px -->
     <nav
-      v-if="!bare"
+      v-if="chrome"
       class="safe-bottom fixed inset-x-0 bottom-0 z-30 grid grid-cols-7 border-t border-slate-200
         bg-white/90 backdrop-blur lg:hidden dark:border-white/10 dark:bg-[#0b0f17]/92"
     >

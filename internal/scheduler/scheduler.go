@@ -19,6 +19,8 @@ type Scheduler struct {
 	stopOnce sync.Once     // Stop 幂等：重复调用会 panic（close of closed channel）
 	done     chan struct{} // 循环退出时关闭，Stop 可等待
 	started  atomic.Bool
+	// next 下次触发时间（unix 纳秒）：接口页据此显示「下次自动采集倒计时」
+	next atomic.Int64
 }
 
 func New(interval time.Duration, run func()) *Scheduler {
@@ -39,6 +41,15 @@ func (s *Scheduler) Interval() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.interval
+}
+
+// Next 下次自动增量触发的时间；未启动时返回零值
+func (s *Scheduler) Next() time.Time {
+	n := s.next.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
 }
 
 // SetInterval 运行时改间隔：立即按新间隔重新计时。
@@ -69,10 +80,13 @@ func (s *Scheduler) Start() {
 		iv := s.Interval()
 		t := time.NewTicker(iv)
 		defer t.Stop()
+		s.next.Store(time.Now().Add(iv).UnixNano())
 		logx.Printf("[scheduler] 增量采集定时任务已启动，间隔 %v", iv)
 		for {
 			select {
 			case <-t.C:
+				// 先记下次触发时间，再执行任务：页面倒计时不会在任务期间停住
+				s.next.Store(time.Now().Add(s.Interval()).UnixNano())
 				func() {
 					defer func() { // 防止 panic 杀掉定时器
 						if r := recover(); r != nil {
@@ -86,6 +100,7 @@ func (s *Scheduler) Start() {
 				t.Stop()
 				iv = s.Interval()
 				t = time.NewTicker(iv)
+				s.next.Store(time.Now().Add(iv).UnixNano())
 				logx.Printf("[scheduler] 定时增量间隔已更新为 %v", iv)
 			case <-s.stop:
 				return

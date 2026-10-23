@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../api'
+import { auth } from '../auth'
 import { confirmDialog } from '../confirm'
 import { fmtBytes } from '../format'
 import { toast } from '../toast'
@@ -250,19 +251,19 @@ async function installFf() {
 }
 
 // ---- 配置（表单，保存即生效）----
-// 只放「不用重启就能改」的三组：采集 / 下载 / 合并转码。
-// 其余项（监听地址、数据目录、日志级别、内存、封面、数据库）只能在启动时定死，
-// 保留在 config.json 里手改；前端不展示、也不提交，避免误以为已经生效。
+// 只放「不用重启就能改」的几组：采集 / 下载 / 封面 / 合并转码 / 访问密码。
+// 其余项（监听地址、数据目录、日志级别、内存、数据库）只能在启动时定死，
+// 保留在 config.yml 里手改；前端不展示、也不提交，避免误以为已经生效。
 const cfgInfo = ref<ConfigInfo | null>(null)
 const cfgForm = ref<ConfigData | null>(null)
 const cfgOrig = ref('')
 const cfgLoading = ref(false)
 const cfgSaving = ref(false)
-// 完整快照（还原用）；cfgOrig 只存可热更三组的序列化，用于脏检查
+// 完整快照（还原用）；cfgOrig 只存可热更几组的序列化，用于脏检查
 let cfgOrigFull: ConfigData | null = null
 
-/** 只取可热更的三组，用于脏检查与提交 */
-type HotConfig = Pick<ConfigData, 'collect' | 'download' | 'cover' | 'ffmpeg'>
+/** 只取可热更的几组，用于脏检查与提交 */
+type HotConfig = Pick<ConfigData, 'collect' | 'download' | 'cover' | 'ffmpeg' | 'auth'>
 
 function clone<T>(v: T): T {
   return JSON.parse(JSON.stringify(v)) as T
@@ -274,6 +275,7 @@ function hotOf(c: ConfigData): HotConfig {
     download: clone(c.download),
     cover: clone(c.cover),
     ffmpeg: clone(c.ffmpeg),
+    auth: clone(c.auth),
   }
 }
 
@@ -300,7 +302,7 @@ async function saveCfg() {
   if (!cfgForm.value || !cfgDirty.value || cfgSaving.value) return
   if (!(await confirmDialog({
     title: '保存配置',
-    message: '保存后立即生效：正在采集的接口、正在下载的这一集不受影响，下一轮采集 / 下一集开始用新值。继续？',
+    message: '保存后立即生效：正在采集的接口、正在下载的这一集不受影响，下一轮采集 / 下一集开始用新值。\n修改访问密码后当前浏览器会保持登录，其它已登录设备需重新输入新密码。继续？',
     okText: '保存并生效',
   }))) return
   cfgSaving.value = true
@@ -312,6 +314,9 @@ async function saveCfg() {
     cfgForm.value = clone(r.data.config)
     cfgOrigFull = clone(r.data.config)
     cfgOrig.value = JSON.stringify(hotOf(r.data.config))
+    // 访问密码保存后立即生效：同步全局状态（刚设密码时服务端已给当前浏览器续上 Cookie）
+    auth.required = !!r.data.config.auth?.password
+    auth.authed = true
   }
   toast(r.data.msg || '已保存并生效', 'ok', 4000)
 }
@@ -321,7 +326,7 @@ function resetCfg() {
   toast('已还原为磁盘上的内容', 'info', 1500)
 }
 
-/** 低配/标准预设：只覆盖这四组（config.json 里的其它项不动） */
+/** 低配/标准预设：只覆盖采集/下载/封面/ffmpeg 四组（访问密码与其它项不动） */
 function applyPreset(kind: 'lowmem' | 'default') {
   const f = cfgForm.value
   const p = cfgInfo.value?.presets?.[kind]
@@ -334,7 +339,7 @@ function applyPreset(kind: 'lowmem' | 'default') {
 }
 
 // ---- 表单字段描述（渲染用，免得手写几十个输入框）----
-type CfgFieldType = 'text' | 'number' | 'select' | 'bool'
+type CfgFieldType = 'text' | 'number' | 'select' | 'bool' | 'password'
 interface CfgField {
   path: string
   label: string
@@ -388,6 +393,18 @@ const cfgGroups: CfgGroup[] = [
       { path: 'ffmpeg.threads', label: '编码线程数', type: 'number', min: 0, max: 64, hint: '0 = 自动' },
       { path: 'ffmpeg.reencode', label: '需要时重新编码', type: 'bool' },
       { path: 'ffmpeg.verify', label: '合并后校验时长', type: 'bool' },
+    ],
+  },
+  {
+    title: '访问控制',
+    desc: '设置后打开网站要先输入密码，接口调用也要带上密码；留空 = 关闭。',
+    fields: [
+      {
+        path: 'auth.password',
+        label: '访问密码',
+        type: 'password',
+        hint: '最多 128 个字符；留空 = 不需要密码。忘记密码时可直接编辑数据目录 ui.yml 里的 auth.password',
+      },
     ],
   },
 ]
@@ -940,7 +957,7 @@ onBeforeUnmount(() => {
           </div>
 
           <template v-if="cfgForm">
-            <!-- 固定高度 + 内部滚动：四组控件全铺开太长，把页面撑得没法看 -->
+            <!-- 固定高度 + 内部滚动：几组控件全铺开太长，把页面撑得没法看 -->
             <div class="max-h-[46vh] min-w-0 overflow-y-auto overscroll-contain pr-1 sm:max-h-[420px]">
               <div
                 v-for="g in cfgGroups"
@@ -983,10 +1000,11 @@ onBeforeUnmount(() => {
                     <div v-else class="flex items-center gap-1.5">
                       <input
                         :id="'cfg-' + f.path"
-                        :type="f.type === 'number' ? 'number' : 'text'"
+                        :type="f.type === 'number' ? 'number' : f.type === 'password' ? 'password' : 'text'"
                         class="input min-w-0 flex-1"
                         :min="f.min"
                         :max="f.max"
+                        autocomplete="new-password"
                         :value="cfgGet(f.path)"
                         @input="f.type === 'number' ? onCfgNum(f.path, $event) : onCfgText(f.path, $event)"
                       />
@@ -1005,10 +1023,13 @@ onBeforeUnmount(() => {
           </p>
 
           <p class="break-all text-[11px] muted">
-            这里只有<strong>不用重启</strong>的四组：点保存后立即生效，正在跑的那一轮采集、
-            正在下的那一集不受影响，下一轮 / 下一集开始用新值。这些值单独存在数据目录的
+            这里只有<strong>不用重启</strong>的几组（采集 / 下载 / 封面 / ffmpeg / 访问密码）：
+            点保存后立即生效，正在跑的那一轮采集、正在下的那一集不受影响，下一轮 / 下一集开始用新值。
+            设了访问密码后，打开网站要先登录，接口调用也要带 Cookie / <code>X-Access-Password</code> /
+            <code>?password=</code>；当前浏览器在保存时会自动保持登录，其它已登录设备需重新输入新密码。
+            这些值单独存在数据目录的
             <code class="break-all">{{ cfgInfo?.ui_path || 'ui.yml' }}</code>（旧文件备份为 <code>.bak</code>），
-            不碰 <code>config.json</code>。监听地址、数据目录、日志级别、内存限制、数据库等
+            不碰 <code>config.yml</code>。监听地址、数据目录、日志级别、内存限制、数据库等
             <strong>需要重启</strong>的项留在 <code class="break-all">{{ cfgInfo?.path || 'config.yml' }}</code>，页面不涉及。
           </p>
         </section>
