@@ -5,8 +5,9 @@ import CoverImg from '../components/CoverImg.vue'
 import QrShareDialog from '../components/QrShareDialog.vue'
 import { api } from '../api'
 import { copyText } from '../clipboard'
+import { confirmDialog } from '../confirm'
 import { toast } from '../toast'
-import type { Episode, VideoDetail } from '../types'
+import type { Episode, FavItem, VideoDetail } from '../types'
 
 const route = useRoute()
 const router = useRouter()
@@ -14,7 +15,9 @@ const router = useRouter()
 const id = computed(() => Number(route.params.id))
 const detail = ref<VideoDetail | null>(null)
 const loading = ref(true)
-const faved = ref(false)
+// 收藏记录（含自动追更状态）：收藏本身按剧名，追更盯的是「来源 + 线路」
+const favItem = ref<FavItem | null>(null)
+const faved = computed(() => !!favItem.value)
 const favBusy = ref(false)
 const expanded = ref(false)
 
@@ -84,7 +87,7 @@ function syncPolling() {
 async function loadFav() {
   const r = await api.favs()
   if (r.ok && r.data && detail.value) {
-    faved.value = r.data.list.some((f) => f.vod_name === detail.value?.vod_name)
+    favItem.value = r.data.list.find((f) => f.vod_name === detail.value?.vod_name) || null
   }
 }
 
@@ -94,8 +97,51 @@ async function toggleFav() {
   const r = faved.value ? await api.delFav(detail.value.vod_name) : await api.addFav(detail.value.vod_name)
   favBusy.value = false
   if (!r.ok) return toast(r.msg || '操作失败', 'err')
-  faved.value = !faved.value
-  toast(faved.value ? '已收藏' : '已取消收藏', 'ok', 1500)
+  toast(faved.value ? '已取消收藏' : '已收藏', 'ok', 1500)
+  await loadFav()
+}
+
+// ---- 自动追更：盯住当前「来源 + 线路」，采集到新集数自动加入下载 ----
+const autoBusy = ref(false)
+const autoOn = computed(() =>
+  !!favItem.value?.auto_dl &&
+  favItem.value?.auto_vod_id === (curSrc.value?.vod_id || 0) &&
+  favItem.value?.auto_play_from === (curLine.value?.play_from || ''),
+)
+// 已在别的来源/线路上开着：提示一下，避开点了没反应的困惑
+const autoElsewhere = computed(() => {
+  const f = favItem.value
+  if (!f?.auto_dl || autoOn.value) return ''
+  const s = (detail.value?.sources || []).find((x) => x.vod_id === f.auto_vod_id)
+  return [s?.source_name, f.auto_play_from].filter(Boolean).join(' · ')
+})
+
+async function toggleAuto() {
+  if (!detail.value || !curSrc.value || !curLine.value || autoBusy.value) return
+  const name = detail.value.vod_name
+  const line = curLine.value.play_from
+  autoBusy.value = true
+  if (autoOn.value) {
+    const yes = await confirmDialog({
+      title: '关闭自动追更',
+      message: `关闭「${name}」在 ${line} 这条线路的自动追更？已经加入队列的下载不受影响。`,
+      okText: '关闭追更',
+    })
+    if (!yes) {
+      autoBusy.value = false
+      return
+    }
+    const r = await api.setFavAuto(name, curSrc.value.vod_id, line, false)
+    autoBusy.value = false
+    if (!r.ok) return toast(r.msg || '操作失败', 'err')
+    toast('已关闭自动追更', 'ok', 1800)
+  } else {
+    const r = await api.setFavAuto(name, curSrc.value.vod_id, line, true)
+    autoBusy.value = false
+    if (!r.ok) return toast(r.msg || '开启失败', 'err')
+    toast(r.data?.msg || '已开启自动追更', 'ok', 3200)
+  }
+  await loadFav()
 }
 
 function pickSource(i: number) {
@@ -282,8 +328,24 @@ onBeforeUnmount(() => { if (poll !== undefined) window.clearInterval(poll) })
           下载选中（{{ selected.size }}）
         </button>
         <button class="btn btn-ghost btn-sm" :disabled="busy" @click="doDownload(true)">下载整条线路</button>
+        <button
+          class="btn btn-sm" :class="autoOn ? 'btn-primary' : 'btn-ghost'"
+          :disabled="autoBusy || !curLine"
+          :title="autoOn ? '这条线路出现新集数会自动加入下载，点此关闭' : '盯住当前来源的这条线路，出现新集数自动加入下载'"
+          @click="toggleAuto"
+        >{{ autoOn ? '● 追更中' : '自动追更' }}</button>
         <span class="ml-auto text-xs muted">每集一个 mp4</span>
       </div>
+
+      <!-- 自动追更状态：只追开启之后的新集数，已更新的不重下 -->
+      <p v-if="autoOn" class="text-xs text-emerald-600 dark:text-emerald-400">
+        已开启自动追更：{{ curSrc?.source_name }} · {{ curLine?.play_from }} 出现新集数时自动加入下载
+        <span v-if="(favItem?.auto_new_eps || 0) > 0" class="opacity-80">（{{ favItem?.auto_new_eps }} 集待入队，下次采集触发）</span>
+      </p>
+      <p v-else-if="autoElsewhere" class="text-xs muted">
+        自动追更已盯住 {{ autoElsewhere }}，点「自动追更」可改盯当前线路
+      </p>
+      <p v-else class="text-xs muted">开启后只追这条线路今后更新的集数，已更新的不重下</p>
 
       <!-- 剧集 -->
       <div class="grid grid-cols-2 gap-2 sm:grid-cols-3 md:grid-cols-5 xl:grid-cols-7">

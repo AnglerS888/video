@@ -57,6 +57,16 @@ export const api = {
   seenFav(vod_name: string) {
     return req<unknown>(`/api/favs/seen?name=${encodeURIComponent(vod_name)}`, { method: 'POST' })
   },
+  /**
+   * 自动追更：盯住「某个来源的某条线路」，采集到新集数时自动加入下载。
+   * 开启时传 vod_id + play_from；关闭只传 vod_name（enabled=false）。
+   */
+  setFavAuto(vod_name: string, vod_id: number, play_from: string, enabled: boolean) {
+    return req<{ auto_dl: number; auto_play_from?: string; auto_new_eps?: number; msg?: string }>(
+      '/api/favs/auto',
+      json({ vod_name, vod_id, play_from, enabled }),
+    )
+  },
 
   /* ---- 下载 ---- */
   downloads() {

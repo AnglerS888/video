@@ -74,11 +74,13 @@ type Collect struct {
 }
 
 // Download 下载与磁盘保护
+// 自动追更：收藏的剧在「指定来源 + 指定线路」上出现新集数时，采集结束后自动加入下载队列。
 type Download struct {
-	Workers        int `json:"workers" yaml:"workers"`                 // 同时下载的集数（实际固定串行）
-	SegConcurrency int `json:"seg_concurrency" yaml:"seg_concurrency"` // 单任务分片并发
-	SegBudget      int `json:"seg_budget" yaml:"seg_budget"`           // 全局分片并发上限，0=workers×seg_concurrency
-	MinFreeMB      int `json:"min_free_mb" yaml:"min_free_mb"`         // 磁盘剩余空间保护阈值（MiB），0=关闭
+	Workers        int  `json:"workers" yaml:"workers"`                 // 同时下载的集数（实际固定串行）
+	SegConcurrency int  `json:"seg_concurrency" yaml:"seg_concurrency"` // 单任务分片并发
+	SegBudget      int  `json:"seg_budget" yaml:"seg_budget"`           // 全局分片并发上限，0=workers×seg_concurrency
+	MinFreeMB      int  `json:"min_free_mb" yaml:"min_free_mb"`         // 磁盘剩余空间保护阈值（MiB），0=关闭
+	AutoNewEp      bool `json:"auto_new_ep" yaml:"auto_new_ep"`         // 自动追更：新集数自动加入下载（总开关）
 }
 
 // Cover 封面
@@ -114,7 +116,7 @@ func Defaults() *Config {
 		MemLimitMB: 0,
 		MaxProcs:   0,
 		Collect:    Collect{Pages: 6, Sources: 8, IncrEvery: "1h", IncrPages: 5},
-		Download:   Download{Workers: 1, SegConcurrency: 16, SegBudget: 0, MinFreeMB: 2048},
+		Download:   Download{Workers: 1, SegConcurrency: 16, SegBudget: 0, MinFreeMB: 2048, AutoNewEp: true},
 		Cover:      Cover{Workers: 2, Concurrency: 4},
 		FFmpeg:     FFmpeg{Threads: 0, Reencode: true, Verify: true},
 		DB:         DB{CacheMB: 64, MmapMB: 1024, Conns: 4, PageSize: 0, VacuumPct: 15},
@@ -686,10 +688,11 @@ type collectPatch struct {
 }
 
 type downloadPatch struct {
-	Workers        *int `json:"workers" yaml:"workers"`
-	SegConcurrency *int `json:"seg_concurrency" yaml:"seg_concurrency"`
-	SegBudget      *int `json:"seg_budget" yaml:"seg_budget"`
-	MinFreeMB      *int `json:"min_free_mb" yaml:"min_free_mb"`
+	Workers        *int  `json:"workers" yaml:"workers"`
+	SegConcurrency *int  `json:"seg_concurrency" yaml:"seg_concurrency"`
+	SegBudget      *int  `json:"seg_budget" yaml:"seg_budget"`
+	MinFreeMB      *int  `json:"min_free_mb" yaml:"min_free_mb"`
+	AutoNewEp      *bool `json:"auto_new_ep" yaml:"auto_new_ep"`
 }
 
 type coverPatch struct {
@@ -797,6 +800,9 @@ func (p *downloadPatch) apply(c *Config) {
 	}
 	if p.MinFreeMB != nil {
 		c.Download.MinFreeMB = *p.MinFreeMB
+	}
+	if p.AutoNewEp != nil {
+		c.Download.AutoNewEp = *p.AutoNewEp
 	}
 }
 

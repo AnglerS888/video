@@ -29,6 +29,9 @@ curl -fsSL https://gitee.com/anglers/video/raw/master/deploy.sh | bash
 - **下载** —— m3u8 分片并发拉取，ffmpeg 合并为 mp4，带进度、速度、暂停与续传
 - **本地库** —— 按剧分组管理已下载内容，记录播放位置，支持续播与自动下一集
 - **收藏** —— 按剧名收藏，显示源站更新时间是否变化
+- **自动追更** —— 在详情页为某部剧指定「来源 + 线路」，采集到这条线路的新集数时自动加入下载队列；
+  只追开启之后的新集数（不倒追已有全集），入队失败（磁盘不足 / 队列满）不推进水位，下一轮采集重试；
+  总开关在「信息」页 →「运行配置」→「下载」，具体盯哪部剧逐部在详情页开启
 - **分享** —— 生成局域网「分享页」链接与二维码；链接带随机令牌、永久有效，
   对方打开的是页面，可自行播放/下载，不会直接拿到视频文件地址
 - **封面本地化** —— 抓取并压缩封面存到本地，页面只读本地文件；确实拉不到时显示内置占位图
@@ -199,14 +202,14 @@ docker build --build-arg GOPROXY=https://proxy.golang.org,direct -t videodl:late
 | 页面 | 路径 | 说明 |
 |---|---|---|
 | 影视库 | `/` | 搜索、按年份/地区/类型筛选，同名多源合并展示 |
-| 详情 | `/v/:id` | 多源多线路、分集列表，可单集下载或整剧下载 |
+| 详情 | `/v/:id` | 多源多线路、分集列表，可单集下载或整剧下载；可为当前线路开启/关闭自动追更 |
 | 本地 | `/local` | 已下载完成的内容，按剧分组；支持单集/整部删除（文件与记录一起删） |
 | 下载 | `/downloads` | 未完成任务：进度、速度、暂停/继续/删除，可「优先下载」插队 |
 | 观看历史 | `/history` | 全部播放记录（进度、上次观看时间），可只看未看完、移除单条或清空 |
 | 播放（本地） | `/watch/:id` | 播放已下载的 mp4，自动续播、自动下一集；← → 切集；倍速会被记住 |
 | 在线播放 | `/online/:vid` | 直接播源站 m3u8，不占磁盘；可换线路 |
 | 分享页 | `/s/:token` | 发给别人的独立页面（无站点导航），可播放/下载，同剧其它集可直接切换；令牌永久有效（删除下载记录时失效；旧数字 id 链接仅本机可打开） |
-| 收藏 | `/favorites` | 按剧名收藏，提示源站是否有更新 |
+| 收藏 | `/favorites` | 按剧名收藏，提示源站是否有更新；开了自动追更的卡片显示追更线路与待入队集数，可直接关闭追更 |
 | 来源 | `/sources` | 接口增删改、连通性测试、全量/增量/排队/取消排队/停止、自动增量开关、下次自动采集倒计时、增量同步记录（分页 + 影片明细） |
 | 接口文档 | `/api-docs` | 站点自身 HTTP 接口一览（方法、路径、参数），可复制 curl |
 | 网站信息 | `/info` | 版本与在线更新、运行环境、数据占用、磁盘、内存、数据库空闲页、ffmpeg 安装、封面缓存检查；「运行配置」含采集 / 下载 / 封面 / ffmpeg / 访问密码 |
@@ -492,6 +495,7 @@ auth:
 | `download.seg_concurrency` | `16` | 单任务分片并发 |
 | `download.seg_budget` | `0` | 全局分片并发上限，0=自动 |
 | `download.min_free_mb` | `2048` | 磁盘保护阈值（MiB）：低于该值拒绝新下载并暂停队列，0=关闭 |
+| `download.auto_new_ep` | `true` | 自动追更总开关：开着才会处理详情页里逐部开启的追更（默认开，不开启就不会凭空下载） |
 | `cover.workers` | `2` | 封面预取协程数 |
 | `cover.concurrency` | `4` | 封面同时连接/解码的并发上限 |
 | `cover.img_proxy` | 空 | 图片代理前缀，如 `https://wsrv.nl/?url=`；填写后取图优先走代理，留空只用直连 |
@@ -512,7 +516,7 @@ auth:
 | 分组 | 项 | 生效时机 |
 |---|---|---|
 | 采集 | `collect.pages` / `sources` / `incr_every` / `incr_pages` | 下一轮采集、下一次定时增量（间隔立即重排） |
-| 下载 | `download.workers` / `seg_concurrency` / `seg_budget` / `min_free_mb` | 下一集开始下载 |
+| 下载 | `download.workers` / `seg_concurrency` / `seg_budget` / `min_free_mb` / `auto_new_ep` | 下一集开始下载、下一轮采集追更 |
 | 封面 | `cover.workers` / `concurrency` / `img_proxy` | 立即 |
 | 合并转码 | `ffmpeg.threads` / `reencode` / `verify` | 下一次合并 |
 | 访问控制 | `auth.password` | 立即（保存后当前浏览器保持登录，其它已登录设备需重新输入） |
@@ -622,7 +626,7 @@ sqlite3 videodl.db < migrations/upgrade-v1.4.1-current.sql
 | `vod_download` | 下载任务 |
 | `vod_sync_state` | 采集断点（全量/增量） |
 | `vod_watch_history` | 观看进度（≥95% 记完成） |
-| `vod_fav` | 收藏（按剧名） |
+| `vod_fav` | 收藏（按剧名；含自动追更开关 `auto_dl`、盯的 `auto_vod_id` / `auto_play_from`、已处理水位 `auto_ep_max`） |
 | `vod_share_token` | 分享令牌（随机串、失效时间；避免用自增 id 当凭据） |
 | `app_meta` | 一次性维护任务的标记（如历史数据清理） |
 
@@ -747,10 +751,11 @@ curl -H 'X-Access-Password: 你的密码' http://localhost:5200/api/videos
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/favs` | 收藏列表 |
+| GET | `/api/favs` | 收藏列表（含追更状态 `auto_dl` / `auto_vod_id` / `auto_play_from` / 待入队 `auto_new_eps`） |
 | POST | `/api/favs` | 添加收藏 |
 | DELETE | `/api/favs` | 取消收藏 |
 | POST | `/api/favs/seen` | 标记收藏已查看（记录当时的更新备注） |
+| POST | `/api/favs/auto` | 开关自动追更 `{"vod_name":"…","vod_id":1,"play_from":"m3u8","enabled":true}`；`enabled:false` 只需 `vod_name` |
 | GET | `/api/auth/status` | 是否启用访问密码、当前浏览器是否已登录（不需要密码） |
 | POST | `/api/auth/login` | 登录 `{"password":"…"}`，成功后下发 HttpOnly Cookie（不需要密码） |
 | POST | `/api/auth/logout` | 退出登录（清 Cookie）（不需要密码） |

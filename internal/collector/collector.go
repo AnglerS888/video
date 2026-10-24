@@ -1235,6 +1235,11 @@ func (c *Collector) runJob(job pendingJob) {
 	} else {
 		c.crawl(src, 0, 0)
 	}
+	// 采集结束：收藏的剧在本接口的指定线路上出现新集数时自动加入下载。
+	// 放在 crawl 之后（而不是每页保存时）：采集收尾时 vod_play 才是这条线路的完整集数。
+	if n := c.AutoDownloadNewEpisodes(src.ID); n > 0 {
+		logx.Printf("[auto-dl] %s 采集结束，自动追更加入 %d 个下载任务", src.Name, n)
+	}
 }
 
 // IsQueued 该接口是否在排队等待采集

@@ -234,6 +234,9 @@ func main() {
 	// 下载任务并发，文件保存到 data/videos
 	collector.SetDownloadConcurrency(cfg.Download.SegConcurrency)
 	collector.SetMinFreeBytes(int64(cfg.Download.MinFreeMB) << 20)
+	// 自动追更总开关：收藏的剧在指定线路上出现新集数时，采集结束自动加入下载
+	collector.SetAutoNewEpEnabled(cfg.Download.AutoNewEp)
+	logx.Infof("[download] 自动追更：%s（在详情页为某部剧开启后生效）", onOff(cfg.Download.AutoNewEp))
 	if cfg.Download.MinFreeMB > 0 {
 		logx.Infof("[download] 磁盘保护：剩余空间低于 %d MiB 时拒绝新下载并自动暂停队列", cfg.Download.MinFreeMB)
 	}
@@ -269,6 +272,7 @@ func main() {
 
 		collector.SetDownloadConcurrency(c.Download.SegConcurrency)
 		collector.SetMinFreeBytes(int64(c.Download.MinFreeMB) << 20)
+		collector.SetAutoNewEpEnabled(c.Download.AutoNewEp)
 		budget := c.Download.SegBudget
 		if budget <= 0 {
 			budget = c.Download.Workers * c.Download.SegConcurrency
@@ -281,9 +285,9 @@ func main() {
 		collector.SetCoverConcurrency(c.Cover.Concurrency)
 		collector.SetImageProxy(c.Cover.ImgProxy)
 
-		logx.Infof("[config] 已热更新：采集 %d 分页 × %d 接口 / 增量每 %v 前 %d 页 | 下载分片并发 %d，全局上限 %d，磁盘保护 %d MiB | 封面 %d 任务 × %d 并发（代理=%s）| ffmpeg 线程 %d（全量重编码=%v，校验=%v）",
+		logx.Infof("[config] 已热更新：采集 %d 分页 × %d 接口 / 增量每 %v 前 %d 页 | 下载分片并发 %d，全局上限 %d，磁盘保护 %d MiB，自动追更 %s | 封面 %d 任务 × %d 并发（代理=%s）| ffmpeg 线程 %d（全量重编码=%v，校验=%v）",
 			c.Collect.Pages, c.Collect.Sources, c.IncrEveryDuration(), c.Collect.IncrPages,
-			c.Download.SegConcurrency, budget, c.Download.MinFreeMB,
+			c.Download.SegConcurrency, budget, c.Download.MinFreeMB, onOff(c.Download.AutoNewEp),
 			c.Cover.Workers, c.Cover.Concurrency, orNo(c.Cover.ImgProxy),
 			c.FFmpeg.Threads, c.FFmpeg.Reencode, c.FFmpeg.Verify)
 		return []string{"collect", "download", "cover", "ffmpeg"}
@@ -384,6 +388,14 @@ func orNo(s string) string {
 		return "无"
 	}
 	return s
+}
+
+// onOff 布尔开关的中文显示（日志用）
+func onOff(b bool) string {
+	if b {
+		return "开启"
+	}
+	return "关闭"
 }
 
 // defaultDataDir 默认数据目录名（SQLite、封面、下载文件、ffmpeg 缓存都在这里）

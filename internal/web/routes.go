@@ -60,6 +60,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/favs", guard(s.addFav))
 	mux.HandleFunc("DELETE /api/favs", guard(s.delFav))
 	mux.HandleFunc("POST /api/favs/seen", guard(s.seenFav))
+	// 自动追更：盯住「来源 + 线路」，采集到新集数时自动加入下载（没收藏会自动收藏）
+	mux.HandleFunc("POST /api/favs/auto", guard(s.setFavAuto))
 
 	// 下载（单位：视频 + 播放源）
 	mux.HandleFunc("POST /api/download", guard(s.enqueueDownload))

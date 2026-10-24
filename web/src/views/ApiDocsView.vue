@@ -249,7 +249,7 @@ const groups: ApiGroup[] = [
         params: [{ in: 'path', name: 'id', desc: 'download_id', required: true }],
       },
       { m: 'DELETE', p: '/api/watch/history', d: '清空历史', confirm: '清空全部观看记录（已下载的文件不受影响）。' },
-      { m: 'GET', p: '/api/favs', d: '收藏列表' },
+      { m: 'GET', p: '/api/favs', d: '收藏列表（含自动追更状态 auto_dl / auto_vod_id / auto_play_from / auto_new_eps）' },
       { m: 'POST', p: '/api/favs', d: '添加收藏', body: { vod_name: '片名' } },
       {
         m: 'DELETE', p: '/api/favs', d: '取消收藏',
@@ -258,6 +258,11 @@ const groups: ApiGroup[] = [
       {
         m: 'POST', p: '/api/favs/seen', d: '把收藏标记为已看过更新',
         params: [{ in: 'query', name: 'name', desc: '片名', required: true }],
+      },
+      {
+        m: 'POST', p: '/api/favs/auto',
+        d: '开关自动追更：盯住某部剧在指定来源的某条线路，采集到新集数自动加入下载',
+        body: { vod_name: '片名', vod_id: 1, play_from: 'm3u8', enabled: true },
       },
     ],
   },

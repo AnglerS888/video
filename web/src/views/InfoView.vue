@@ -375,6 +375,7 @@ const cfgGroups: CfgGroup[] = [
       { path: 'download.seg_concurrency', label: '单个任务的分片并发', type: 'number', unit: '片', min: 1, max: 64 },
       { path: 'download.seg_budget', label: '全局分片并发上限', type: 'number', unit: '片', min: 0, max: 512, hint: '0 = 集数 × 分片并发' },
       { path: 'download.min_free_mb', label: '磁盘剩余保护阈值', type: 'number', unit: 'MiB', min: 0, hint: '低于该值暂停下载；0 = 关闭' },
+      { path: 'download.auto_new_ep', label: '自动追更下载', type: 'bool', hint: '总开关；具体盯哪部剧要在详情页逐部开启' },
     ],
   },
   {

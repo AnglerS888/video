@@ -205,6 +205,14 @@ export interface FavItem {
   created_at: string
   has_update: boolean
   gone: boolean
+  /** 1 = 已开启自动追更（指定来源 + 线路出现新集数时自动下载） */
+  auto_dl: number
+  /** 追更盯的 vod_info.id（决定来源） */
+  auto_vod_id: number
+  /** 追更盯的播放线路 */
+  auto_play_from: string
+  /** 该线路里还没入队的新集数（0 = 已追平） */
+  auto_new_eps: number
 }
 
 export interface DownloadTask {
@@ -378,7 +386,7 @@ export interface ConfigData {
   mem_limit_mb: number
   max_procs: number
   collect: { pages: number; sources: number; incr_every: string; incr_pages: number }
-  download: { workers: number; seg_concurrency: number; seg_budget: number; min_free_mb: number }
+  download: { workers: number; seg_concurrency: number; seg_budget: number; min_free_mb: number; auto_new_ep: boolean }
   cover: { workers: number; concurrency: number; img_proxy: string }
   ffmpeg: { threads: number; reencode: boolean; verify: boolean }
   /** 访问密码（存在 ui.yml；留空 = 不启用）：启用后站点要登录，接口要带密码 */

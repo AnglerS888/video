@@ -246,7 +246,13 @@ CREATE TABLE IF NOT EXISTS vod_fav (
 	vod_name        TEXT PRIMARY KEY,
 	created_at      DATETIME DEFAULT CURRENT_TIMESTAMP,
 	seen_remarks    TEXT DEFAULT '',   -- 收藏/上次查看时的更新备注快照
-	seen_updated_at TEXT DEFAULT ''    -- 收藏/上次查看时的源站更新时间快照
+	seen_updated_at TEXT DEFAULT '',   -- 收藏/上次查看时的源站更新时间快照
+	-- 自动追更：盯住「某个来源的某条线路」，出现新集数时自动加入下载
+	auto_dl         INTEGER NOT NULL DEFAULT 0,  -- 1=开启自动追更
+	auto_vod_id     INTEGER NOT NULL DEFAULT 0,  -- 盯的 vod_info.id（决定来源，0=未指定）
+	auto_play_from  TEXT NOT NULL DEFAULT '',    -- 盯的播放线路（play_from）
+	auto_ep_max     INTEGER NOT NULL DEFAULT -1, -- 已处理到的最大集号（-1=未初始化，只记水位不下载）
+	auto_updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 采集断点状态：全量采集可中断续采（6 万页级别的源站必需）
@@ -488,6 +494,14 @@ func migrate(d *sql.DB) {
 	ensureColumn(d, "vod_download", "share_expires_at", "TEXT NOT NULL DEFAULT ''")
 	// 增量同步记录：本次新增/更新的影片明细（JSON 数组，旧库补列；默认空数组）
 	ensureColumn(d, "vod_sync_log", "items", "TEXT NOT NULL DEFAULT '[]'")
+	// 自动追更（收藏的剧在指定线路上出现新集数时自动下载）：旧库补列，默认关闭
+	ensureColumn(d, "vod_fav", "auto_dl", "INTEGER NOT NULL DEFAULT 0")
+	ensureColumn(d, "vod_fav", "auto_vod_id", "INTEGER NOT NULL DEFAULT 0")
+	ensureColumn(d, "vod_fav", "auto_play_from", "TEXT NOT NULL DEFAULT ''")
+	ensureColumn(d, "vod_fav", "auto_ep_max", "INTEGER NOT NULL DEFAULT -1")
+	// 注意：ALTER TABLE ADD COLUMN 的默认值必须是常量，不能写 CURRENT_TIMESTAMP，
+	// 所以旧库补的这一列用空串默认值（代码里写库时显式给时间）。
+	ensureColumn(d, "vod_fav", "auto_updated_at", "TEXT NOT NULL DEFAULT ''")
 	migrateDetailContent(d)
 	migrateDownloadEpIndex(d)
 	// 兜底：整表重建（migrateDownloadEpIndex）之后再确认这两列还在。
