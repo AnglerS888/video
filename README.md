@@ -14,7 +14,7 @@
 ![Go](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-%E6%94%AF%E6%8C%81-2496ED?logo=docker&logoColor=white)
 
-[功能](#功能) · [界面预览](#界面预览) · [安装](#安装) · [怎么用](#怎么用) · [在线更新](#在线更新) · [常见问题](#常见问题)
+[功能](#功能) · [界面预览](#界面预览) · [安装](#安装) · [怎么用](#怎么用) · [在线更新](#在线更新) · [常见问题](#常见问题) · [关于作者](#关于作者)
 
 <img src="docs/screenshot-home.png" width="820" alt="影视库首页">
 
@@ -136,6 +136,19 @@ Docker 部署的，进「信息」页 →「版本与更新」：
 
 **封面显示不出来？**
 部分源站有防盗链。程序会把封面抓到本地，抓不到时显示内置占位图，不影响播放。
+
+## 关于作者
+
+- **作者微信**：`KFC_good` —— 使用问题、部署求助、功能定制都可以加，备注一下「影视库」即可。
+- 如果这个项目帮到了你，欢迎请作者喝杯咖啡：
+
+<div align="center">
+
+<img src="docs/reward.jpg" width="280" alt="赞赏码">
+
+<sub>Anglers 的赞赏码</sub>
+
+</div>
 
 ## 说明
 
