@@ -46,7 +46,7 @@ func (s *Server) applyUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !version.InDocker() {
-		fail(w, "当前为直接运行模式，不支持自动更新。请到 "+version.RepoURL(version.Repo)+" 下载最新版本后手动替换")
+		fail(w, "当前为直接运行模式，不支持自动更新。请到 "+version.RepoLinksText()+" 下载最新版本后手动替换")
 		return
 	}
 	force := r.URL.Query().Get("force")

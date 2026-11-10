@@ -274,7 +274,7 @@ const groups: ApiGroup[] = [
         params: [{ in: 'query', name: 'fresh', desc: '1 = 跳过缓存', example: '1' }],
       },
       { m: 'GET', p: '/api/version', d: '版本与更新状态' },
-      { m: 'POST', p: '/api/update/check', d: '检查 Gitee 是否有新版本（最长 45 秒）' },
+      { m: 'POST', p: '/api/update/check', d: '检查 Gitee / GitHub 是否有新版本（最长 45 秒）' },
       {
         m: 'POST', p: '/api/update/apply', d: '下载最新源码（仅 Docker 容器内可用）',
         params: [{ in: 'query', name: 'force', desc: '1 = 忽略版本号强制更新', example: '1' }],

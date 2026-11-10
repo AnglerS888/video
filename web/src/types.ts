@@ -345,7 +345,7 @@ export interface UpdateInfo {
   build_time: string
   /** docker / direct */
   mode: string
-  /** 更新源仓库网页地址（Gitee） */
+  /** 更新源仓库网页地址（检查后为命中的那个仓库：Gitee 或 GitHub） */
   site_url: string
   repo: string
   branch: string

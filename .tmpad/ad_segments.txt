@@ -1,0 +1,16 @@
+m3u8: https://v15.wsyzym3u8.com/202609/30/D0B1D0qnTG27/video/2000k_1080/hls/index.m3u8
+总段数 624，总时长 1247.77s
+广告段 #154 ~ #159（5:08.00 ~ 5:19.77，共 11.77s）
+
+154  5:08.00 ~ 5:10.10  dur=2.100s  disc_before=Y  pts=316840  sps=1904x1072
+     https://v15.wsyzyts.vip/202609/30/D0B1D0qnTG27/video/2000k_1080/hls/pfajT3JUoF.ts?sign=1793251515-7f2FMX4tvtpZFWR4-b50e7da3cc221dc0ca2aa3fc2300ec63
+155  5:10.10 ~ 5:12.10  dur=2.000s  disc_before=-  pts=705448  sps=无(非IDR起点)
+     https://v15.wsyzyts.vip/202609/30/D0B1D0qnTG27/video/2000k_1080/hls/Yn7Y82acsA.ts?sign=1793251515-9WraAwkMiejifcOv-1f9a31b0af29d7d8db6c05a35e27284f
+156  5:12.10 ~ 5:14.10  dur=2.000s  disc_before=-  pts=1082056  sps=无(非IDR起点)
+     https://v15.wsyzyts.vip/202609/30/D0B1D0qnTG27/video/2000k_1080/hls/igrZtiYNPy.ts?sign=1793251515-yGMzuA2oGicYj3Nh-dccdba6c757f6d42d825a67e8d2be888
+157  5:14.10 ~ 5:16.07  dur=1.967s  disc_before=-  pts=1425896  sps=无(非IDR起点)
+     https://v15.wsyzyts.vip/202609/30/D0B1D0qnTG27/video/2000k_1080/hls/PWhVzGL0Yz.ts?sign=1793251515-sG7rxT90WZexJhzW-ca00dabab341ea504983ace209222f39
+158  5:16.07 ~ 5:18.00  dur=1.933s  disc_before=-  pts=1748736  sps=无(非IDR起点)
+     https://v15.wsyzyts.vip/202609/30/D0B1D0qnTG27/video/2000k_1080/hls/iIGeB68cxJ.ts?sign=1793251515-nx9PTRtQsuWXT9aL-d64b04ad1f116dcdf1e9357a003f1ad4
+159  5:18.00 ~ 5:19.77  dur=1.767s  disc_before=-  pts=2131344  sps=无(非IDR起点)
+     https://v15.wsyzyts.vip/202609/30/D0B1D0qnTG27/video/2000k_1080/hls/qYV8P4GsVB.ts?sign=1793251515-gXhEvdxWayUkdpef-2ed144ef65fb57fd786a249baf8b87f9

@@ -311,11 +311,15 @@ func main() {
 	// 先在后台跑完，别让第一个打开「信息」页的请求同步等全盘扫描
 	go sysinfo.DirUsageOf(dataDir)
 
-	// 在线更新器：更新源固定为 Gitee（anglers/video@master），配置里不再保留 update 段。
-	// 匿名下载偶尔被 Gitee 要求验证，可用环境变量 VDL_UPDATE_TOKEN 提供私人令牌。
+	// 在线更新器：同一份代码的两个仓库（Gitee + GitHub），检查时取最新、下载时互相回退。
+	// 匿名下载偶尔被 Gitee 要求验证，可用环境变量 VDL_UPDATE_TOKEN 提供私人令牌（只对 Gitee 生效）。
 	up := updater.New(dataDir, version.Repo, version.Branch, os.Getenv("VDL_UPDATE_TOKEN"))
-	logx.Infof("[update] 在线更新：gitee // %s（分支 %s），运行方式 %s",
-		version.Repo, version.Branch, version.ModeText())
+	srcs := make([]string, 0, len(version.Remotes))
+	for _, r := range version.Remotes {
+		srcs = append(srcs, r.Name+" "+r.Repo+"@"+r.Branch)
+	}
+	logx.Infof("[update] 在线更新：%s，运行方式 %s",
+		strings.Join(srcs, " / "), version.ModeText())
 
 	srv := &web.Server{
 		DB: database, Col: col, DataDir: dataDir,

@@ -1,19 +1,22 @@
 // Package updater 实现在线检查与更新。
 //
-// 更新源只支持 Gitee（GitHub 仓库已删除，不再做镜像回退）。
+// 更新源是同一份代码的两个仓库：Gitee（anglers/video@master）与
+// GitHub（AnglerS888/video@main）。检查时逐个查，取版本号最高（相同则提交最新）
+// 的那个；下载源码包失败时按同样顺序回退到另一个仓库。
 // 没有 release / tag 依赖，所以以「分支最新提交 + 仓库根目录 VERSION 文件」为准，
 // 三个信号任一命中即视为有更新：
 //  1. 远端 VERSION 比本地版本号大；
 //  2. 本地记录了构建提交，且与远端最新提交不同；
 //  3. 本地没有提交哈希时，远端提交时间晚于构建时间（+2 分钟容差）。
 //
-// 更新：直接下载 Gitee 的源码包 /repository/archive/<branch>.zip。
+// 两个源的探测方式不同：Gitee 直接读 raw 文件（会 302 到 raw.giteeusercontent.com）；
+// GitHub 的 raw.githubusercontent.com 国内经常不通，所以走 OpenAPI 的 contents 接口取 base64。
 //
 // 只支持 Docker 容器内更新。2026-10-21 起运行镜像自带 Go 工具链（golang 基座），
 // 流程是「下载源码 → 容器内 go build → 原子替换二进制 → 原地 exec 重启（PID 不变，
 // 容器不退出）」；旧的精简镜像（容器里找不到 go 命令）自动回退为
 // 「下载源码到数据目录 → 给出在宿主机重建镜像的指令」。
-// 直接运行（单个二进制 / NAS 裸跑）**不提供自动更新**，页面上只给 Gitee 仓库链接，
+// 直接运行（单个二进制 / NAS 裸跑）**不提供自动更新**，页面上只给仓库链接，
 // 由用户自己下载最新版本替换。
 package updater
 
@@ -21,6 +24,7 @@ import (
 	"archive/zip"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,7 +62,7 @@ type Info struct {
 	CurrentCommit   string   `json:"current_commit"`
 	BuildTime       string   `json:"build_time"`
 	Mode            string   `json:"mode"`     // docker / direct
-	SiteURL         string   `json:"site_url"` // 仓库网页地址（Gitee）
+	SiteURL         string   `json:"site_url"` // 仓库网页地址（检查后为命中的那个源）
 	Repo            string   `json:"repo"`
 	Branch          string   `json:"branch"`
 	LatestVersion   string   `json:"latest_version"`
@@ -88,9 +92,9 @@ type Status struct {
 // Updater 更新器。同一进程只用一个实例。
 type Updater struct {
 	dataDir string
-	repo    string
-	branch  string
-	token   string // 可选的 Gitee 私人令牌（配置后走官方 zipball 接口，不依赖匿名下载）
+	remotes []version.Remote // 全部更新源，按优先级排列
+	active  int              // 上次检查命中的源下标（下载时优先用它），受 mu 保护
+	token   string           // 可选的 Gitee 私人令牌（配置后走官方 zipball 接口，不依赖匿名下载）
 	client  *http.Client
 
 	mu      sync.Mutex
@@ -100,19 +104,36 @@ type Updater struct {
 	running bool
 }
 
-// New 创建更新器。repo/branch 为空时用 version 包里的默认值（anglers/video@master）；
-// token 是可选的 Gitee 私人令牌，配了就优先用官方 zipball 接口。
+// New 创建更新器。
+//
+// repo/branch 传空或传 version 包里的默认值（main.go 就是这么调的）时，
+// 使用 version.Remotes 里的全部仓库（Gitee + GitHub 双源）。
+// 传了别的 repo 视为自建 fork：只用它一个源，形态沿用 Gitee。
+// token 是可选的 Gitee 私人令牌，配了就优先用官方 zipball 接口（GitHub 源不使用令牌）。
 func New(dataDir, repo, branch, token string) *Updater {
-	if repo == "" {
-		repo = version.Repo
+	remotes := make([]version.Remote, 0, len(version.Remotes))
+	for _, r := range version.Remotes {
+		if repo != "" && repo != version.Repo && r.Name == "gitee" {
+			r.Repo = repo
+			if branch != "" {
+				r.Branch = branch
+			}
+		}
+		if repo != "" && repo != version.Repo && r.Name != "gitee" {
+			continue // 自建 fork 只留一个源，别去查官方镜像
+		}
+		remotes = append(remotes, r)
 	}
-	if branch == "" {
-		branch = version.Branch
+	if len(remotes) == 0 {
+		remotes = []version.Remote{{
+			Name: "gitee", Label: "Gitee",
+			Site: version.SiteBase, API: version.SiteBase + "/api/v5",
+			Repo: version.Repo, Branch: version.Branch,
+		}}
 	}
 	u := &Updater{
 		dataDir: dataDir,
-		repo:    repo,
-		branch:  branch,
+		remotes: remotes,
 		token:   strings.TrimSpace(token),
 		client: &http.Client{
 			Timeout: 20 * time.Second,
@@ -265,23 +286,55 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
+// activeRemote 当前选中的源：上次检查命中的那个，没检查过就用第一个。
+// remotes 构造后只读，只有 active 需要加锁。
+func (u *Updater) activeRemote() version.Remote {
+	u.mu.Lock()
+	i := u.active
+	u.mu.Unlock()
+	if i < 0 || i >= len(u.remotes) {
+		i = 0
+	}
+	return u.remotes[i]
+}
+
+func (u *Updater) setActive(i int) {
+	u.mu.Lock()
+	if i >= 0 && i < len(u.remotes) {
+		u.active = i
+	}
+	u.mu.Unlock()
+}
+
 func (u *Updater) ua() string {
-	return "videoDownload-updater/" + version.Version + " (+" + version.RepoURL(u.repo) + ")"
+	return "videoDownload-updater/" + version.Version + " (+" + u.remotes[0].PageURL() + ")"
 }
 
-// apiCommitURL 分支最新提交的 API 地址（Gitee OpenAPI v5）
-func (u *Updater) apiCommitURL() string {
-	return fmt.Sprintf("%s/api/v5/repos/%s/commits/%s", version.SiteBase, u.repo, u.branch)
+// commitURL 分支最新提交的 API 地址。
+// Gitee 与 GitHub 的形状一致：{API}/repos/{repo}/commits/{branch}
+func commitURL(r version.Remote) string {
+	return fmt.Sprintf("%s/repos/%s/commits/%s", r.API, r.Repo, r.Branch)
 }
 
-// rawFileURL 仓库内原始文件（Gitee: /<owner>/<repo>/raw/<branch>/<file>）
-func (u *Updater) rawFileURL(name string) string {
-	return fmt.Sprintf("%s/%s/raw/%s/%s", version.SiteBase, u.repo, u.branch, name)
+// rawFileURL 仓库内原始文件（Gitee 形态：/<owner>/<repo>/raw/<branch>/<file>）。
+// Gitee 会 302 到 raw.giteeusercontent.com 的签名地址，由 http.Client 自动跟随。
+func rawFileURL(r version.Remote, name string) string {
+	return fmt.Sprintf("%s/%s/raw/%s/%s", r.Site, r.Repo, r.Branch, name)
+}
+
+// contentsURL GitHub 读文件的 API 地址。
+// 不能像 Gitee 那样直连 raw.githubusercontent.com —— 国内网络经常整个域名不通，
+// 而 api.github.com 是通的，contents 接口返回 base64 内容。
+func contentsURL(r version.Remote, name string) string {
+	return fmt.Sprintf("%s/repos/%s/contents/%s?ref=%s", r.API, r.Repo, name, url.QueryEscape(r.Branch))
 }
 
 // archiveURL 分支源码包（匿名下载地址）
-func (u *Updater) archiveURL() string {
-	return fmt.Sprintf("%s/%s/repository/archive/%s.zip", version.SiteBase, u.repo, u.branch)
+func archiveURL(r version.Remote) string {
+	if r.Name == "github" {
+		return fmt.Sprintf("%s/%s/archive/refs/heads/%s.zip", r.Site, r.Repo, r.Branch)
+	}
+	return fmt.Sprintf("%s/%s/repository/archive/%s.zip", r.Site, r.Repo, r.Branch)
 }
 
 // zipballURL 官方 OpenAPI 源码包地址（**URL 里不带令牌**）。
@@ -291,16 +344,20 @@ func (u *Updater) archiveURL() string {
 // access_token 查询参数，但请求头同样被服务端接受）。
 // 令牌不能拼在 URL 上——Go 的 *url.Error 会把完整 URL 带进错误文本，
 // 那段文本随后会进容器 stdout 和对外的更新状态接口，等于把令牌公开。
-func (u *Updater) zipballURL() string {
-	return fmt.Sprintf("%s/api/v5/repos/%s/zipball?ref=%s",
-		version.SiteBase, u.repo, url.QueryEscape(u.branch))
+func zipballURL(r version.Remote) string {
+	if r.Name == "github" {
+		// GitHub 的 zipball 是 /repos/{repo}/zipball/{ref}，没有查询参数形态
+		return fmt.Sprintf("%s/repos/%s/zipball/%s", r.API, r.Repo, url.PathEscape(r.Branch))
+	}
+	return fmt.Sprintf("%s/repos/%s/zipball?ref=%s", r.API, r.Repo, url.QueryEscape(r.Branch))
 }
 
 // zipballURLWithToken 官方 OpenAPI 源码包地址（令牌放查询串，老接口形态）。
 // 只在请求头方式不被接受时作为回退使用；它生成的错误文本必须经过 redact() 脱敏。
-func (u *Updater) zipballURLWithToken() string {
-	return fmt.Sprintf("%s/api/v5/repos/%s/zipball?ref=%s&access_token=%s",
-		version.SiteBase, u.repo, url.QueryEscape(u.branch), url.QueryEscape(u.token))
+// 仅 Gitee 用（GitHub 源不需要令牌）。
+func (u *Updater) zipballURLWithToken(r version.Remote) string {
+	return fmt.Sprintf("%s/repos/%s/zipball?ref=%s&access_token=%s",
+		r.API, r.Repo, url.QueryEscape(r.Branch), url.QueryEscape(u.token))
 }
 
 // accessTokenRe 匹配错误文本里的 access_token 查询参数（含 URL 编码后的值）
@@ -350,9 +407,9 @@ func (u *Updater) base() Info {
 		CurrentCommit:  version.Commit,
 		BuildTime:      buildTime,
 		Mode:           version.Mode(),
-		SiteURL:        version.RepoURL(u.repo),
-		Repo:           u.repo,
-		Branch:         u.branch,
+		SiteURL:        u.remotes[0].PageURL(),
+		Repo:           u.remotes[0].Repo,
+		Branch:         u.remotes[0].Branch,
 	}
 }
 
@@ -396,58 +453,122 @@ func (u *Updater) snapshot() Info {
 	return copyInfo(u.info)
 }
 
-// Refresh 主动联网检查；失败时把错误写进返回值的 Error 字段（不抛错，前端好展示）
+// Refresh 主动联网检查全部更新源；失败时把错误写进返回值的 Error 字段（不抛错，前端好展示）。
+//
+// 双源策略：每个仓库都查一遍，取「版本号更高」的（同版本取提交时间更新的）作为最新版本，
+// 并把它记成 active —— 下载源码包时优先用这个仓库，失败再回退到另一个。
 func (u *Updater) Refresh(ctx context.Context) Info {
 	info := u.base()
 
-	commit, commitAt, commitMsg, via1, err1 := u.fetchCommit(ctx)
-	remoteVer, via2, err2 := u.fetchRemoteVersion(ctx)
-	if via1 != "" {
-		info.Via = via1
-	} else if via2 != "" {
-		info.Via = via2
+	type probe struct {
+		idx    int
+		remote version.Remote
+		commit string
+		at     time.Time
+		msg    string
+		ver    string
 	}
-	info.LatestCommit = commit
-	info.LatestCommitMsg = commitMsg
-	if !commitAt.IsZero() {
-		info.LatestCommitAt = commitAt.UTC().Format(time.RFC3339)
+	var probes []probe
+	var errs []string
+
+	for i, r := range u.remotes {
+		commit, at, msg, err1 := u.fetchCommit(ctx, r)
+		ver, err2 := u.fetchRemoteVersion(ctx, r)
+		if err1 != nil || err2 != nil {
+			problems := make([]string, 0, 2)
+			if err1 != nil {
+				problems = append(problems, u.redactTok(err1.Error()))
+			}
+			if err2 != nil {
+				problems = append(problems, u.redactTok(err2.Error()))
+			}
+			errs = append(errs, r.Label+"："+strings.Join(problems, "；"))
+		}
+		// 两个信号都拿不到才算这个源不可用
+		if commit == "" && ver == "" {
+			continue
+		}
+		probes = append(probes, probe{idx: i, remote: r, commit: commit, at: at, msg: msg, ver: ver})
+		logx.Debugf("[update] 源 %s：版本 %q，提交 %s，时间 %s",
+			r.Label, ver, shortSHA(commit), at.UTC().Format(time.RFC3339))
 	}
-	info.LatestVersion = remoteVer
+
+	// 选最新的那个源：版本号高的优先；版本相同看提交时间；时间也拿不到就用先查到的
+	best := -1
+	for i := range probes {
+		if best < 0 {
+			best = i
+			continue
+		}
+		switch cmp := compareSemver(probes[i].ver, probes[best].ver); {
+		case cmp > 0:
+			best = i
+		case cmp == 0 && probes[i].at.After(probes[best].at):
+			best = i
+		}
+	}
+
+	if best < 0 {
+		msg := "检查失败：全部更新源都不可用"
+		if len(errs) > 0 {
+			msg = "检查失败：" + strings.Join(errs, "；")
+		}
+		info.Error = msg
+		info.CheckedAt = time.Now().Format("2006-01-02 15:04:05")
+		u.mu.Lock()
+		u.info, u.infoAt = info, time.Now()
+		u.mu.Unlock()
+		logx.Warnf("[update] %s", msg)
+		return info
+	}
+
+	b := probes[best]
+	u.setActive(b.idx)
+
+	info.Via = b.remote.Name
+	info.SiteURL = b.remote.PageURL()
+	info.Repo = b.remote.Repo
+	info.Branch = b.remote.Branch
+	info.LatestCommit = b.commit
+	info.LatestCommitMsg = b.msg
+	if !b.at.IsZero() {
+		info.LatestCommitAt = b.at.UTC().Format(time.RFC3339)
+	}
+	info.LatestVersion = b.ver
 
 	// 判定是否有更新
-	if remoteVer != "" && compareSemver(remoteVer, version.Version) > 0 {
+	if b.ver != "" && compareSemver(b.ver, version.Version) > 0 {
 		info.Available = true
-		info.Reasons = append(info.Reasons, "远端版本号 "+remoteVer+" 高于本机 "+version.Version)
+		info.Reasons = append(info.Reasons, "远端版本号 "+b.ver+" 高于本机 "+version.Version)
 	}
-	if commit != "" {
+	if b.commit != "" {
 		switch {
 		case version.Commit != "":
 			// 本地提交可能是短哈希（7 位），远端是完整 40 位：互相前缀匹配即视为同一个提交
-			same := strings.HasPrefix(commit, version.Commit) || strings.HasPrefix(version.Commit, commit)
+			same := strings.HasPrefix(b.commit, version.Commit) || strings.HasPrefix(version.Commit, b.commit)
 			if !same {
 				info.Available = true
 				info.Reasons = append(info.Reasons, "远端最新提交与本机构建提交不同")
 			}
-		case !commitAt.IsZero():
+		case !b.at.IsZero():
 			bt := version.Time()
-			if !bt.IsZero() && commitAt.After(bt.Add(2*time.Minute)) {
+			if !bt.IsZero() && b.at.After(bt.Add(2*time.Minute)) {
 				info.Available = true
 				info.Reasons = append(info.Reasons, "远端提交时间晚于本机构建时间")
 			}
 		}
 	}
-	if err1 != nil && err2 != nil {
-		info.Error = fmt.Sprintf("检查失败：%s；%s", u.redactTok(err1.Error()), u.redactTok(err2.Error()))
-	} else if err1 != nil && remoteVer == "" {
-		info.Error = "读取提交信息失败：" + u.redactTok(err1.Error())
+	// 另一个源不通不算致命：页面只报结果，细节留在日志里（Gitee 匿名接口常限流）
+	if len(errs) > 0 {
+		logx.Warnf("[update] 部分更新源不可用：%s", strings.Join(errs, "；"))
 	}
 	info.CheckedAt = time.Now().Format("2006-01-02 15:04:05")
 
 	u.mu.Lock()
 	u.info, u.infoAt = info, time.Now()
 	u.mu.Unlock()
-	logx.Infof("[update] 检查完成（gitee:%s@%s）：本机 %s（%s），远端 %s（%s），有更新=%v",
-		u.repo, u.branch, info.CurrentVersion, shortSHA(info.CurrentCommit),
+	logx.Infof("[update] 检查完成（%s:%s@%s）：本机 %s（%s），远端 %s（%s），有更新=%v",
+		b.remote.Name, b.remote.Repo, b.remote.Branch, info.CurrentVersion, shortSHA(info.CurrentCommit),
 		info.LatestVersion, shortSHA(info.LatestCommit), info.Available)
 	return info
 }
@@ -462,8 +583,9 @@ func shortSHA(s string) string {
 	return s
 }
 
-// fetchCommit 读分支最新提交（Gitee OpenAPI）
-func (u *Updater) fetchCommit(ctx context.Context) (sha string, at time.Time, msg, via string, err error) {
+// fetchCommit 读分支最新提交。Gitee 与 GitHub 的 OpenAPI 路径形状一致，
+// 只有 API 根不同（Gitee 是 https://gitee.com/api/v5，GitHub 是 https://api.github.com）。
+func (u *Updater) fetchCommit(ctx context.Context, r version.Remote) (sha string, at time.Time, msg string, err error) {
 	var body struct {
 		SHA    string `json:"sha"`
 		Commit struct {
@@ -473,23 +595,42 @@ func (u *Updater) fetchCommit(ctx context.Context) (sha string, at time.Time, ms
 			Message string `json:"message"`
 		} `json:"commit"`
 	}
-	if err := u.getJSON(ctx, u.apiCommitURL(), &body); err != nil {
-		return "", time.Time{}, "", "", err
+	if err := u.getJSON(ctx, commitURL(r), &body); err != nil {
+		return "", time.Time{}, "", err
 	}
 	if body.SHA == "" {
-		return "", time.Time{}, "", "", errors.New("接口响应里没有 sha（仓库可能是空的）")
+		return "", time.Time{}, "", errors.New("接口响应里没有 sha（仓库可能是空的）")
 	}
 	t, _ := time.Parse(time.RFC3339, body.Commit.Author.Date)
-	return body.SHA, t, firstLine(body.Commit.Message), "gitee", nil
+	return body.SHA, t, firstLine(body.Commit.Message), nil
 }
 
-// fetchRemoteVersion 读仓库根目录 VERSION 文件
-func (u *Updater) fetchRemoteVersion(ctx context.Context) (ver, via string, err error) {
-	s, err := u.getText(ctx, u.rawFileURL("VERSION"), 4<<10)
-	if err != nil {
-		return "", "", err
+// fetchRemoteVersion 读仓库根目录 VERSION 文件。
+//
+// Gitee 直连 raw 地址（会 302 到 raw.giteeusercontent.com，由 client 跟随）；
+// GitHub 改走 contents 接口取 base64 —— raw.githubusercontent.com 在国内
+// 经常整个域名不可达，而 api.github.com 可用（2026-11 实测）。
+func (u *Updater) fetchRemoteVersion(ctx context.Context, r version.Remote) (string, error) {
+	if r.Name == "github" {
+		var body struct {
+			Content  string `json:"content"`
+			Encoding string `json:"encoding"`
+		}
+		if err := u.getJSON(ctx, contentsURL(r, "VERSION"), &body); err != nil {
+			return "", err
+		}
+		clean := strings.ReplaceAll(strings.ReplaceAll(body.Content, "\n", ""), "\r", "")
+		raw, err := base64.StdEncoding.DecodeString(clean)
+		if err != nil {
+			return "", fmt.Errorf("VERSION 内容不是合法的 base64")
+		}
+		return strings.TrimSpace(string(raw)), nil
 	}
-	return strings.TrimSpace(s), "gitee", nil
+	s, err := u.getText(ctx, rawFileURL(r, "VERSION"), 4<<10)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(s), nil
 }
 
 func (u *Updater) getJSON(ctx context.Context, url string, dst any) error {
@@ -975,29 +1116,42 @@ func writeOKFile(dataDir, newVer, commit string) error {
 
 // download 下载源码包。
 //
+// 两个仓库依次试：先上次检查命中的那个（active），失败再换另一个。
+// 每个仓库内部再按「官方接口（有令牌时）→ 匿名 archive」的顺序回退。
+//
 // 注意：Gitee 的 /repository/archive/<branch>.zip 对「浏览器 UA」会返回登录/验证网页，
-// 只有命令行 UA 才直接给 zip（2026-10-20 实测）。所以这里分两条路：
-//  1. 配了 Gitee 令牌：走官方 /api/v5/repos/<repo>/zipball（最稳）；
-//     令牌优先用 Authorization 头传（URL 里不带令牌，避免令牌随错误文本外泄），
-//     请求头方式不被接受时再回退到 URL 查询串形式（该形式的错误文本一律脱敏）。
-//  2. 没配令牌：匿名 archive 地址 + CLI 风格 UA（拿到 HTML 时给出明确错误提示）。
+// 只有命令行 UA 才直接给 zip（2026-10-20 实测）。GitHub 的 archive 则是 302 到
+// codeload.github.com，用命令行 UA 同样最稳，所以统一走 cliUserAgent。
 func (u *Updater) download(ctx context.Context, dst string) error {
 	type candidate struct {
 		url, ua, note string
 		useTokenQuery bool // 令牌放 URL 查询串（兼容回退；错误文本必须脱敏）
 	}
-	var cands []candidate
-	if u.token != "" {
-		// 主路径：Authorization 头带令牌，URL 干净
-		cands = append(cands, candidate{u.zipballURL(), u.ua(), "官方接口", false})
-		// 兼容回退：令牌放查询串（老接口形态）
-		cands = append(cands, candidate{u.zipballURLWithToken(), u.ua(), "官方接口(兼容)", true})
+
+	// 排好顺序：上次检查命中的源优先，其余的原样跟在后面
+	act := u.activeRemote()
+	order := make([]version.Remote, 0, len(u.remotes))
+	order = append(order, act)
+	for _, r := range u.remotes {
+		if r.Name != act.Name {
+			order = append(order, r)
+		}
 	}
-	cands = append(cands, candidate{u.archiveURL(), cliUserAgent, "匿名下载", false})
+
+	var cands []candidate
+	for _, r := range order {
+		if r.Name == "gitee" && u.token != "" {
+			// 主路径：Authorization 头带令牌，URL 干净
+			cands = append(cands, candidate{zipballURL(r), u.ua(), r.Label + " 官方接口", false})
+			// 兼容回退：令牌放查询串（老接口形态）
+			cands = append(cands, candidate{u.zipballURLWithToken(r), u.ua(), r.Label + " 官方接口(兼容)", true})
+		}
+		cands = append(cands, candidate{archiveURL(r), cliUserAgent, r.Label + " 匿名下载", false})
+	}
 
 	var lastErr error
 	for _, c := range cands {
-		u.setStatus(func(s *Status) { s.Message = "正在下载源码包（Gitee " + c.note + "）…" })
+		u.setStatus(func(s *Status) { s.Message = "正在下载源码包（" + c.note + "）…" })
 		err := u.downloadOne(ctx, c.url, c.ua, dst, c.useTokenQuery)
 		if err == nil {
 			return nil
@@ -1009,7 +1163,7 @@ func (u *Updater) download(ctx context.Context, dst string) error {
 	if lastErr == nil {
 		lastErr = errors.New("未知错误")
 	}
-	return fmt.Errorf("下载源码包失败: %w（可用环境变量 VDL_UPDATE_TOKEN 提供 Gitee 令牌走官方接口）", errors.New(u.redactTok(lastErr.Error())))
+	return fmt.Errorf("下载源码包失败: %w（Gitee 与 GitHub 都没下成；Gitee 匿名下载被要求登录时，可用环境变量 VDL_UPDATE_TOKEN 提供私人令牌）", errors.New(u.redactTok(lastErr.Error())))
 }
 
 func (u *Updater) downloadOne(ctx context.Context, url, ua, dst string, tokenInQuery bool) error {

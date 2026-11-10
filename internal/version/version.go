@@ -27,13 +27,54 @@ var (
 )
 
 const (
-	// Repo 更新源仓库（Gitee，owner/name）；GitHub 镜像仓库已删除，只保留 Gitee
+	// Repo 默认更新源仓库（Gitee，owner/name）
 	Repo = "anglers/video"
-	// Branch 更新跟踪的分支
+	// Branch 默认更新跟踪的分支
 	Branch = "master"
-	// SiteBase Gitee 站点根地址
+	// SiteBase 默认更新源的站点根地址
 	SiteBase = "https://gitee.com"
 )
+
+// Remote 一个更新源（同一份代码的多仓库镜像）。
+//
+// Gitee 与 GitHub 的 OpenAPI 形状基本一致（都是 {API}/repos/{repo}/commits/{branch}），
+// 差别只在：GitHub 的 API 根是 https://api.github.com、分支叫 main、
+// 匿名读文件要用 contents 接口（raw.githubusercontent.com 国内常不可达）。
+type Remote struct {
+	Name   string // 机器名：gitee / github
+	Label  string // 展示名：Gitee / GitHub
+	Site   string // 网页站点根
+	API    string // OpenAPI 根（Gitee 含 /api/v5）
+	Repo   string // owner/name
+	Branch string
+}
+
+// PageURL 仓库网页地址（给用户在浏览器里打开）
+func (r Remote) PageURL() string { return r.Site + "/" + r.Repo }
+
+// RepoLinksText 全部仓库网页地址，用「或」连接（提示文案用）
+func RepoLinksText() string {
+	parts := make([]string, 0, len(Remotes))
+	for _, r := range Remotes {
+		parts = append(parts, r.PageURL())
+	}
+	return strings.Join(parts, " 或 ")
+}
+
+// Remotes 全部更新源，按优先级排列：检查更新时会逐个试，
+// 取版本号最高（相同则提交最新）的那个；下载源码包失败时按同样顺序回退。
+var Remotes = []Remote{
+	{
+		Name: "gitee", Label: "Gitee",
+		Site: "https://gitee.com", API: "https://gitee.com/api/v5",
+		Repo: "anglers/video", Branch: "master",
+	},
+	{
+		Name: "github", Label: "GitHub",
+		Site: "https://github.com", API: "https://api.github.com",
+		Repo: "AnglerS888/video", Branch: "main",
+	},
+}
 
 // RepoURL 仓库网页地址
 func RepoURL(repo string) string {

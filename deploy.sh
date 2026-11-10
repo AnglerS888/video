@@ -4,8 +4,10 @@
 #
 # 用法：
 #   curl -fsSL https://gitee.com/anglers/video/raw/master/deploy.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/AnglerS888/video/main/deploy.sh | bash
 #   sudo ./deploy.sh                          # 交互：询问对外端口、数据目录
 #   sudo ./deploy.sh --port 8080 --data /data/videodl
+#   sudo ./deploy.sh --source github          # 强制从 GitHub 拉源码（默认先 Gitee 后 GitHub）
 #   sudo ./deploy.sh --yes                    # 非交互：用默认值（已有容器则沿用）
 #
 # 再次执行 = 更新：默认沿用旧容器的端口与数据目录，直接回车即可。
@@ -16,13 +18,19 @@ set -euo pipefail
 # ---------- 配置 ----------
 IMAGE_NAME="videodl"
 CONTAINER_NAME="videodl"
-CODE_URL="https://gitee.com/anglers/video/repository/archive/master.tar.gz"
 DEFAULT_PORT="5200"
 WORK_DIR="$(pwd)"
+
+# 源码仓库（同一份代码的两个镜像）：格式「名字|tar.gz 地址」
+# 默认按 Gitee → GitHub 的顺序尝试，哪个能下用哪个
+SRC_GITEE="gitee|https://gitee.com/anglers/video/repository/archive/master.tar.gz"
+SRC_GITHUB="github|https://github.com/AnglerS888/video/archive/refs/heads/main.tar.gz"
+SOURCE="auto"
 
 PORT=""
 DATA_DIR=""
 ASSUME_YES=0
+SRC_FROM=""
 
 # ---------- 颜色 ----------
 GREEN='\033[0;32m'
@@ -41,12 +49,14 @@ usage() {
 
   --port N       对外访问端口（容器内固定 5200，默认 5200）
   --data PATH    数据存储目录（数据库 / 视频 / 配置都在这里，不存在会自动创建）
+  --source S     源码仓库：auto（默认，先 Gitee 后 GitHub）/ gitee / github
   --yes, -y      非交互模式：全部用默认值（已有容器则沿用它的端口与数据目录）
   -h, --help     显示本帮助
 
 示例：
   curl -fsSL https://gitee.com/anglers/video/raw/master/deploy.sh | bash
   sudo ./deploy.sh --port 8080 --data /data/videodl
+  sudo ./deploy.sh --source github
 EOF
 }
 
@@ -59,6 +69,13 @@ while [ $# -gt 0 ]; do
         --data)
             [ $# -ge 2 ] || die "--data 需要一个目录路径"
             DATA_DIR="$2"; shift 2 ;;
+        --source)
+            [ $# -ge 2 ] || die "--source 需要 auto / gitee / github"
+            case "$2" in
+                auto|gitee|github) SOURCE="$2" ;;
+                *) die "--source 只能是 auto / gitee / github" ;;
+            esac
+            shift 2 ;;
         --yes|-y)
             ASSUME_YES=1; shift ;;
         -h|--help)
@@ -228,6 +245,31 @@ resolve_settings() {
 }
 
 # ---------- 主流程 ----------
+# 按 SOURCE 的顺序尝试下载源码包，成功返回 0 并把命中的仓库名写进 SRC_FROM
+download_source() {
+    local list=()
+    case "$SOURCE" in
+        gitee)  list=("$SRC_GITEE") ;;
+        github) list=("$SRC_GITHUB") ;;
+        *)      list=("$SRC_GITEE" "$SRC_GITHUB") ;;
+    esac
+    local entry name url
+    for entry in "${list[@]}"; do
+        name="${entry%%|*}"
+        url="${entry#*|}"
+        log "  尝试从 ${name} 下载源码…"
+        # 必须用命令行风格 UA：Gitee 对浏览器 UA 会返回登录/验证页（HTML 而不是 tar.gz）
+        if curl -fsSL --connect-timeout 30 --max-time 180 \
+             -A 'curl/8.10.1' "$url" -o "$TMP_DIR/source.tar.gz"; then
+            SRC_FROM="$name"
+            return 0
+        fi
+        warn "  ${name} 下载失败，换下一个源"
+        rm -f "$TMP_DIR/source.tar.gz"
+    done
+    return 1
+}
+
 main() {
     check_env
 
@@ -246,12 +288,10 @@ main() {
     TMP_DIR=$(mktemp -d)
     trap 'rm -rf "$TMP_DIR"' EXIT
 
-    # 必须用命令行风格 UA：Gitee 对浏览器 UA 会返回登录/验证页（HTML 而不是 tar.gz）
-    if ! curl -fsSL --connect-timeout 30 --max-time 180 \
-         -A 'curl/8.10.1' "$CODE_URL" -o "$TMP_DIR/source.tar.gz"; then
-        die "下载失败：$CODE_URL"
+    if ! download_source; then
+        die "源码下载失败（Gitee 与 GitHub 都不通），检查网络后重试，或用 --source 指定单个仓库"
     fi
-    log "  ✓ 下载完成"
+    log "  ✓ 下载完成（来源：${SRC_FROM}）"
 
     if ! tar -xzf "$TMP_DIR/source.tar.gz" -C "$TMP_DIR" 2>/dev/null; then
         die "解压失败（下载到的可能不是源码包，检查网络或手动下载）"

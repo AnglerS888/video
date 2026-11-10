@@ -455,6 +455,11 @@ let upTimer: number | undefined
 let reloadTimer: number | undefined
 
 const isDocker = computed(() => upInfo.value?.mode === 'docker')
+// 更新源显示成「gitee.com/anglers/video」这种形式：去掉协议头即可。
+// 检查更新后 site_url 会是实际命中并胜出的那个仓库（Gitee 或 GitHub）。
+const upSiteHost = computed(() =>
+  (upInfo.value?.site_url || 'https://gitee.com').replace(/^https?:\/\//, '').replace(/\/+$/, ''),
+)
 // restarting 也算进行中：进程马上原地 exec 重启，接口会断几秒，新进程回来后回 done
 const upBusy = computed(() => ['downloading', 'extracting', 'building', 'restarting'].includes(upStatus.value?.phase || ''))
 
@@ -535,7 +540,7 @@ async function maybeAutoCheck() {
 async function applyUp(force = false) {
   if (upApplying.value || upBusy.value) return
   if (!isDocker.value) {
-    return toast('直接运行模式不支持自动更新，请到 Gitee 下载最新版', 'info', 3000)
+    return toast('直接运行模式不支持自动更新，请到 Gitee / GitHub 下载最新版', 'info', 3000)
   }
   if (!force && !upVersionDiff.value) {
     return toast('当前版本号与远端相同，如需按最新提交重装请用「强制更新」', 'info', 2800)
@@ -846,7 +851,7 @@ onBeforeUnmount(() => {
             </div>
             <div class="flex justify-between gap-3">
               <dt class="muted">更新源</dt>
-              <dd class="truncate" :title="upInfo?.site_url || ''">gitee.com/{{ upInfo?.repo || '—' }}@{{ upInfo?.branch || '—' }}</dd>
+              <dd class="truncate" :title="upInfo?.site_url || ''">{{ upSiteHost }}/{{ upInfo?.repo || '—' }}@{{ upInfo?.branch || '—' }}</dd>
             </div>
             <div class="flex justify-between gap-3">
               <dt class="muted">最新提交</dt>
@@ -866,7 +871,7 @@ onBeforeUnmount(() => {
           </ul>
           <p v-if="upInfo?.error" class="break-all rounded-lg bg-rose-500/10 px-2.5 py-2 text-[11px] text-rose-500">{{ upInfo.error }}</p>
           <p v-if="upInfo?.checked_at" class="text-[11px] muted">
-            上次检查：{{ upInfo.checked_at }}<span v-if="upInfo.via"> · 通道 {{ upInfo.via === 'direct' ? 'GitHub 直连' : upInfo.via }}</span>
+            上次检查：{{ upInfo.checked_at }}<span v-if="upInfo.via"> · 通道 {{ upInfo.via === 'github' ? 'GitHub' : upInfo.via === 'gitee' ? 'Gitee' : upInfo.via }}</span>
           </p>
 
           <!-- 进行中 -->
@@ -919,12 +924,12 @@ onBeforeUnmount(() => {
               v-else
               :href="upInfo?.site_url || 'https://gitee.com/anglers/video'"
               target="_blank" rel="noopener"
-            >打开 Gitee 手动更新</a>
+            >打开仓库手动更新</a>
             <a
               class="btn btn-ghost btn-sm"
               :href="upInfo?.site_url || 'https://gitee.com/anglers/video'"
               target="_blank" rel="noopener"
-            >Gitee 仓库</a>
+            >项目仓库</a>
           </div>
           <p v-if="isDocker" class="text-[11px] muted">
             自动更新只在 Docker 容器内提供：「立即更新」仅在版本号与远端不同时可用；
@@ -933,7 +938,7 @@ onBeforeUnmount(() => {
             若镜像不含 Go 工具链（旧版精简镜像），则只下载源码并给出宿主机重建镜像的步骤。
           </p>
           <p v-else class="text-[11px] muted">
-            当前为<strong>直接运行</strong>模式，不支持自动更新：请到 Gitee 下载最新版（或最新源码自行编译），
+            当前为<strong>直接运行</strong>模式，不支持自动更新：请到 Gitee / GitHub 下载最新版（或最新源码自行编译），
             替换程序文件后重启即可；数据目录与配置不受影响。
           </p>
         </section>
