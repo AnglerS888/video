@@ -94,6 +94,12 @@ function epLabel(t: DownloadTask | WatchHistoryItem): string {
   return t.ep_index >= 0 ? `第${t.ep_index + 1}集` : '整条'
 }
 
+// 这一集当初是从哪个接口下载的（source_name 是下载时冗余下来的接口名，
+// 接口被删掉也还在；老数据没有则退回线路名 play_from）
+function srcOf(t: DownloadTask): string {
+  return (t.source_name || '').trim() || (t.play_from || '').trim() || '未知来源'
+}
+
 // 某集上次看到第几秒（没有记录/已看完都返回 0）
 function watchedAt(id: number): number {
   const h = histMap.value.get(id)
@@ -302,15 +308,17 @@ onMounted(load)
                   : 'border-slate-200 dark:border-white/10'"
               >
                 <button
-                  class="flex min-h-11 flex-1 items-center px-3 text-xs transition xl:min-h-0 xl:flex-none xl:px-2 xl:py-1 xl:text-[11px]"
+                  class="flex min-h-11 min-w-0 flex-1 items-center gap-1.5 px-3 text-xs transition xl:min-h-0 xl:flex-none xl:px-2 xl:py-1 xl:text-[11px]"
                   :class="watchedAt(ep.id)
                     ? 'text-amber-700 dark:text-amber-300'
                     : 'hover:text-amber-500'"
                   :title="(watchedAt(ep.id) ? `上次看到 ${fmt(watchedAt(ep.id))}` : '点击播放')
-                    + ` · 来源：${ep.source_name || ep.play_from || '未知'}`"
+                    + ` · 来源：${srcOf(ep)}`"
                   @click="play(ep.id)"
                 >
-                  {{ epLabel(ep) }}<span v-if="watchedAt(ep.id)" class="ml-0.5">·</span>
+                  <span class="shrink-0">{{ epLabel(ep) }}<span v-if="watchedAt(ep.id)" class="ml-0.5">·</span></span>
+                  <!-- 每集标出下载来源：同一集可能来自多个接口，光看集号分不清是哪一份 -->
+                  <span class="ml-0.5 min-w-0 truncate text-[10px] font-normal text-slate-500 dark:text-slate-400 xl:max-w-[7.5rem]" :title="`下载来源：${srcOf(ep)}`">{{ srcOf(ep) }}</span>
                 </button>
                 <button
                   class="grid w-11 shrink-0 place-items-center border-l border-slate-200 text-slate-400 transition hover:bg-sky-500/10 hover:text-sky-500 dark:border-white/10 xl:w-7 xl:py-1"
